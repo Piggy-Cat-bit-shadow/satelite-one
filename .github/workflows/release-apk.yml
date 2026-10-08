@@ -51,8 +51,14 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      # No `packages:` here: the action's default requests the legacy `tools`
+      # package, which no longer exists in the SDK repository and makes the
+      # step fail. Runners already ship the SDK; we only need it on PATH and
+      # the NDK installed below.
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: ''
 
       - name: Install NDK ${{ env.NDK_VERSION }}
         run: |
