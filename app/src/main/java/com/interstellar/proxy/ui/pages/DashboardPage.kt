@@ -71,7 +71,6 @@ import com.interstellar.proxy.ui.components.StatusPill
 import com.interstellar.proxy.ui.components.glassSurface
 import com.interstellar.proxy.ui.components.pressableClick
 import com.interstellar.proxy.ui.localizedCountryName
-import com.interstellar.proxy.BuildConfig
 import com.interstellar.proxy.ui.theme.LocalInterstellarColors
 import com.interstellar.proxy.ui.theme.Motion
 import io.nekohasekai.libbox.Libbox
@@ -82,21 +81,6 @@ import com.interstellar.proxy.core.CoreGroup
  * libbox reports at runtime. This client has exactly one core, so there is no
  * selector — only provenance.
  */
-@Composable
-private fun coreVersionLine(): String {
-    val runtime = runCatching { Libbox.version() }
-        .getOrNull()?.takeIf { it.isNotBlank() && it != "unknown" }
-        ?: BuildConfig.CORE_VERSION
-    val rev = BuildConfig.CORE_COMMIT
-    // "<product version> · <revision>": two clearly different things. The
-    // revision comes from the core's own provenance record, so it always
-    // describes the libbox.so that is actually packaged.
-    return if (rev != "unknown" && rev != runtime) {
-        "sing-box $runtime · $rev"
-    } else {
-        "sing-box $runtime"
-    }
-}
 
 @Composable
 fun DashboardPage(
@@ -162,18 +146,13 @@ fun DashboardPage(
                     .padding(top = 22.dp, bottom = 4.dp),
             ) {
                 Column(modifier = Modifier.weight(1f)) {
+                    // Product name only — the old slogan was part of the previous
+                    // brand, and a replacement slogan would be invented marketing.
                     Text(
                         stringResource(R.string.app_name),
                         color = colors.text,
                         fontSize = 24.sp,
                         fontWeight = FontWeight.Bold,
-                    )
-                    Spacer(Modifier.height(2.dp))
-                    Text(
-                        stringResource(R.string.app_tagline),
-                        color = colors.textTertiary,
-                        fontSize = 11.sp,
-                        letterSpacing = 1.sp,
                     )
                 }
                 GlassIconButton(
@@ -345,30 +324,6 @@ fun DashboardPage(
 
             Spacer(Modifier.height(8.dp))
 
-            // Core identity (no selector — this client ships one core).
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(
-                    stringResource(R.string.dash_core_label),
-                    color = colors.textTertiary,
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.Medium,
-                    letterSpacing = 1.sp,
-                    modifier = Modifier.width(30.dp),
-                )
-                Text(
-                    coreVersionLine(),
-                    color = colors.textSecondary,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-            }
-
             Spacer(Modifier.height(12.dp))
 
             // ── 仪表网格：核心 / 流量曲线 / 网络探测 / 订阅
@@ -381,12 +336,15 @@ fun DashboardPage(
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 InstrumentCard(
-                    caption = stringResource(R.string.dash_caption_core),
+                    caption = stringResource(R.string.dash_caption_session),
                     onClick = { onOpenSubPage(SettingsSubPage.Logs) },
                     modifier = Modifier.weight(1f),
                     secondary = {
+                        // Session duration is the useful telemetry here; the core
+                        // identity lives in Settings -> About (single-core client,
+                        // so it is not actionable from the home page).
                         Text(
-                            BuildConfig.CORE_REPO,
+                            stringResource(R.string.dash_caption_session_hint),
                             color = colors.textTertiary,
                             fontSize = 11.sp,
                             maxLines = 1,

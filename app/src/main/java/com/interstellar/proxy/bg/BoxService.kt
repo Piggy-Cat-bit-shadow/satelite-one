@@ -126,7 +126,7 @@ class BoxService(private val service: Service, private val platformInterface: Pl
         try {
             if (status.value != Status.Starting) return
             withContext(Dispatchers.Main) {
-                notification.show(service.getString(R.string.app_tagline), R.string.status_starting)
+                notification.show(service.getString(R.string.app_name), R.string.status_starting)
             }
 
             val content = ConfigStore.readActiveConfig()
@@ -165,7 +165,7 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             withContext(Dispatchers.Main) {
                 if (status.value == Status.Starting) {
                     status.value = Status.Started
-                    notification.show(service.getString(R.string.app_tagline), R.string.status_started)
+                    notification.show(service.getString(R.string.app_name), R.string.status_started)
                     notification.start()
                 }
             }

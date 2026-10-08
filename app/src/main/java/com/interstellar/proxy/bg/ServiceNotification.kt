@@ -61,7 +61,7 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
 
     private val notificationBuilder by lazy {
         NotificationCompat.Builder(service, notificationChannel).setShowWhen(false).setOngoing(true)
-            .setContentTitle(service.getString(R.string.app_tagline)).setOnlyAlertOnce(true)
+            .setContentTitle(service.getString(R.string.app_name)).setOnlyAlertOnce(true)
             .setSmallIcon(R.drawable.ic_stat)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setContentIntent(
@@ -120,7 +120,7 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
             service,
             notificationId,
             notificationBuilder
-                .setContentTitle(profileName.takeIf { it.isNotBlank() } ?: service.getString(R.string.app_tagline))
+                .setContentTitle(profileName.takeIf { it.isNotBlank() } ?: service.getString(R.string.app_name))
                 .setContentText(service.getString(contentTextId)).build(),
             fgsType,
         )

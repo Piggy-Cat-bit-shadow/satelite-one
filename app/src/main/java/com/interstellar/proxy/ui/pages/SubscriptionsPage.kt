@@ -165,7 +165,7 @@ fun SubscriptionsPage(viewModel: AppViewModel) {
                                     stringResource(R.string.subs_interval_12h),
                                     stringResource(R.string.subs_interval_daily),
                                 ),
-                                selected = listOf(1, 6, 12, 24).indexOf(interval).coerceAtLeast(1),
+                                selected = listOf(1, 6, 12, 24).indexOf(interval).coerceAtLeast(0),
                                 onSelect = { index ->
                                     interval = listOf(1, 6, 12, 24)[index]
                                     Settings.autoUpdateIntervalHours = interval

@@ -372,9 +372,4 @@ class SmartSwitchEngine(
         cache.clear()
         sorted.forEach { (k, v) -> cache[k] = v }
     }
-
-    /** Ordered tags by cached delay (ascending) — the node page's "智能" order. */
-    fun cachedOrder(): List<String> = cache.keys.toList()
-
-    fun cachedDelay(tag: String): Int? = cache[tag]?.first
 }

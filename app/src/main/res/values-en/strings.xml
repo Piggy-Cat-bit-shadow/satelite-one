@@ -1,14 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!-- app identity -->
-    <string name="app_name">Interstellar</string>
-    <string name="app_tagline">Across the galaxy, beyond light-years</string>
-
+    <string name="app_name">Jiejiebox</string>
+    
     <!-- service / notification -->
     <string name="stop">Stop</string>
     <string name="status_starting">Starting…</string>
     <string name="status_started">Connected</string>
-    <string name="status_stopping">Stopping…</string>
     <string name="tile_disconnected">Offline</string>
     <string name="channel_service">Service Notifications</string>
 
@@ -93,9 +91,7 @@
     <string name="vm_start_failed">Start failed: %1$s</string>
     <string name="vm_config_update_failed">Failed to update config</string>
     <string name="vm_rule_update_failed">Rule file update failed: %1$s</string>
-    <string name="vm_switch_failed_api">Switch failed: core API unreachable</string>
     <string name="vm_switch_failed">Switch failed: %1$s</string>
-    <string name="vm_test_failed_api">Test failed: core API unreachable</string>
     <string name="vm_test_failed_send">Test failed: could not send command</string>
     <string name="vm_test_failed">Test failed: %1$s</string>
     <string name="vm_no_test_config">Could not generate a test config</string>
@@ -172,8 +168,8 @@
     <string name="dash_scope_on">On</string>
     <string name="dash_scope_off">Off</string>
     <string name="dash_label_switch">Switch mode</string>
-    <string name="dash_core_label">Core</string>
-    <string name="dash_caption_core">Core</string>
+    <string name="dash_caption_session">Session</string>
+    <string name="dash_caption_session_hint">Connected for · tap for details</string>
     <string name="dash_caption_traffic">Traffic</string>
     <string name="dash_traffic_summary">Σ %1$s · %2$d conns</string>
     <string name="dash_caption_probe">Exit network</string>
@@ -407,10 +403,6 @@
     <string name="nodes_empty_mix">No subscriptions checked in Mix, or the selected subscription has no usable nodes</string>
     <string name="nodes_empty_no_subscription">Add and activate a subscription first</string>
     <string name="nodes_empty_no_nodes">No usable nodes in the subscription</string>
-    <string name="nodes_split_rules_title">Split rules enabled</string>
-    <string name="nodes_split_rules_no_rules">No rules set; add them in Settings</string>
-    <string name="nodes_split_rules_active">Matching domains use their filtered node groups</string>
-    <string name="nodes_split_rules_off">Off; everything uses the current node</string>
     <string name="nodes_sort_delay">Latency</string>
     <string name="nodes_sort_name">Name</string>
     <string name="nodes_view_list">List</string>

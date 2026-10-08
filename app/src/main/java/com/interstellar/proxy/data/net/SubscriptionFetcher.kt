@@ -188,5 +188,5 @@ object SubscriptionFetcher {
         return s.trim()
     }
 
-    private const val USER_AGENT = "Interstellar/0.5 clash-verge/v2.5 flclash/1 Android"
+    private const val USER_AGENT = "Jiejiebox/0.5 clash-verge/v2.5 flclash/1 Android"
 }

@@ -23,7 +23,7 @@ import java.util.concurrent.TimeUnit
  * in CN), then fall back to direct.
  */
 object AppUpdateChecker {
-    const val RELEASES_PAGE = "https://github.com/zn0wii/interstellar-proxy/releases/latest"
+    const val RELEASES_PAGE = "https://github.com/Piggy-Cat-bit-shadow/satelite-one/releases/latest"
     private const val MIXED_PORT = 2080
 
     sealed interface Result {

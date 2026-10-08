@@ -39,10 +39,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -54,10 +54,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.interstellar.proxy.R
 import com.interstellar.proxy.data.SubscriptionRepository
-import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.data.config.ConfigBuilder
 import com.interstellar.proxy.ui.AppViewModel
-import com.interstellar.proxy.ui.components.IosSwitch
 import com.interstellar.proxy.ui.components.PageHeader
 import com.interstellar.proxy.ui.components.SegmentedControl
 import com.interstellar.proxy.ui.components.glassSurface
@@ -101,7 +99,6 @@ fun NodesPage(viewModel: AppViewModel) {
     val delays by viewModel.delays.collectAsState()
     val testing by viewModel.testing.collectAsState()
     val message by viewModel.message.collectAsState()
-    val splitRules by viewModel.splitRuleStatus.collectAsState()
     val subscriptions by viewModel.subscriptions.collectAsState()
     val activeId by viewModel.activeSubscriptionId.collectAsState()
     val mixEnabled by viewModel.mixEnabled.collectAsState()
@@ -271,30 +268,6 @@ fun NodesPage(viewModel: AppViewModel) {
                 },
             )
             return@Column
-        }
-
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 10.dp),
-        ) {
-            Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
-                Text(stringResource(R.string.nodes_split_rules_title), color = colors.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-                Text(
-                    when {
-                        !splitRules.hasEnabledRules -> stringResource(R.string.nodes_split_rules_no_rules)
-                        splitRules.active -> stringResource(R.string.nodes_split_rules_active)
-                        else -> stringResource(R.string.nodes_split_rules_off)
-                    },
-                    color = colors.textTertiary,
-                    fontSize = 12.sp,
-                )
-            }
-            IosSwitch(
-                checked = splitRules.masterEnabled,
-                onChange = { viewModel.setSplitRulesEnabled(it) },
-            )
         }
 
         // ── 分组 tab: 虚拟 自动/智能 置前(仅程序生成配置),后跟真实分组 ──

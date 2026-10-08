@@ -1,10 +1,7 @@
 package com.interstellar.proxy.data.config
 
 import com.interstellar.proxy.data.NodeMatcher
-import com.interstellar.proxy.data.model.CustomRouteRule
-import com.interstellar.proxy.data.model.DomainMatchType
 import com.interstellar.proxy.data.model.DnsOverrideEntry
-import com.interstellar.proxy.data.model.NodeFilterMode
 import com.interstellar.proxy.data.model.NodeType
 import com.interstellar.proxy.data.model.ProxyNode
 import kotlinx.serialization.json.JsonArray
@@ -51,14 +48,8 @@ object ConfigBuilder {
         // loopback port for sing-box's clash_api (mode switching goes through it)
         val apiPort: Int = 19090,
         val apiSecret: String = "",
-        val customRules: List<CustomRouteRule> = emptyList(),
         /** User domain→IP injections, resolved by a hosts DNS server first. */
         val dnsOverrides: List<DnsOverrideEntry> = emptyList(),
-        /**
-         * When true, domain→filtered-urltest rules are in the config even if
-         * a leaf node is selected. Default traffic still uses [selectedNodeTag].
-         */
-        val applyNodeFilterRules: Boolean = true,
         /** Per-country urltest groups (香港 · 自动, …). Off: only 自动 + nodes. */
         val regionGroupsEnabled: Boolean = false,
         /** When false, skip TUN so url-test can run without claiming the VPN. */
@@ -80,11 +71,7 @@ object ConfigBuilder {
         val tags = dedupeTags(nodes)
         val used = tags.toMutableSet().apply { addAll(RESERVED_TAGS) }
         val regionGroups = if (options.regionGroupsEnabled) deriveRegionGroups(tags, used) else emptyList()
-        val customGroups = if (options.mode == OutboundMode.RULE && options.applyNodeFilterRules) {
-            deriveCustomGroups(tags, options.customRules, used)
-        } else {
-            emptyList()
-        }
+        val customGroups = emptyList<DerivedGroup>()
         val json = buildJsonObject {
             putJsonObject("log") {
                 put("level", "info")
@@ -239,30 +226,6 @@ object ConfigBuilder {
         }
     }
 
-    private fun deriveCustomGroups(
-        tags: List<String>,
-        rules: List<CustomRouteRule>,
-        used: MutableSet<String>,
-    ): List<DerivedGroup> {
-        return rules.mapNotNull { rule ->
-            if (!rule.enabled) return@mapNotNull null
-            // direct rules need no node group — routed to the fixed direct outbound
-            if (rule.filterMode == NodeFilterMode.DIRECT) return@mapNotNull null
-            if (rule.parsedMatchValues().isEmpty()) return@mapNotNull null
-            val keywords = rule.nodeKeywords.map { it.trim() }.filter { it.isNotEmpty() }
-            if (keywords.isEmpty()) return@mapNotNull null
-            val members = NodeMatcher.filterTags(
-                tags,
-                keywords,
-                include = rule.filterMode == NodeFilterMode.INCLUDE,
-            )
-            if (members.isEmpty()) return@mapNotNull null
-            val tag = uniqueTag(customRuleTag(rule.id), used)
-            DerivedGroup(tag, members, ruleId = rule.id)
-        }
-    }
-
-    fun customRuleTag(id: String): String = "rule-${id.replace("-", "").take(8)}"
 
     /**
      * True when [selectedTag] is auto or a per-region urltest group — the
@@ -665,32 +628,6 @@ object ConfigBuilder {
                         put("outbound", BLOCK_TAG)
                     },
                 )
-            }
-            // user domain rules beat the generic CN bypass (so a CN site can
-            // still be forced through a filtered node set). Armed whenever
-            // the split-rules master switch is on — independent of auto/manual.
-            if (options.mode == OutboundMode.RULE && options.applyNodeFilterRules) {
-                val byId = customGroups.associateBy { it.ruleId }
-                for (rule in options.customRules) {
-                    if (!rule.enabled) continue
-                    val values = rule.parsedMatchValues()
-                    if (values.isEmpty()) continue
-                    val outbound = when (rule.filterMode) {
-                        // direct rules need no derived group
-                        NodeFilterMode.DIRECT -> DIRECT_TAG
-                        else -> byId[rule.id]?.tag ?: continue
-                    }
-                    add(
-                        buildJsonObject {
-                            when (rule.matchType) {
-                                DomainMatchType.DOMAIN -> putJsonArray("domain") { values.forEach { add(it) } }
-                                DomainMatchType.DOMAIN_SUFFIX -> putJsonArray("domain_suffix") { values.forEach { add(it) } }
-                                DomainMatchType.DOMAIN_KEYWORD -> putJsonArray("domain_keyword") { values.forEach { add(it) } }
-                            }
-                            put("outbound", outbound)
-                        },
-                    )
-                }
             }
             // overseas (geolocation-!cn) domains ride the proxy — matched
             // before the CN bypass so whitelist-style routing wins for a

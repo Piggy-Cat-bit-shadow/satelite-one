@@ -1,14 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!-- app identity -->
-    <string name="app_name">星际穿越</string>
-    <string name="app_tagline">星河漫漫·穿越光年</string>
-
+    <string name="app_name">Jiejiebox</string>
+    
     <!-- service / notification -->
     <string name="stop">停止</string>
     <string name="status_starting">启动中…</string>
     <string name="status_started">已连接</string>
-    <string name="status_stopping">正在停止…</string>
     <string name="tile_disconnected">已离线</string>
     <string name="channel_service">服务通知</string>
 
@@ -93,9 +91,7 @@
     <string name="vm_start_failed">启动失败: %1$s</string>
     <string name="vm_config_update_failed">配置更新失败</string>
     <string name="vm_rule_update_failed">规则文件更新失败:%1$s</string>
-    <string name="vm_switch_failed_api">切换失败: 内核 API 不可达</string>
     <string name="vm_switch_failed">切换失败: %1$s</string>
-    <string name="vm_test_failed_api">测速失败: 内核 API 不可达</string>
     <string name="vm_test_failed_send">测速失败: 命令发送失败</string>
     <string name="vm_test_failed">测速失败: %1$s</string>
     <string name="vm_no_test_config">无法生成测速配置</string>
@@ -172,8 +168,8 @@
     <string name="dash_scope_on">开</string>
     <string name="dash_scope_off">关</string>
     <string name="dash_label_switch">切换模式</string>
-    <string name="dash_core_label">内核</string>
-    <string name="dash_caption_core">核心</string>
+    <string name="dash_caption_session">会话</string>
+    <string name="dash_caption_session_hint">已连接时长 · 连接详情</string>
     <string name="dash_caption_traffic">流量</string>
     <string name="dash_traffic_summary">Σ %1$s · %2$d 连接</string>
     <string name="dash_caption_probe">出口网络</string>
@@ -407,10 +403,6 @@
     <string name="nodes_empty_mix">Mix 未勾选订阅,或所选订阅中没有可用节点</string>
     <string name="nodes_empty_no_subscription">请先添加并激活一个订阅</string>
     <string name="nodes_empty_no_nodes">订阅中没有可用节点</string>
-    <string name="nodes_split_rules_title">分流规则启用</string>
-    <string name="nodes_split_rules_no_rules">未设置规则，可在设置里添加</string>
-    <string name="nodes_split_rules_active">指定域名走过滤后的节点组</string>
-    <string name="nodes_split_rules_off">已关闭，全部走当前节点</string>
     <string name="nodes_sort_delay">延迟</string>
     <string name="nodes_sort_name">名称</string>
     <string name="nodes_view_list">列表</string>

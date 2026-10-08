@@ -19,6 +19,22 @@ data class DnsOverrideEntry(
     fun parsedDomains(): List<String> = parseDnsDomains(domains)
 }
 
+/**
+ * Normalises a user-typed domain: strips scheme, path/query and a trailing
+ * port, then trims dots. Shared by [parseDnsDomains] (DNS overrides).
+ */
+fun sanitizeMatchValue(raw: String): String {
+    var s = raw.trim()
+    s = s.removePrefix("https://").removePrefix("http://")
+    s = s.substringBefore('/').substringBefore('?')
+    // drop a trailing port if present ("chatgpt.com:443")
+    val colon = s.lastIndexOf(':')
+    if (colon > 0 && s.substring(colon + 1).all { it.isDigit() }) {
+        s = s.substring(0, colon)
+    }
+    return s.trim().trim('.')
+}
+
 fun parseDnsDomains(raw: String): List<String> =
     raw.split(',', '\n', ';')
         .map { sanitizeMatchValue(it).lowercase() }

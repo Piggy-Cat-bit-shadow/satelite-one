@@ -160,18 +160,6 @@ object Settings {
             commit()
         }
 
-    /**
-     * Master switch for custom domain→node-filter rules. Independent of
-     * auto vs a locked node: on = matching domains always use their own
-     * urltest pool; off = all proxy traffic uses the current selection.
-     */
-    var splitRulesEnabled: Boolean
-        get() = properties.getProperty("splitRulesEnabled", "true").toBoolean()
-        set(value) {
-            properties.setProperty("splitRulesEnabled", value.toString())
-            commit()
-        }
-
     /** Last selected outbound tag of the main selector (`auto`, `smart`, a region group, or a node). */
     var selectedOutboundTag: String
         get() = properties.getProperty("selectedOutboundTag", "")
@@ -248,14 +236,6 @@ object Settings {
             com.interstellar.proxy.ktx.AppLanguage.invalidate()
         }
 
-    /** Legacy key from the pre-glow era; the macaron accent (see ui.theme.Accents) replaced it. */
-    var glowColorId: String
-        get() = properties.getProperty("glowColorId", "matcha")
-        set(value) {
-            properties.setProperty("glowColorId", value)
-            commit()
-        }
-
     /** Last-known core state, keeps the quick-settings tile truthful. */
     var tileActive: Boolean
         get() = properties.getProperty("tileActive", "false").toBoolean()
@@ -324,14 +304,6 @@ object Settings {
         get() = properties.getProperty("autoUpdateIntervalHours", "6")?.toIntOrNull() ?: 6
         set(value) {
             properties.setProperty("autoUpdateIntervalHours", value.toString())
-            commit()
-        }
-
-    /** Fingerprint of the last clipboard text the import banner was shown for; the same clip won't re-prompt. */
-    var lastImportPromptClip: String
-        get() = properties.getProperty("lastImportPromptClip", "")
-        set(value) {
-            properties.setProperty("lastImportPromptClip", value)
             commit()
         }
 

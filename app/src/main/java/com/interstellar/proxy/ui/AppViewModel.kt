@@ -11,12 +11,10 @@ import androidx.lifecycle.viewModelScope
 import com.interstellar.proxy.constant.Action
 import com.interstellar.proxy.constant.Status
 import com.interstellar.proxy.data.ConfigStore
-import com.interstellar.proxy.data.CustomRulesStore
 import com.interstellar.proxy.data.DnsOverridesStore
 import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.data.SubscriptionRepository
 import com.interstellar.proxy.data.config.ConfigBuilder
-import com.interstellar.proxy.data.model.CustomRouteRule
 import com.interstellar.proxy.data.model.DnsOverrideEntry
 import com.interstellar.proxy.data.net.SubscriptionFetcher
 import com.interstellar.proxy.data.subscription.SubscriptionParser
@@ -49,14 +47,6 @@ data class SpeedState(
 data class ClashModeState(
     val modes: List<String> = emptyList(),
     val current: String = "rule",
-)
-
-data class SplitRuleStatus(
-    val hasEnabledRules: Boolean = false,
-    /** Master switch on the nodes page. Independent of auto vs a locked node. */
-    val masterEnabled: Boolean = true,
-    /** Keyword-filter rules are actually in the running/generated config. */
-    val active: Boolean = false,
 )
 
 /** Exit-IP probe lifecycle for the dashboard 网络探测 card. */
@@ -138,22 +128,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         count = Settings.perAppProxyList.size,
     )
 
-    fun setProxyScope(mode: String) {
-        when (mode) {
-            "all" -> Settings.perAppProxyEnabled = false
-            "whitelist" -> {
-                Settings.perAppProxyMode = Settings.PER_APP_PROXY_INCLUDE
-                Settings.perAppProxyEnabled = true
-            }
-
-            "blacklist" -> {
-                Settings.perAppProxyMode = Settings.PER_APP_PROXY_EXCLUDE
-                Settings.perAppProxyEnabled = true
-            }
-        }
-        _proxyScope.value = readProxyScope()
-        refreshProxyConfig()
-    }
 
     // ---- simple routing rules ----
 
@@ -332,7 +306,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (Settings.selectedOutboundTag == ConfigBuilder.SMART_TAG) return
         Settings.selectedOutboundTag = ConfigBuilder.SMART_TAG
         _selectedOutboundTag.value = ConfigBuilder.SMART_TAG
-        refreshSplitRuleStatus()
         viewModelScope.launch(Dispatchers.IO) {
             if (_status.value == Status.Started) {
                 // hot-apply the effective selection (smartActiveTag / auto)
@@ -383,14 +356,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private val _customRules = MutableStateFlow(CustomRulesStore.rules.toList())
-    val customRules: StateFlow<List<CustomRouteRule>> = _customRules
 
     private val _dnsOverrides = MutableStateFlow(DnsOverridesStore.entries.toList())
     val dnsOverrides: StateFlow<List<DnsOverrideEntry>> = _dnsOverrides
-
-    private val _splitRuleStatus = MutableStateFlow(computeSplitRuleStatus())
-    val splitRuleStatus: StateFlow<SplitRuleStatus> = _splitRuleStatus
 
     private var pollJob: Job? = null
     private var startingWatchdog: Job? = null
@@ -462,7 +430,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
             override fun updateGroups(newGroups: MutableList<OutboundGroup>) {
                 _groups.value = newGroups.map(::convertGroup)
-                refreshSplitRuleStatus()
             }
 
             override fun updateOutbounds(outbounds: List<io.nekohasekai.libbox.OutboundGroupItem>) {
@@ -786,7 +753,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 "direct" -> ConfigBuilder.OutboundMode.DIRECT
                 else -> ConfigBuilder.OutboundMode.RULE
             }
-            refreshSplitRuleStatus()
             // regenerate with the new mode, then hot-reload so a running core
             // picks up the new route.final / CN bypass rules immediately
             val config = SubscriptionRepository.regenerateActiveConfig()
@@ -799,7 +765,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun selectNode(groupTag: String, itemTag: String) {
         Settings.selectedOutboundTag = itemTag
         _selectedOutboundTag.value = itemTag
-        refreshSplitRuleStatus()
         // picking a concrete node exits smart mode
         if (itemTag != com.interstellar.proxy.data.config.ConfigBuilder.SMART_TAG) {
             smartEngine.stop()
@@ -823,32 +788,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun setSplitRulesEnabled(enabled: Boolean) {
-        Settings.splitRulesEnabled = enabled
-        refreshSplitRuleStatus()
-        refreshProxyConfig()
-    }
 
-    fun upsertCustomRule(rule: CustomRouteRule) {
-        CustomRulesStore.upsert(rule)
-        _customRules.value = CustomRulesStore.rules.toList()
-        refreshSplitRuleStatus()
-        refreshProxyConfig()
-    }
 
-    fun removeCustomRule(id: String) {
-        CustomRulesStore.remove(id)
-        _customRules.value = CustomRulesStore.rules.toList()
-        refreshSplitRuleStatus()
-        refreshProxyConfig()
-    }
 
-    fun setCustomRuleEnabled(id: String, enabled: Boolean) {
-        CustomRulesStore.setEnabled(id, enabled)
-        _customRules.value = CustomRulesStore.rules.toList()
-        refreshSplitRuleStatus()
-        refreshProxyConfig()
-    }
 
     fun upsertDnsOverride(entry: DnsOverrideEntry) {
         DnsOverridesStore.upsert(entry)
@@ -868,20 +810,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         refreshProxyConfig()
     }
 
-    private fun refreshSplitRuleStatus() {
-        _splitRuleStatus.value = computeSplitRuleStatus()
-    }
 
-    private fun computeSplitRuleStatus(): SplitRuleStatus {
-        val has = CustomRulesStore.rules.any { it.enabled }
-        val master = Settings.splitRulesEnabled
-        val clashRule = Settings.outboundMode == ConfigBuilder.OutboundMode.RULE
-        return SplitRuleStatus(
-            hasEnabledRules = has,
-            masterEnabled = master,
-            active = has && master && clashRule,
-        )
-    }
 
     fun urlTest(groupTag: String) {
         if (_testing.value) return
@@ -1148,12 +1077,24 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun addSubscriptionFromText(name: String, text: String) {
-        viewModelScope.launch(Dispatchers.IO) {
+        // Tracked like the URL path so Cancel can actually abort a text import
+        // (previously addSubJob was only assigned here in the URL branch, so
+        // cancelling a paste let the import complete anyway).
+        addSubJob = viewModelScope.launch(Dispatchers.IO) {
+            _busy.value = true
             _addingSub.value = true
             _addSubError.value = null
             try {
                 importContent(name.ifBlank { str(com.interstellar.proxy.R.string.vm_local_subscription) }, null, text, null)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                val msg = str(com.interstellar.proxy.R.string.vm_download_failed, e.message ?: "")
+                _message.value = msg
+                _addSubError.value = msg
             } finally {
+                addSubJob = null
+                _busy.value = false
                 _addingSub.value = false
             }
         }
@@ -1400,7 +1341,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (id == _activeSubscriptionId.value) return
         SubscriptionRepository.activeSubscriptionId = id
         _activeSubscriptionId.value = id
-        refreshSplitRuleStatus()
         // regenerate + hot-reload the running core
         refreshProxyConfig()
     }

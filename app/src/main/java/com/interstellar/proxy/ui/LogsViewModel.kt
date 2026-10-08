@@ -7,7 +7,9 @@ import com.interstellar.proxy.core.AppLog
 import com.interstellar.proxy.utils.CommandClient
 import com.interstellar.proxy.utils.CommandTarget
 import io.nekohasekai.libbox.LogEntry
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
@@ -51,14 +53,30 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
     )
 
     private var appLogJob: Job? = null
+    private var reconnectJob: Job? = null
 
     fun connect() {
         startAppLogCollector()
         client.connect()
+        // poll-reconnect: libbox's own client only retries briefly and then
+        // gives up without redialling, so a screen that was open before the VPN
+        // started would show only [app] lines and "not running" forever. The box
+        // may come up at any time; keep redialling while we are disconnected.
+        // (Same approach as AppViewModel/ConnectionsViewModel.)
+        if (reconnectJob?.isActive != true) {
+            reconnectJob = viewModelScope.launch(Dispatchers.IO) {
+                while (isActive) {
+                    delay(2000)
+                    if (!_connected.value) client.connect()
+                }
+            }
+        }
     }
 
     fun disconnect() {
         client.disconnect()
+        reconnectJob?.cancel()
+        reconnectJob = null
         appLogJob?.cancel()
         appLogJob = null
     }

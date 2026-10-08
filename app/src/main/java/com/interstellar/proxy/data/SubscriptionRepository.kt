@@ -242,10 +242,7 @@ object SubscriptionRepository {
             fallbackDirect = Settings.fallbackDirectEnabled,
             adBlock = Settings.adBlockEnabled,
             selectedNodeTag = selectedTag,
-            customRules = CustomRulesStore.rules.toList(),
             dnsOverrides = DnsOverridesStore.enabled(),
-            applyNodeFilterRules = Settings.splitRulesEnabled &&
-                Settings.outboundMode == ConfigBuilder.OutboundMode.RULE,
             regionGroupsEnabled = regionGroups,
             includeTun = includeTun,
             simpleRules = com.interstellar.proxy.data.SimpleRulesStore.enabled(),

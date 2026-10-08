@@ -24,11 +24,11 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -38,7 +38,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.interstellar.proxy.BuildConfig
 import com.interstellar.proxy.R
-import com.interstellar.proxy.data.CustomRulesStore
 import com.interstellar.proxy.data.DnsOverridesStore
 import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.data.net.AppUpdateChecker
@@ -68,7 +67,7 @@ fun setLanguageChangedListener(listener: () -> Unit) {
 
 enum class SettingsSubPage { Settings, PerApp, Connections, Logs, Rules, Dns, Proxy }
 
-/** Bottom-dock root tabs (satelite's navbar, phone layout). */
+/** Bottom-dock root tabs (phone layout). */
 /**
  * What the packaged core reports at runtime. This is `constant.Version` read back
  * through libbox, i.e. the value actually baked into the shipped libbox.so — not
@@ -83,7 +82,7 @@ private fun coreRuntimeVersion(): String {
 
 enum class MainTab { Home, Nodes, Subscriptions, Logs, Settings }
 
-/** hiddify-style: phone uses 2 tabs (Home/Settings); these pages push in. */
+/** Sub-pages pushed on top of the bottom-dock tabs. */
 @Composable
 fun settingsSubPageTitle(page: SettingsSubPage): String = when (page) {
     SettingsSubPage.Settings -> stringResource(R.string.settings_title)
@@ -549,7 +548,11 @@ private fun PrefNavRow(
             )
             Spacer(Modifier.width(6.dp))
         }
-        Text("›", color = colors.textTertiary, fontSize = 20.sp)
+        // Only show the disclosure affordance when the row actually navigates;
+        // info-only rows (version / core / build date) must not look tappable.
+        if (onClick != null) {
+            Text("›", color = colors.textTertiary, fontSize = 20.sp)
+        }
     }
 }
 
@@ -644,7 +647,6 @@ private fun AccentDot(preset: Accents.Preset, selected: Boolean, modifier: Modif
 fun ProxySettingsPage(viewModel: com.interstellar.proxy.ui.AppViewModel, onOpen: (SettingsSubPage) -> Unit) {
     val colors = LocalInterstellarColors.current
     val routingMode by viewModel.routingMode.collectAsState()
-    val proxyScope by viewModel.proxyScope.collectAsState()
 
     Column(
         modifier = Modifier
