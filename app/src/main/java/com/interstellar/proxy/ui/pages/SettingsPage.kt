@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -31,9 +32,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.interstellar.proxy.BuildConfig
@@ -297,25 +301,35 @@ fun SettingsPage(onOpen: (SettingsSubPage) -> Unit, onProxyChanged: () -> Unit =
                     }
                 },
             )
-            PrefNavRow(title = stringResource(R.string.settings_version_title), value = BuildConfig.VERSION_NAME)
+            // Read-only metadata uses PrefInfoRow (label pinned to one line, value
+            // right-aligned and ellipsised) so a long value can never squeeze the
+            // label — previously "内核" wrapped to two lines next to a long version.
+            // These rows are not navigation, so they get no disclosure chevron.
+            PrefInfoRow(label = stringResource(R.string.settings_version_title), value = BuildConfig.VERSION_NAME)
             UpdateCheckRow()
             // Product version and git revision are shown as separate rows: the
             // version string is not a revision, and printing one where the other
             // belongs is how an APK ends up claiming the wrong core.
-            PrefNavRow(
-                title = stringResource(R.string.settings_core_title),
+            PrefInfoRow(
+                label = stringResource(R.string.settings_core_title),
                 value = "sing-box ${coreRuntimeVersion()}",
             )
-            PrefNavRow(title = stringResource(R.string.settings_core_source_title), value = BuildConfig.CORE_REPO)
-            PrefNavRow(
-                title = stringResource(R.string.settings_core_branch_title),
+            PrefInfoRow(
+                label = stringResource(R.string.settings_core_source_title),
+                value = BuildConfig.CORE_REPO,
+            )
+            PrefInfoRow(
+                label = stringResource(R.string.settings_core_branch_title),
                 value = BuildConfig.CORE_BRANCH,
             )
-            PrefNavRow(
-                title = stringResource(R.string.settings_core_revision_title),
+            PrefInfoRow(
+                label = stringResource(R.string.settings_core_revision_title),
                 value = BuildConfig.CORE_COMMIT,
             )
-            PrefNavRow(title = stringResource(R.string.settings_build_date_title), value = BuildConfig.BUILD_DATE)
+            PrefInfoRow(
+                label = stringResource(R.string.settings_build_date_title),
+                value = BuildConfig.BUILD_DATE,
+            )
         }
 
         Spacer(Modifier.height(20.dp))
@@ -476,10 +490,19 @@ private fun PrefToggleRow(
     title: String,
     desc: String? = null,
     checked: Boolean,
+    enabled: Boolean = true,
     onChange: (Boolean) -> Unit,
 ) {
+    // A disabled row keeps rendering its saved state but cannot be toggled, so
+    // a setting that only applies in one routing mode cannot be changed while
+    // it is inert.
     PrefRowShell(title = title, desc = desc) {
-        IosSwitch(checked = checked, onChange = onChange)
+        Box(modifier = Modifier.alpha(if (enabled) 1f else 0.45f)) {
+            IosSwitch(
+                checked = checked,
+                onChange = { if (enabled) onChange(it) },
+            )
+        }
     }
 }
 
@@ -491,6 +514,7 @@ private fun PrefSegRow(
     desc: String? = null,
     items: List<String>,
     selected: Int,
+    enabled: Boolean = true,
     onSelect: (Int) -> Unit,
     layout: SegLayout = SegLayout.Trailing,
 ) {
@@ -499,6 +523,7 @@ private fun PrefSegRow(
             SegmentedControl(
                 items = items,
                 selected = selected,
+                enabled = enabled,
                 onSelect = onSelect,
                 modifier = Modifier.width(if (items.size >= 3) 190.dp else 128.dp),
             )
@@ -555,6 +580,59 @@ private fun PrefNavRow(
         }
     }
 }
+
+/**
+ * Read-only label/value metadata row (Settings → About).
+ *
+ * Generic by design — NOT a special case for any particular label. The label is
+ * pinned to a single line (a long value previously squeezed e.g. "内核" into two
+ * lines), while the value absorbs the remaining width, right-aligns and
+ * ellipsises. A long value can therefore only ever truncate itself.
+ */
+@Composable
+private fun PrefInfoRow(
+    label: String,
+    value: String,
+) {
+    val colors = LocalInterstellarColors.current
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+    ) {
+        Text(
+            label,
+            color = colors.text,
+            fontSize = 15.sp,
+            fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
+            maxLines = 1,
+            softWrap = false,
+            // A shared minimum width gives every row the same value start, so the
+            // left column does not drift with each label's length. `weight(fill =
+            // false)` then keeps it at its natural width when space is tight, so a
+            // narrow screen shrinks the label before it would ever wrap or push the
+            // value out of the card.
+            modifier = Modifier
+                .weight(1f, fill = false)
+                .widthIn(min = LABEL_MIN_WIDTH),
+        )
+        Spacer(Modifier.width(12.dp))
+        Text(
+            value,
+            color = colors.textTertiary,
+            fontSize = 14.sp,
+            maxLines = 1,
+            softWrap = false,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.End,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+/** Shared label column width for [PrefInfoRow], so value columns line up. */
+private val LABEL_MIN_WIDTH = 104.dp
 
 /** Macaron accent dots; the selected one grows and gains a ring. */
 @Composable
@@ -677,6 +755,12 @@ fun ProxySettingsPage(viewModel: com.interstellar.proxy.ui.AppViewModel, onOpen:
 
         Spacer(Modifier.height(22.dp))
 
+        // These apply only in Rule mode (ConfigBuilder gates their route rules on
+        // OutboundMode.RULE). Outside it they are inert, so disable the control
+        // and say why — the saved value is left untouched and returns with Rule.
+        val ruleModeOn = routingMode == "rule"
+        val ruleOnlyHint = stringResource(R.string.settings_rule_mode_only)
+
         // ---- 规则细则 ----
         PrefSectionLabel(stringResource(R.string.settings_rule_details))
         GlassCard(modifier = Modifier.fillMaxWidth(), contentPadding = 6.dp) {
@@ -698,8 +782,13 @@ fun ProxySettingsPage(viewModel: com.interstellar.proxy.ui.AppViewModel, onOpen:
             )
             PrefToggleRow(
                 title = stringResource(R.string.settings_bypass_cn_title),
-                desc = stringResource(R.string.settings_bypass_cn_desc),
+                desc = if (ruleModeOn) {
+                    stringResource(R.string.settings_bypass_cn_desc)
+                } else {
+                    stringResource(R.string.settings_bypass_cn_desc) + " · " + ruleOnlyHint
+                },
                 checked = bypassCn,
+                enabled = ruleModeOn,
                 onChange = {
                     bypassCn = it
                     Settings.bypassCnEnabled = it
@@ -708,8 +797,13 @@ fun ProxySettingsPage(viewModel: com.interstellar.proxy.ui.AppViewModel, onOpen:
             )
             PrefToggleRow(
                 title = stringResource(R.string.settings_overseas_proxy_title),
-                desc = stringResource(R.string.settings_overseas_proxy_desc),
+                desc = if (ruleModeOn) {
+                    stringResource(R.string.settings_overseas_proxy_desc)
+                } else {
+                    stringResource(R.string.settings_overseas_proxy_desc) + " · " + ruleOnlyHint
+                },
                 checked = overseasProxy,
+                enabled = ruleModeOn,
                 onChange = {
                     overseasProxy = it
                     Settings.overseasProxyEnabled = it
@@ -718,12 +812,17 @@ fun ProxySettingsPage(viewModel: com.interstellar.proxy.ui.AppViewModel, onOpen:
             )
             PrefSegRow(
                 title = stringResource(R.string.settings_fallback_title),
-                desc = stringResource(R.string.settings_fallback_desc),
+                desc = if (ruleModeOn) {
+                    stringResource(R.string.settings_fallback_desc)
+                } else {
+                    stringResource(R.string.settings_fallback_desc) + " · " + ruleOnlyHint
+                },
                 items = listOf(
                     stringResource(R.string.rule_action_proxy),
                     stringResource(R.string.rule_action_direct),
                 ),
                 selected = if (fallbackDirect) 1 else 0,
+                enabled = ruleModeOn,
                 onSelect = { i ->
                     fallbackDirect = i == 1
                     Settings.fallbackDirectEnabled = i == 1

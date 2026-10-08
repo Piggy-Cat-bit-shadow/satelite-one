@@ -49,6 +49,22 @@ data class ClashModeState(
     val current: String = "rule",
 )
 
+/**
+ * Resolve which group a manual url-test should target.
+ *
+ * urltest groups (auto, per-region) are testable directly, so the requested tag
+ * is honoured. The main entry is a *selector* whose members mix group and node
+ * tags; the kernel's per-item pass skips those ("大量未测"), so a selector (or an
+ * unknown/blank tag) falls back to [ConfigBuilder.AUTO_TAG], whose members are
+ * every node. Pure so the mapping is unit-testable without a ViewModel.
+ */
+internal fun resolveUrlTestTarget(groupTag: String, groups: List<CoreGroup>): String {
+    if (groupTag.isBlank()) return ConfigBuilder.AUTO_TAG
+    val live = groups.find { it.tag == groupTag }
+    val isUrlTest = live != null && live.type.equals("urltest", ignoreCase = true)
+    return if (isUrlTest) groupTag else ConfigBuilder.AUTO_TAG
+}
+
 /** Exit-IP probe lifecycle for the dashboard 网络探测 card. */
 sealed interface ProbeState {
     data object Idle : ProbeState
@@ -812,22 +828,30 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
 
 
+    /**
+     * Resolve the group a manual url-test should target.
+     *
+     * urltest groups (auto, per-region) are testable directly. The main entry is
+     * a *selector* whose members mix group and node tags, and the kernel's
+     * per-item pass skips those wholesale ("大量未测"), so a selector keeps
+     * falling back to [ConfigBuilder.AUTO_TAG], whose members are every node.
+     */
+    private fun urlTestTarget(groupTag: String): String =
+        resolveUrlTestTarget(groupTag, _groups.value)
+
     fun urlTest(groupTag: String) {
         if (_testing.value) return
+        val target = urlTestTarget(groupTag)
         _testing.value = true
         _testProgress.value = 0 to urlTestTotal()
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 if (_status.value == Status.Started) {
-                    // Test the AUTO urltest group (members = every node tag),
-                    // not the selector: the selector's mixed group+node items
-                    // get skipped wholesale by the kernel's per-item pass —
-                    // that's the "大量未测" at the bottom.
-                    if (!runKernelUrlTest(manual = true)) {
+                    if (!runKernelUrlTest(manual = true, target = target)) {
                         _message.value = str(com.interstellar.proxy.R.string.vm_test_failed_send)
                     }
                 } else {
-                    runDisconnectedUrlTest()
+                    runDisconnectedUrlTest(target)
                 }
             } catch (e: Exception) {
                 _message.value = str(com.interstellar.proxy.R.string.vm_test_failed, e.message ?: "")
@@ -876,7 +900,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      * report every member stamped after the epoch — bounded by the kernel's
      * per-node timeout plus margin. False = the command could not be sent.
      */
-    private suspend fun runKernelUrlTest(manual: Boolean): Boolean =
+    private suspend fun runKernelUrlTest(manual: Boolean, target: String = ConfigBuilder.AUTO_TAG): Boolean =
         kernelUrlTestMutex.withLock {
             kernelTestManual = manual
             testStartEpoch = System.currentTimeMillis() / 1000
@@ -887,7 +911,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 _testProgress.value = 0 to urlTestTotal()
             }
             val ok = runCatching {
-                CommandTarget.standaloneClient().urlTest(ConfigBuilder.AUTO_TAG)
+                CommandTarget.standaloneClient().urlTest(target)
             }.isSuccess
             if (!ok) {
                 testStartEpoch = 0
@@ -903,7 +927,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      * Spin up the core without TUN so url-test can run while the UI stays
      * 未连接. Restores the previous config afterwards.
      */
-    private suspend fun runDisconnectedUrlTest() {
+    private suspend fun runDisconnectedUrlTest(target: String = ConfigBuilder.AUTO_TAG) {
         probing = true
         probeSocketUp = false
         val previous = ConfigStore.readActiveConfig()
@@ -933,7 +957,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             kernelTestManual = true // manual run: progress + settle own the UI state
             testStartEpoch = System.currentTimeMillis() / 1000
             val ok = runCatching {
-                CommandTarget.standaloneClient().urlTest(ConfigBuilder.AUTO_TAG)
+                CommandTarget.standaloneClient().urlTest(target)
             }.isSuccess
             if (!ok) throw IllegalStateException(str(com.interstellar.proxy.R.string.vm_test_cmd_failed))
             // bounded by the kernel's per-node timeout (15s) + margin —

@@ -37,6 +37,8 @@ import com.interstellar.proxy.R
 import com.interstellar.proxy.data.DnsOverridesStore
 import com.interstellar.proxy.data.model.DnsOverrideEntry
 import com.interstellar.proxy.data.model.isValidIpLiteral
+import com.interstellar.proxy.data.Settings
+import com.interstellar.proxy.data.SubscriptionRepository
 import com.interstellar.proxy.ui.AppViewModel
 import com.interstellar.proxy.ui.components.IosCard
 import com.interstellar.proxy.ui.components.IosHairline
@@ -54,6 +56,20 @@ fun DnsOverridesPage(viewModel: AppViewModel) {
     var editing by remember { mutableStateOf<DnsOverrideEntry?>(null) }
     var creating by remember { mutableStateOf(false) }
 
+    // In raw-config mode the active subscription's own config is passed through
+    // verbatim (SubscriptionRepository.applyRawConfigIfMatching) and it has no
+    // DNS-override hook, so these entries would be silently ignored. Disable
+    // editing and say why instead of letting an edit look effective.
+    val rawConfigActive = remember(entries) {
+        Settings.useRawConfigEnabled &&
+            com.interstellar.proxy.data.subscription.RawConfigFormat.from(
+                SubscriptionRepository.activeSubscription()?.configFormat,
+            ) == com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX &&
+            SubscriptionRepository.rawFileOf(
+                SubscriptionRepository.activeSubscriptionId,
+            ).isFile
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -66,11 +82,17 @@ fun DnsOverridesPage(viewModel: AppViewModel) {
             Spacer(Modifier.weight(1f))
             Text(
                 stringResource(R.string.dns_add),
-                color = colors.accent,
+                color = if (rawConfigActive) colors.textTertiary else colors.accent,
                 fontSize = 17.sp,
                 modifier = Modifier
                     .clip(RoundedCornerShape(8.dp))
-                    .iosPressable { creating = true }
+                    .then(
+                        if (rawConfigActive) {
+                            Modifier
+                        } else {
+                            Modifier.iosPressable { creating = true }
+                        },
+                    )
                     .padding(horizontal = 4.dp, vertical = 6.dp),
             )
         }
@@ -82,6 +104,16 @@ fun DnsOverridesPage(viewModel: AppViewModel) {
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             IosSectionLabel(stringResource(R.string.dns_title))
+            if (rawConfigActive) {
+                IosCard(modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        stringResource(R.string.dns_raw_mode_hint),
+                        color = colors.textTertiary,
+                        fontSize = 14.sp,
+                        modifier = Modifier.padding(16.dp),
+                    )
+                }
+            }
             if (entries.isEmpty()) {
                 IosCard(modifier = Modifier.fillMaxWidth()) {
                     Text(
@@ -97,8 +129,8 @@ fun DnsOverridesPage(viewModel: AppViewModel) {
                         entries.forEachIndexed { index, entry ->
                             DnsOverrideRow(
                                 entry = entry,
-                                onToggle = { viewModel.setDnsOverrideEnabled(entry.id, it) },
-                                onClick = { editing = entry },
+                                onToggle = { if (!rawConfigActive) viewModel.setDnsOverrideEnabled(entry.id, it) },
+                                onClick = { if (!rawConfigActive) editing = entry },
                             )
                             if (index != entries.lastIndex) IosHairline(startInset = 16.dp)
                         }
@@ -106,7 +138,11 @@ fun DnsOverridesPage(viewModel: AppViewModel) {
                 }
             }
             IosSectionFooter(
-                stringResource(R.string.dns_footer),
+                if (rawConfigActive) {
+                    stringResource(R.string.dns_raw_mode_hint)
+                } else {
+                    stringResource(R.string.dns_footer)
+                },
             )
             Spacer(Modifier.height(20.dp))
         }

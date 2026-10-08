@@ -291,6 +291,7 @@
     <string name="dns_add">Add</string>
     <string name="dns_title">Custom DNS records</string>
     <string name="dns_empty_hint">No custom records yet. For example, pin example.com to 10.0.0.1 so it skips upstream DNS.</string>
+    <string name="dns_raw_mode_hint">Raw config mode passes the subscription config through unchanged, so DNS overrides do not apply and cannot be edited here</string>
     <string name="dns_footer">Exact-domain matching (like system hosts); subdomains must be added separately, e.g. example.com and www.example.com. Changes regenerate the config immediately and hot-reload a running core.</string>
     <string name="dns_unnamed">Unnamed record</string>
     <string name="dns_entry_summary">"%1$d domains  ·  %2$s"</string>
@@ -376,6 +377,7 @@
     <string name="settings_mode_title">Mode</string>
     <string name="settings_mode_desc">Where proxied traffic is headed</string>
     <string name="settings_routing_mode_footer">Rule mode splits by destination (CN/LAN/custom); global sends everything through the node; direct keeps the VPN but does not proxy.</string>
+    <string name="settings_rule_mode_only">Rule mode only</string>
     <string name="settings_rule_details">Rule details</string>
     <string name="settings_bypass_lan_title">Bypass LAN</string>
     <string name="settings_bypass_lan_desc">NAS, printers and routers skip the proxy</string>

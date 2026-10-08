@@ -291,6 +291,7 @@
     <string name="dns_add">添加</string>
     <string name="dns_title">自定义域名解析</string>
     <string name="dns_empty_hint">还没有自定义解析。例如把 example.com 固定到 10.0.0.1，访问时不再走上游 DNS。</string>
+    <string name="dns_raw_mode_hint">原始配置模式下会直接透传订阅自带配置，DNS 覆盖不会生效，因此暂不可编辑</string>
     <string name="dns_footer">匹配为精确域名（同系统 hosts），子域名需单独添加，如 example.com 和 www.example.com。修改后立即重新生成配置，内核运行中自动热重载。</string>
     <string name="dns_unnamed">未命名解析</string>
     <string name="dns_entry_summary">"%1$d 个域名  ·  %2$s"</string>
@@ -376,6 +377,7 @@
     <string name="settings_mode_title">模式</string>
     <string name="settings_mode_desc">被代理流量的目的地走向</string>
     <string name="settings_routing_mode_footer">规则模式按目的地规则(大陆/局域网/自定义)分流;全局模式全部经节点;直连保持 VPN 但不代理。</string>
+    <string name="settings_rule_mode_only">仅规则模式下生效</string>
     <string name="settings_rule_details">规则细则</string>
     <string name="settings_bypass_lan_title">绕过局域网</string>
     <string name="settings_bypass_lan_desc">访问 NAS、打印机、路由器不走代理</string>

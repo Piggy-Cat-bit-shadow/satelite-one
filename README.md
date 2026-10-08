@@ -1,10 +1,8 @@
 <div align="center">
 
-<img src="assets/android/ic_launcher-web.png" width="110" alt="星际穿越" />
+<img src="assets/android/ic_launcher-web.png" width="110" alt="Jiejiebox" />
 
-# 星际穿越 · interstellar
-
-**星河漫漫， 穿越光年。**
+# Jiejiebox
 
 Android 7.0+ · v0.5.10 · Kotlin + Jetpack Compose
 

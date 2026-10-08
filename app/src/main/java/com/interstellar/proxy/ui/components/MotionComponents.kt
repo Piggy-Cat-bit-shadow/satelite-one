@@ -33,6 +33,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
@@ -82,6 +83,7 @@ fun SegmentedControl(
     onSelect: (Int) -> Unit,
     modifier: Modifier = Modifier,
     controlHeight: Dp = 36.dp,
+    enabled: Boolean = true,
 ) {
     val colors = LocalInterstellarColors.current
 
@@ -90,6 +92,7 @@ fun SegmentedControl(
             .height(controlHeight)
             .clip(RoundedCornerShape(50))
             .background(colors.bgDeep)
+            .alpha(if (enabled) 1f else 0.45f)
             .padding(3.dp),
     ) {
         val segWidth = maxWidth / items.size
@@ -127,7 +130,10 @@ fun SegmentedControl(
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxHeight()
+                        // disabled segments ignore taps entirely (the saved value
+                        // stays untouched; only the ability to change it goes away)
                         .clickable(
+                            enabled = enabled,
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null,
                         ) { onSelect(index) },
