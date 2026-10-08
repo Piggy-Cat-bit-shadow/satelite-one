@@ -19,7 +19,7 @@ import org.junit.Test
  *     clash_api, no smart group. A future change that quietly re-adds client
  *     policy to the generator must fail here.
  */
-class ConfigBuilderTest {
+class MinimalConfigBuilderTest {
 
     private val nodes = listOf(
         ProxyNode(
@@ -34,8 +34,8 @@ class ConfigBuilderTest {
         ),
     )
 
-    private fun config(options: ConfigBuilder.BuildOptions = ConfigBuilder.BuildOptions()): JsonObject =
-        Json.parseToJsonElement(ConfigBuilder.build(nodes, options)).jsonObject
+    private fun config(options: MinimalConfigBuilder.BuildOptions = MinimalConfigBuilder.BuildOptions()): JsonObject =
+        Json.parseToJsonElement(MinimalConfigBuilder.build(nodes, options)).jsonObject
 
     private fun objs(json: JsonObject, key: String): List<JsonObject> =
         json[key]!!.jsonArray.map { it.jsonObject }
@@ -51,9 +51,9 @@ class ConfigBuilderTest {
         check(types.none { it == "block" }) { "no block outbound: ad blocking is gone" }
 
         val selector = outbounds.first { it["type"]!!.jsonPrimitive.content == "selector" }
-        check(selector["tag"]!!.jsonPrimitive.content == ConfigBuilder.GROUP_TAG)
+        check(selector["tag"]!!.jsonPrimitive.content == MinimalConfigBuilder.GROUP_TAG)
         val members = selector["outbounds"]!!.jsonArray.map { it.jsonPrimitive.content }
-        check(members.first() == ConfigBuilder.AUTO_TAG) { "auto first" }
+        check(members.first() == MinimalConfigBuilder.AUTO_TAG) { "auto first" }
         check(members.containsAll(listOf("🇭🇰 香港 01", "🇺🇸 洛杉矶 01"))) { "every node reachable" }
         check(members.size == 3) { "auto + 2 nodes, no derived region groups: $members" }
     }
@@ -67,8 +67,8 @@ class ConfigBuilderTest {
         check(rules[1]["protocol"]!!.jsonPrimitive.content == "dns")
         check(rules[1]["action"]!!.jsonPrimitive.content == "hijack-dns")
         check(rules[2]["ip_is_private"]!!.jsonPrimitive.content == "true")
-        check(rules[2]["outbound"]!!.jsonPrimitive.content == ConfigBuilder.DIRECT_TAG)
-        check(route["final"]!!.jsonPrimitive.content == ConfigBuilder.GROUP_TAG) { "everything else rides the selector" }
+        check(rules[2]["outbound"]!!.jsonPrimitive.content == MinimalConfigBuilder.DIRECT_TAG)
+        check(route["final"]!!.jsonPrimitive.content == MinimalConfigBuilder.GROUP_TAG) { "everything else rides the selector" }
     }
 
     @Test
@@ -81,7 +81,7 @@ class ConfigBuilderTest {
         val remote = servers[1]
         check(remote["tag"]!!.jsonPrimitive.content == "dns-remote")
         check(remote["type"]!!.jsonPrimitive.content == "https")
-        check(remote["detour"]!!.jsonPrimitive.content == ConfigBuilder.GROUP_TAG) { "app DNS rides the selector" }
+        check(remote["detour"]!!.jsonPrimitive.content == MinimalConfigBuilder.GROUP_TAG) { "app DNS rides the selector" }
 
         val rules = dns["rules"]!!.jsonArray.map { it.jsonObject }
         check(rules.size == 1) { "only the outbound-dial bootstrap rule: $rules" }
@@ -98,13 +98,17 @@ class ConfigBuilderTest {
         val excluded = tun["route_exclude_address"]!!.jsonArray.map { it.jsonPrimitive.content }
         check(excluded == listOf("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")) { "LAN bypass: $excluded" }
         check(tun["auto_route"]!!.jsonPrimitive.content == "true")
+        // The netstack must be sing-box's choice: writing "stack" here is what
+        // used to force every Android libbox to ship gVisor.
+        check("stack" !in tun) { "the app must not pin a tun netstack: $tun" }
+        check("mtu" !in tun) { "the app must not pin a tun mtu: $tun" }
         val mixed = inbounds.first { it["type"]!!.jsonPrimitive.content == "mixed" }
         check(mixed["listen_port"]!!.jsonPrimitive.content == "2080")
     }
 
     @Test
     fun `includeTun false drops the tun so url-test can run without the VPN`() {
-        val types = objs(config(ConfigBuilder.BuildOptions(includeTun = false)), "inbounds")
+        val types = objs(config(MinimalConfigBuilder.BuildOptions(includeTun = false)), "inbounds")
             .map { it["type"]!!.jsonPrimitive.content }
         check("tun" !in types) { "tun skipped for a headless url-test" }
         check("mixed" in types)
@@ -112,23 +116,24 @@ class ConfigBuilderTest {
 
     @Test
     fun `selected node tag becomes the selector default`() {
-        val selector = objs(config(ConfigBuilder.BuildOptions(selectedNodeTag = "🇺🇸 洛杉矶 01")), "outbounds")
+        val selector = objs(config(MinimalConfigBuilder.BuildOptions(selectedNodeTag = "🇺🇸 洛杉矶 01")), "outbounds")
             .first { it["type"]!!.jsonPrimitive.content == "selector" }
         check(selector["default"]!!.jsonPrimitive.content == "🇺🇸 洛杉矶 01")
         // unknown tag falls back to auto rather than producing an invalid default
-        val fallback = objs(config(ConfigBuilder.BuildOptions(selectedNodeTag = "nope")), "outbounds")
+        val fallback = objs(config(MinimalConfigBuilder.BuildOptions(selectedNodeTag = "nope")), "outbounds")
             .first { it["type"]!!.jsonPrimitive.content == "selector" }
-        check(fallback["default"]!!.jsonPrimitive.content == ConfigBuilder.AUTO_TAG)
+        check(fallback["default"]!!.jsonPrimitive.content == MinimalConfigBuilder.AUTO_TAG)
     }
 
     // ---- no app-side policy ----
 
     @Test
     fun `no app-side network policy is injected`() {
-        val text = ConfigBuilder.build(nodes, ConfigBuilder.BuildOptions())
+        val text = MinimalConfigBuilder.build(nodes, MinimalConfigBuilder.BuildOptions())
         for (forbidden in listOf(
             "rule_set", "geosite", "geoip", "category-ads-all", "geolocation",
             "clash_api", "smart", "adblock", "dns-hosts", "block",
+            "gvisor", "stack", "outbound_mode", "bypass_cn", "overseas",
         )) {
             check(!text.contains(forbidden)) { "generated config must not contain '$forbidden'" }
         }
@@ -151,11 +156,11 @@ class ConfigBuilderTest {
             ProxyNode(id = "2", name = "direct", type = NodeType.VMESS, server = "b", port = 1, uuid = "u"),
         )
         val selector = objs(
-            Json.parseToJsonElement(ConfigBuilder.build(clash, ConfigBuilder.BuildOptions())).jsonObject,
+            Json.parseToJsonElement(MinimalConfigBuilder.build(clash, MinimalConfigBuilder.BuildOptions())).jsonObject,
             "outbounds",
         ).first { it["type"]!!.jsonPrimitive.content == "selector" }
         val members = selector["outbounds"]!!.jsonArray.map { it.jsonPrimitive.content }
-        check(members.count { it == ConfigBuilder.AUTO_TAG } == 1) { "one real auto only" }
-        check(members.count { it == ConfigBuilder.DIRECT_TAG } == 0) { "no node claims direct" }
+        check(members.count { it == MinimalConfigBuilder.AUTO_TAG } == 1) { "one real auto only" }
+        check(members.count { it == MinimalConfigBuilder.DIRECT_TAG } == 0) { "no node claims direct" }
     }
 }

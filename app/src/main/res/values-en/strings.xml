@@ -103,14 +103,8 @@
     <string name="dash_switch_node">Switch node</string>
     <string name="subs_title">Subscriptions</string>
     <string name="subs_add">＋ Add</string>
-    <string name="subs_config_mode_section">Config mode</string>
-    <string name="subs_use_raw_config_title">Use raw config</string>
-    <string name="subs_use_raw_config_on">Hand the active subscription\'s raw config to the core verbatim, with no rewrite</string>
-    <string name="subs_use_raw_config_off">When the subscription is a full config that matches the core, pass it through verbatim</string>
-    <string name="subs_use_raw_config_footer">The subscription config reaches the core as-is: groups, DNS, route and rules are all preserved and no rules are injected. Falls back to a minimal rewrite when the core does not match.</string>
     <string name="subs_mix_section">Merge subscriptions (Mix)</string>
     <string name="subs_mix_title">Merge multiple subscriptions</string>
-    <string name="subs_mix_unavailable">Unavailable in raw-config mode</string>
     <string name="subs_mix_checked_count">%1$d / %2$d subscriptions checked</string>
     <string name="subs_mix_footer">When on, the node pool is the union of all checked subscriptions; the nodes page marks each node\'s source. Traffic and expiry stay per subscription.</string>
     <string name="subs_auto_update_section">Auto update</string>

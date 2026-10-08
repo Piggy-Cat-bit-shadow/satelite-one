@@ -103,14 +103,8 @@
     <string name="dash_switch_node">切换节点</string>
     <string name="subs_title">订阅</string>
     <string name="subs_add">＋ 添加</string>
-    <string name="subs_config_mode_section">配置模式</string>
-    <string name="subs_use_raw_config_title">使用原始配置</string>
-    <string name="subs_use_raw_config_on">激活订阅的原始配置原文直供内核，不作任何改写</string>
-    <string name="subs_use_raw_config_off">订阅是完整配置且与内核匹配时,原文直供内核</string>
-    <string name="subs_use_raw_config_footer">开启后订阅配置原样交给内核：分组、DNS、路由与规则全部保留，App 不注入任何规则。内核不匹配时自动回退到最小配置重写。</string>
     <string name="subs_mix_section">合并订阅 (Mix)</string>
     <string name="subs_mix_title">合并多个订阅</string>
-    <string name="subs_mix_unavailable">原始配置模式下不可用</string>
     <string name="subs_mix_checked_count">已勾选 %1$d / %2$d 个订阅</string>
     <string name="subs_mix_footer">开启后节点池为所有勾选订阅的合集,节点页会标注来源;流量与到期仍按订阅独立显示。</string>
     <string name="subs_auto_update_section">自动更新</string>

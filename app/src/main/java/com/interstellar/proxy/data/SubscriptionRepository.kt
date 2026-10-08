@@ -1,7 +1,7 @@
 package com.interstellar.proxy.data
 
 import com.interstellar.proxy.InterstellarApplication
-import com.interstellar.proxy.data.config.ConfigBuilder
+import com.interstellar.proxy.data.config.MinimalConfigBuilder
 import com.interstellar.proxy.data.model.ProxyNode
 import io.nekohasekai.libbox.Libbox
 import kotlinx.coroutines.Dispatchers
@@ -155,20 +155,35 @@ object SubscriptionRepository {
      * checked subscriptions (in store order), off = the active subscription.
      * Single derivation shared by the repository and the UI.
      */
+    /**
+     * True when this subscription is a complete sing-box config whose body is
+     * still on disk — i.e. it will be handed to the core verbatim.
+     *
+     * Raw configs are STANDALONE: they bring their own selector/urltest/route,
+     * so merging them into a node pool would mean rewriting them. The mix pool
+     * therefore only ever contains plain node subscriptions.
+     */
+    fun isRawConfig(sub: Subscription): Boolean =
+        com.interstellar.proxy.data.subscription.RawConfigFormat.from(sub.configFormat) ==
+            com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX &&
+            rawFileOf(sub.id).isFile
+
     fun poolOf(
         subscriptions: List<Subscription>,
         activeSubscriptionId: String,
         mixEnabled: Boolean,
         mixSubscriptionIds: Set<String>,
     ): List<ProxyNode> = if (mixEnabled) {
-        subscriptions.filter { it.id in mixSubscriptionIds }.flatMap { it.nodes }
+        subscriptions
+            .filter { it.id in mixSubscriptionIds && !isRawConfig(it) }
+            .flatMap { it.nodes }
     } else {
         subscriptions.find { it.id == activeSubscriptionId }?.nodes ?: emptyList()
     }
 
-    /** Subscriptions checked into the mix pool (store order). */
+    /** Subscriptions checked into the mix pool (store order; raw configs excluded). */
     fun mixedSubscriptions(): List<Subscription> =
-        subscriptions.filter { it.id in Settings.mixSubscriptionIds }
+        subscriptions.filter { it.id in Settings.mixSubscriptionIds && !isRawConfig(it) }
 
     fun activeNodes(): List<ProxyNode> =
         poolOf(subscriptions, activeSubscriptionId, Settings.mixEnabled, Settings.mixSubscriptionIds)
@@ -187,13 +202,15 @@ object SubscriptionRepository {
      */
     @Synchronized
     fun regenerateActiveConfig(includeTun: Boolean = true): String? {
-        // raw-config path: the active subscription IS a full config for this
-        // core, so it is handed to libbox byte-for-byte. The app injects no
-        // rules, rewrites no DNS, rebuilds no outbounds and never touches
-        // route.final — the config decides the behaviour. Format mismatch or a
-        // missing file falls through to the minimal rewrite below.
+        // Raw-config path — automatic, with no user switch to understand.
+        //
+        // If the active subscription's body is a complete sing-box config, it is
+        // handed to libbox byte-for-byte: no injected rules, no DNS rewrite, no
+        // outbound rebuild, no route.final override. The config decides the
+        // behaviour. Anything else (share links, base64 node lists, Clash YAML)
+        // is not a config, so it falls through to the minimal generator below.
         val activeSub = activeSubscription()
-        if (Settings.useRawConfigEnabled && activeSub != null) {
+        if (activeSub != null) {
             val rawApplied = applyRawConfigIfMatching(activeSub)
             if (rawApplied != null) return rawApplied
         }
@@ -215,13 +232,13 @@ object SubscriptionRepository {
         }
 
         val selectedTag = Settings.selectedOutboundTag.takeIf { it.isNotBlank() }
-            ?: ConfigBuilder.tagFor(nodes, selectedNodeId)
-            ?: ConfigBuilder.AUTO_TAG
-        val opts = ConfigBuilder.BuildOptions(
+            ?: MinimalConfigBuilder.tagFor(nodes, selectedNodeId)
+            ?: MinimalConfigBuilder.AUTO_TAG
+        val opts = MinimalConfigBuilder.BuildOptions(
             selectedNodeTag = selectedTag,
             includeTun = includeTun,
         )
-        val content = ConfigBuilder.build(nodes, opts)
+        val content = MinimalConfigBuilder.build(nodes, opts)
         return try {
             Libbox.checkConfig(content)
             ConfigStore.writeActiveConfig(content)

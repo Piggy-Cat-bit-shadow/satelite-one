@@ -5,7 +5,7 @@ import java.io.File
 
 /**
  * The active sing-box configuration. For now a single generated file;
- * subscription management (P2) regenerates it via ConfigBuilder.
+ * subscription management (P2) regenerates it via MinimalConfigBuilder.
  */
 object ConfigStore {
     private const val ACTIVE_CONFIG = "active.json"

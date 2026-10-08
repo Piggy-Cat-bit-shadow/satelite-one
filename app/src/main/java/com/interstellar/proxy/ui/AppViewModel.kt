@@ -13,7 +13,7 @@ import com.interstellar.proxy.constant.Status
 import com.interstellar.proxy.data.ConfigStore
 import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.data.SubscriptionRepository
-import com.interstellar.proxy.data.config.ConfigBuilder
+import com.interstellar.proxy.data.config.MinimalConfigBuilder
 import com.interstellar.proxy.data.net.SubscriptionFetcher
 import com.interstellar.proxy.data.subscription.SubscriptionParser
 import io.nekohasekai.libbox.Libbox
@@ -47,14 +47,14 @@ data class SpeedState(
  * urltest groups (auto) are testable directly, so the requested tag
  * is honoured. The main entry is a *selector* whose members mix group and node
  * tags; the kernel's per-item pass skips those ("大量未测"), so a selector (or an
- * unknown/blank tag) falls back to [ConfigBuilder.AUTO_TAG], whose members are
+ * unknown/blank tag) falls back to [MinimalConfigBuilder.AUTO_TAG], whose members are
  * every node. Pure so the mapping is unit-testable without a ViewModel.
  */
 internal fun resolveUrlTestTarget(groupTag: String, groups: List<CoreGroup>): String {
-    if (groupTag.isBlank()) return ConfigBuilder.AUTO_TAG
+    if (groupTag.isBlank()) return MinimalConfigBuilder.AUTO_TAG
     val live = groups.find { it.tag == groupTag }
     val isUrlTest = live != null && live.type.equals("urltest", ignoreCase = true)
-    return if (isUrlTest) groupTag else ConfigBuilder.AUTO_TAG
+    return if (isUrlTest) groupTag else MinimalConfigBuilder.AUTO_TAG
 }
 
 /** Transient feedback pill (subscription updates etc.). */
@@ -147,22 +147,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     /** Mix: node pool = union of the checked subscriptions. */
     private val _mixEnabled = MutableStateFlow(Settings.mixEnabled)
     val mixEnabled: StateFlow<Boolean> = _mixEnabled
-
-    /** Global raw-config switch: the active subscription's config goes to the core verbatim. */
-    private val _useRawConfig = MutableStateFlow(Settings.useRawConfigEnabled)
-    val useRawConfig: StateFlow<Boolean> = _useRawConfig
-
-    fun setUseRawConfig(enabled: Boolean) {
-        if (enabled == _useRawConfig.value) return
-        _useRawConfig.value = enabled
-        Settings.useRawConfigEnabled = enabled
-        // raw mode is single-subscription by definition — mix cannot coexist
-        if (enabled && Settings.mixEnabled) {
-            Settings.mixEnabled = false
-            _mixEnabled.value = false
-        }
-        refreshProxyConfig()
-    }
 
     private val _mixSubscriptionIds = MutableStateFlow(Settings.mixSubscriptionIds)
     val mixSubscriptionIds: StateFlow<Set<String>> = _mixSubscriptionIds
@@ -407,7 +391,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (!autoTested) {
             autoTested = true
             viewModelScope.launch(Dispatchers.IO) {
-                runCatching { CommandTarget.standaloneClient().urlTest(ConfigBuilder.AUTO_TAG) }
+                runCatching { CommandTarget.standaloneClient().urlTest(MinimalConfigBuilder.AUTO_TAG) }
             }
         }
     }
@@ -586,7 +570,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      * urltest groups (auto) are testable directly. The main entry is
      * a *selector* whose members mix group and node tags, and the kernel's
      * per-item pass skips those wholesale ("大量未测"), so a selector keeps
-     * falling back to [ConfigBuilder.AUTO_TAG], whose members are every node.
+     * falling back to [MinimalConfigBuilder.AUTO_TAG], whose members are every node.
      */
     private fun urlTestTarget(groupTag: String): String =
         resolveUrlTestTarget(groupTag, _groups.value)
@@ -651,7 +635,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      * report every member stamped after the epoch — bounded by the kernel's
      * per-node timeout plus margin. False = the command could not be sent.
      */
-    private suspend fun runKernelUrlTest(manual: Boolean, target: String = ConfigBuilder.AUTO_TAG): Boolean =
+    private suspend fun runKernelUrlTest(manual: Boolean, target: String = MinimalConfigBuilder.AUTO_TAG): Boolean =
         kernelUrlTestMutex.withLock {
             kernelTestManual = manual
             testStartEpoch = System.currentTimeMillis() / 1000
@@ -678,7 +662,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      * Spin up the core without TUN so url-test can run while the UI stays
      * 未连接. Restores the previous config afterwards.
      */
-    private suspend fun runDisconnectedUrlTest(target: String = ConfigBuilder.AUTO_TAG) {
+    private suspend fun runDisconnectedUrlTest(target: String = MinimalConfigBuilder.AUTO_TAG) {
         probing = true
         probeSocketUp = false
         val previous = ConfigStore.readActiveConfig()
@@ -804,7 +788,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 SubscriptionRepository.upsert(sub)
                 if (Settings.selectedOutboundTag.isBlank()) {
-                    Settings.selectedOutboundTag = com.interstellar.proxy.data.config.ConfigBuilder.AUTO_TAG
+                    Settings.selectedOutboundTag = com.interstellar.proxy.data.config.MinimalConfigBuilder.AUTO_TAG
                 }
                 // NOT auto-checked into the mix pool: the user ticks it in the
                 // subscription list (toggleMixSubscription → applyPoolChange

@@ -2,7 +2,7 @@ package com.interstellar.proxy.ui
 
 import com.interstellar.proxy.core.CoreGroup
 import com.interstellar.proxy.core.CoreGroupItem
-import com.interstellar.proxy.data.config.ConfigBuilder
+import com.interstellar.proxy.data.config.MinimalConfigBuilder
 import org.junit.Test
 
 /**
@@ -23,15 +23,15 @@ class UrlTestTargetTest {
     )
 
     private val groups = listOf(
-        group(ConfigBuilder.GROUP_TAG, "selector"),
-        group(ConfigBuilder.AUTO_TAG, "urltest"),
+        group(MinimalConfigBuilder.GROUP_TAG, "selector"),
+        group(MinimalConfigBuilder.AUTO_TAG, "urltest"),
         group("🇭🇰 香港", "urltest"),
         group("🇺🇸 美国", "urltest"),
     )
 
     @Test
     fun `auto tab tests auto`() {
-        check(resolveUrlTestTarget(ConfigBuilder.AUTO_TAG, groups) == ConfigBuilder.AUTO_TAG)
+        check(resolveUrlTestTarget(MinimalConfigBuilder.AUTO_TAG, groups) == MinimalConfigBuilder.AUTO_TAG)
     }
 
     @Test
@@ -43,13 +43,13 @@ class UrlTestTargetTest {
 
     @Test
     fun `selector falls back to auto because the kernel skips its mixed members`() {
-        check(resolveUrlTestTarget(ConfigBuilder.GROUP_TAG, groups) == ConfigBuilder.AUTO_TAG)
+        check(resolveUrlTestTarget(MinimalConfigBuilder.GROUP_TAG, groups) == MinimalConfigBuilder.AUTO_TAG)
     }
 
     @Test
     fun `blank and unknown tags fall back to auto`() {
-        check(resolveUrlTestTarget("", groups) == ConfigBuilder.AUTO_TAG)
-        check(resolveUrlTestTarget("nope", groups) == ConfigBuilder.AUTO_TAG)
+        check(resolveUrlTestTarget("", groups) == MinimalConfigBuilder.AUTO_TAG)
+        check(resolveUrlTestTarget("nope", groups) == MinimalConfigBuilder.AUTO_TAG)
     }
 
     @Test

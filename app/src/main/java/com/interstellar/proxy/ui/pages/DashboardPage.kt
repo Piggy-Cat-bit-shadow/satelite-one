@@ -58,7 +58,7 @@ import com.interstellar.proxy.R
 import com.interstellar.proxy.constant.Status
 import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.data.SubscriptionRepository
-import com.interstellar.proxy.data.config.ConfigBuilder
+import com.interstellar.proxy.data.config.MinimalConfigBuilder
 import com.interstellar.proxy.ui.AppViewModel
 import com.interstellar.proxy.ui.ConnectionsViewModel
 import com.interstellar.proxy.ui.components.FaceMark
@@ -107,7 +107,7 @@ fun DashboardPage(
     val running = status == Status.Started
     val activeConnectionCount = connections.count { !it.closed }
     // raw configs may not name any group "proxy" — fall back to the first selector
-    val mainGroup = groups.find { it.tag == ConfigBuilder.GROUP_TAG }
+    val mainGroup = groups.find { it.tag == MinimalConfigBuilder.GROUP_TAG }
         ?: groups.firstOrNull { it.type.equals("selector", ignoreCase = true) }
         ?: groups.firstOrNull()
     // tag → protocol (VLESS / TROJAN / …) for the current node pool
@@ -118,7 +118,7 @@ fun DashboardPage(
             mixEnabled,
             mixSubscriptionIds,
         )
-        ConfigBuilder.tagsFor(pool).zip(pool)
+        MinimalConfigBuilder.tagsFor(pool).zip(pool)
             .associate { (tag, node) -> tag to node.type.wire.uppercase() }
     }
 
@@ -257,7 +257,7 @@ fun DashboardPage(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier
                         .clip(RoundedCornerShape(8.dp))
-                        .clickable { viewModel.urlTest(ConfigBuilder.GROUP_TAG) }
+                        .clickable { viewModel.urlTest(MinimalConfigBuilder.GROUP_TAG) }
                         .padding(horizontal = 8.dp, vertical = 2.dp),
                 )
             } else {
@@ -281,7 +281,7 @@ fun DashboardPage(
             // ── 状态标签: 居中胶囊, 点击进入对应设置 ──
             val scopeOn = proxyScope.on
             val switchModeLabel = when (storedSelected) {
-                ConfigBuilder.AUTO_TAG -> stringResource(R.string.dash_mode_auto)
+                MinimalConfigBuilder.AUTO_TAG -> stringResource(R.string.dash_mode_auto)
                 else -> stringResource(R.string.dash_mode_manual)
             }
             Row(
@@ -674,7 +674,7 @@ private fun nodeRowValue(
         ?: storedSelected.takeIf { it.isNotBlank() }
         ?: return "未选择"
     val leaf = resolveNow(groups, delays, selected)
-    return if (leaf == ConfigBuilder.AUTO_TAG || leaf == ConfigBuilder.GROUP_TAG) "自动" else leaf
+    return if (leaf == MinimalConfigBuilder.AUTO_TAG || leaf == MinimalConfigBuilder.GROUP_TAG) "自动" else leaf
 }
 
 /** Leaf node tag currently in use (null when it stays on a group / auto itself). */
@@ -685,7 +685,7 @@ private fun currentLeafTag(
 ): String? {
     val selected = mainGroup?.selected?.takeIf { it.isNotBlank() } ?: return null
     val leaf = resolveNow(groups, delays, selected)
-    return leaf.takeIf { it != ConfigBuilder.AUTO_TAG && it != ConfigBuilder.GROUP_TAG }
+    return leaf.takeIf { it != MinimalConfigBuilder.AUTO_TAG && it != MinimalConfigBuilder.GROUP_TAG }
 }
 
 /**
@@ -721,7 +721,7 @@ private fun delayOfItem(item: com.interstellar.proxy.core.CoreGroupItem, delays:
     delays[item.tag]?.takeIf { it > 0 } ?: item.urlTestDelay
 
 private fun delayOf(groups: List<com.interstellar.proxy.core.CoreGroup>, delays: Map<String, Int>): Int {
-    val main = groups.find { it.tag == ConfigBuilder.GROUP_TAG }
+    val main = groups.find { it.tag == MinimalConfigBuilder.GROUP_TAG }
         ?: groups.firstOrNull { it.type.equals("selector", ignoreCase = true) }
         ?: return 0
     val selected = main.selected ?: return 0

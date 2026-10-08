@@ -3,7 +3,7 @@ package com.interstellar.proxy.ui
 import android.content.Context
 import androidx.compose.runtime.Composable
 import com.interstellar.proxy.R
-import com.interstellar.proxy.data.config.ConfigBuilder
+import com.interstellar.proxy.data.config.MinimalConfigBuilder
 
 /**
  * Display-layer translation for FUNCTIONAL names that must stay byte-stable
@@ -16,8 +16,8 @@ object LocalizedNames {
 
     /** Any group/outbound tag → localized display name (unknown tags pass through). */
     fun groupName(context: Context, tag: String): String = when (tag) {
-        ConfigBuilder.GROUP_TAG -> context.getString(R.string.group_manual)
-        ConfigBuilder.AUTO_TAG -> context.getString(R.string.group_auto)
+        MinimalConfigBuilder.GROUP_TAG -> context.getString(R.string.group_manual)
+        MinimalConfigBuilder.AUTO_TAG -> context.getString(R.string.group_auto)
         else -> tag
     }
 }

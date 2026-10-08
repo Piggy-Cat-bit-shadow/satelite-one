@@ -28,7 +28,7 @@ import kotlinx.serialization.json.putJsonObject
  *  - a TUN inbound, plus an optional loopback mixed port for subscription refresh
  *  - a minimal DNS block and a minimal route block
  */
-object ConfigBuilder {
+object MinimalConfigBuilder {
 
     const val GROUP_TAG = "手动选择"
     const val AUTO_TAG = "auto"
@@ -89,16 +89,24 @@ object ConfigBuilder {
                 buildJsonObject {
                     put("type", "tun")
                     put("tag", "tun-in")
+                    // No `stack`: the netstack is sing-box's choice, not ours.
+                    // Writing "mixed"/"gvisor" here is what used to force every
+                    // Android libbox to be compiled with gVisor.
+                    //
+                    // No `mtu` either: sing-box's default applies.
                     putJsonArray("address") {
-                        // v4-only TUN: the underlying network often has no IPv6
-                        // exit, and a v6 tun address makes apps dial AAAA targets
-                        // that can never be reached — those connections die with
-                        // ERR_CONNECTION_RESET.
+                        // sing-box needs a tun address (the schema's own example
+                        // value) and hands it to the platform via TunOptions; a
+                        // v4-only address is kept because the underlying network
+                        // often has no IPv6 exit and a v6 address makes apps dial
+                        // AAAA targets that can never complete.
                         add("172.19.0.1/30")
                     }
-                    put("mtu", 9000)
+                    // Required by the Android integration: the app's VpnService
+                    // reads libbox's TunOptions.autoRoute to decide whether to add
+                    // routes and DNS servers — without it the tunnel captures
+                    // nothing.
                     put("auto_route", true)
-                    put("stack", "mixed")
                     putJsonArray("route_exclude_address") {
                         LAN_ROUTES.forEach { add(it) }
                     }

@@ -74,7 +74,6 @@ fun SubscriptionsPage(viewModel: AppViewModel) {
     val activeId by viewModel.activeSubscriptionId.collectAsState()
     val mixEnabled by viewModel.mixEnabled.collectAsState()
     val mixIds by viewModel.mixSubscriptionIds.collectAsState()
-    val useRawConfig by viewModel.useRawConfig.collectAsState()
     var showAdd by remember { mutableStateOf(false) }
     var editTarget by remember { mutableStateOf<SubscriptionRepository.Subscription?>(null) }
     var deleteTarget by remember { mutableStateOf<SubscriptionRepository.Subscription?>(null) }
@@ -110,34 +109,16 @@ fun SubscriptionsPage(viewModel: AppViewModel) {
                 },
             )
 
-            IosSectionLabel(stringResource(R.string.subs_config_mode_section))
-            IosCard(modifier = Modifier.fillMaxWidth()) {
-                IosToggleRow(
-                    title = stringResource(R.string.subs_use_raw_config_title),
-                    subtitle = when {
-                        useRawConfig -> stringResource(R.string.subs_use_raw_config_on)
-                        else -> stringResource(R.string.subs_use_raw_config_off)
-                    },
-                    checked = useRawConfig,
-                    onChange = { viewModel.setUseRawConfig(it) },
-                )
-            }
-            IosSectionFooter(
-                stringResource(R.string.subs_use_raw_config_footer),
-            )
-
-            Spacer(Modifier.height(8.dp))
             IosSectionLabel(stringResource(R.string.subs_mix_section))
             IosCard(modifier = Modifier.fillMaxWidth()) {
                 IosToggleRow(
                     title = stringResource(R.string.subs_mix_title),
-                    subtitle = when {
-                        useRawConfig -> stringResource(R.string.subs_mix_unavailable)
-                        mixEnabled -> stringResource(R.string.subs_mix_checked_count, mixIds.size, subscriptions.size)
-                        else -> null
+                    subtitle = if (mixEnabled) {
+                        stringResource(R.string.subs_mix_checked_count, mixIds.size, subscriptions.size)
+                    } else {
+                        null
                     },
                     checked = mixEnabled,
-                    enabled = !useRawConfig,
                     onChange = { viewModel.setMixEnabled(it) },
                 )
             }
@@ -381,16 +362,13 @@ private fun SubscriptionCard(
             val format = com.interstellar.proxy.data.subscription.RawConfigFormat.from(sub.configFormat)
             if (format != null) {
                 Spacer(Modifier.width(8.dp))
-                // raw only takes effect when the body is a sing-box config and
-                // it is still on disk — show the truth
-                val rawOn = Settings.useRawConfigEnabled
-                val effective = rawOn &&
-                    format == com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX &&
-                    SubscriptionRepository.rawFileOf(sub.id).isFile
+                // Raw handling is automatic: a complete sing-box config is used
+                // verbatim. The badge just reports what was detected.
+                val rawActive = SubscriptionRepository.isRawConfig(sub)
                 FormatBadge(
                     label = format.label,
-                    active = rawOn,
-                    activeHint = if (effective) {
+                    active = rawActive,
+                    activeHint = if (rawActive) {
                         stringResource(R.string.subs_raw_badge_on)
                     } else {
                         stringResource(R.string.subs_raw_badge_fallback)

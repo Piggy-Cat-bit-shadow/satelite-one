@@ -54,7 +54,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.interstellar.proxy.R
 import com.interstellar.proxy.data.SubscriptionRepository
-import com.interstellar.proxy.data.config.ConfigBuilder
+import com.interstellar.proxy.data.config.MinimalConfigBuilder
 import com.interstellar.proxy.ui.AppViewModel
 import com.interstellar.proxy.ui.components.PageHeader
 import com.interstellar.proxy.ui.components.SegmentedControl
@@ -80,7 +80,7 @@ private data class NodeEntry(
 private fun isGroupItem(item: NodeEntry): Boolean {
     // libbox reports group types lowercase
     val t = item.type.lowercase()
-    return item.tag == ConfigBuilder.AUTO_TAG || t == "urltest" || t == "selector"
+    return item.tag == MinimalConfigBuilder.AUTO_TAG || t == "urltest" || t == "selector"
 }
 
 @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
@@ -114,10 +114,10 @@ fun NodesPage(viewModel: AppViewModel) {
     // 虚拟 自动 分组只在程序自己生成的配置结构上有意义:机场原始配置自带
     // 自动选择分组,再插一个只会重复,且其选择目标 (auto) 在原始配置里
     // 不存在,点了必然无效。判定:存在我们生成的 auto 组。
-    val autoGroup = groups.find { it.tag == ConfigBuilder.AUTO_TAG }
+    val autoGroup = groups.find { it.tag == MinimalConfigBuilder.AUTO_TAG }
     val virtualTabs = autoGroup != null
 
-    val mainGroup = groups.find { it.tag == ConfigBuilder.GROUP_TAG }
+    val mainGroup = groups.find { it.tag == MinimalConfigBuilder.GROUP_TAG }
         // raw configs may not name any group "proxy" — fall back to the first
         // selector so the page and dashboard still have a main tab
         ?: groups.firstOrNull { it.type.equals("selector", ignoreCase = true) }
@@ -140,7 +140,7 @@ fun NodesPage(viewModel: AppViewModel) {
                     repeat(sub.nodes.size) { add(sub.name) }
                 }
             }
-            ConfigBuilder.tagsFor(storedNodes).zip(names).toMap()
+            MinimalConfigBuilder.tagsFor(storedNodes).zip(names).toMap()
         }
     }
 
@@ -156,7 +156,7 @@ fun NodesPage(viewModel: AppViewModel) {
             testSummary = null // a new run clears the old summary
         } else if (prevRunning) {
             // just finished — snapshot stats over the current pool tags
-            val tags = ConfigBuilder.tagsFor(storedNodes)
+            val tags = MinimalConfigBuilder.tagsFor(storedNodes)
             testSummary = computeNodesTestSummary(tags, delays, genericFailNote)
         }
         prevRunning = testRunning
@@ -182,7 +182,7 @@ fun NodesPage(viewModel: AppViewModel) {
         }
         // tag → full node model, so cards and the detail sheet can show protocol info
         val nodeByTag = remember(storedNodes) {
-            ConfigBuilder.tagsFor(storedNodes).zip(storedNodes).toMap()
+            MinimalConfigBuilder.tagsFor(storedNodes).zip(storedNodes).toMap()
         }
         val allItems = remember(liveItems, storedNodes, delays, sourceByTag, nodeByTag) {
             if (liveItems.isNotEmpty()) {
@@ -197,7 +197,7 @@ fun NodesPage(viewModel: AppViewModel) {
                     )
                 }
             } else {
-                val tags = ConfigBuilder.tagsFor(storedNodes)
+                val tags = MinimalConfigBuilder.tagsFor(storedNodes)
                 storedNodes.zip(tags).map { (node, tag) ->
                     NodeEntry(
                         tag,
@@ -214,7 +214,7 @@ fun NodesPage(viewModel: AppViewModel) {
         // as tappable group cards — tapping points THIS group at them. The
         // auto group reference is skipped: the top 自动 tab IS its switch.
         val groupItems = remember(allItems) {
-            allItems.filter(::isGroupItem).filterNot { it.tag == ConfigBuilder.AUTO_TAG }
+            allItems.filter(::isGroupItem).filterNot { it.tag == MinimalConfigBuilder.AUTO_TAG }
         }
         // Selection precedence: LIVE core state first (fresh truth), then the
         // stored pick (instant feedback while the stopped core just baked it
@@ -241,7 +241,7 @@ fun NodesPage(viewModel: AppViewModel) {
                 }
                 through
                     ?: storedSelected.takeIf { it.isNotBlank() }
-                    ?: ConfigBuilder.AUTO_TAG
+                    ?: MinimalConfigBuilder.AUTO_TAG
             }
         }
 
@@ -261,9 +261,9 @@ fun NodesPage(viewModel: AppViewModel) {
         // ── 分组 tab: 虚拟 自动/智能 置前(仅程序生成配置),后跟真实分组 ──
         val tabs = buildList {
             if (virtualTabs) {
-                add(GroupTab(ConfigBuilder.AUTO_TAG, auto = true))
+                add(GroupTab(MinimalConfigBuilder.AUTO_TAG, auto = true))
             }
-            groups.filterNot { virtualTabs && it.tag == ConfigBuilder.AUTO_TAG }.forEach {
+            groups.filterNot { virtualTabs && it.tag == MinimalConfigBuilder.AUTO_TAG }.forEach {
                 add(GroupTab(it.tag, auto = it.type.equals("urltest", ignoreCase = true)))
             }
         }
@@ -332,7 +332,7 @@ fun NodesPage(viewModel: AppViewModel) {
                 modifier = Modifier
                     .clip(RoundedCornerShape(12.dp))
                     .background(colors.primaryMuted)
-                    .pressableClick { viewModel.urlTest(currentTab?.tag ?: ConfigBuilder.GROUP_TAG) }
+                    .pressableClick { viewModel.urlTest(currentTab?.tag ?: MinimalConfigBuilder.GROUP_TAG) }
                     .padding(horizontal = 16.dp, vertical = 10.dp),
             ) {
                 if (testActive) {
@@ -414,7 +414,7 @@ fun NodesPage(viewModel: AppViewModel) {
             when {
                 // urltest groups pick their own node — selection taps are no-ops
                 !tabSelectable && !isMainTab -> Unit
-                else -> viewModel.selectNode(currentTab?.tag ?: ConfigBuilder.GROUP_TAG, item.tag)
+                else -> viewModel.selectNode(currentTab?.tag ?: MinimalConfigBuilder.GROUP_TAG, item.tag)
             }
         }
 
