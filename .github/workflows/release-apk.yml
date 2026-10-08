@@ -223,7 +223,12 @@ jobs:
       - name: Rename APKs with tag
         run: |
           set -euo pipefail
-          SUFFIX="${GITHUB_REF_NAME:-$(grep '^versionName=' version.properties | cut -d= -f2 | tr -d ' \r')}"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            SUFFIX="${GITHUB_REF_NAME}"
+          else
+            # dry run on a branch: don't label the artifact with the branch name
+            SUFFIX="dryrun"
+          fi
           cd app/build/outputs/apk/release
           for f in satelite-one-*-release.apk; do
             mv "$f" "${f%-release.apk}-${SUFFIX}.apk"
