@@ -13,7 +13,14 @@ on:
   push:
     tags:
       - 'v*'
+  # Dry run: exercises the full release path (pinned core, provenance gate,
+  # release build, checksums, build-info) but publishes nothing.
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build and validate only — skip tag check and publishing'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -185,7 +192,7 @@ jobs:
           } > signing.properties
 
       - name: Verify tag matches version.properties
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
         run: |
           VERSION=$(grep '^versionName=' version.properties | cut -d= -f2 | tr -d ' \r')
           TAG="${GITHUB_REF_NAME#v}"
@@ -254,7 +261,7 @@ jobs:
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: satelite-one-${{ github.ref_name }}
+          name: satelite-one-release-${{ github.run_number }}
           path: |
             app/build/outputs/apk/release/*.apk
             app/build/outputs/apk/release/SHA256SUMS.txt
@@ -265,7 +272,7 @@ jobs:
       # message(标题+正文), 再附自上一 tag 以来的其余提交。按 version.properties
       # 定位而不是 tag 落点 —— tag 可能落在版本提交之后的杂项提交上(如 v0.5.3)。
       - name: Generate release notes
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
@@ -296,7 +303,7 @@ jobs:
           cat release_notes.md
 
       - name: Publish GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
         uses: softprops/action-gh-release@v2
         with:
           files: |
