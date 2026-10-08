@@ -105,9 +105,9 @@
     <string name="subs_add">＋ 添加</string>
     <string name="subs_config_mode_section">配置模式</string>
     <string name="subs_use_raw_config_title">使用原始配置</string>
-    <string name="subs_use_raw_config_on">激活订阅的原始配置直通内核(不重写),自动注入内置规则</string>
+    <string name="subs_use_raw_config_on">激活订阅的原始配置原文直供内核，不作任何改写</string>
     <string name="subs_use_raw_config_off">订阅是完整配置且与内核匹配时,原文直供内核</string>
-    <string name="subs_use_raw_config_footer">开启后保留订阅原有的分组与规则结构,仅注入绕过大陆等内置规则;不支持合并订阅与自定义规则。内核不匹配时自动回退重写模式。</string>
+    <string name="subs_use_raw_config_footer">开启后订阅配置原样交给内核：分组、DNS、路由与规则全部保留，App 不注入任何规则。内核不匹配时自动回退到最小配置重写。</string>
     <string name="subs_mix_section">合并订阅 (Mix)</string>
     <string name="subs_mix_title">合并多个订阅</string>
     <string name="subs_mix_unavailable">原始配置模式下不可用</string>

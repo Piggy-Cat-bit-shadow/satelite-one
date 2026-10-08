@@ -105,9 +105,9 @@
     <string name="subs_add">＋ Add</string>
     <string name="subs_config_mode_section">Config mode</string>
     <string name="subs_use_raw_config_title">Use raw config</string>
-    <string name="subs_use_raw_config_on">Feed the active subscription\'s raw config straight to the core (no rewrite); built-in rules are injected automatically</string>
+    <string name="subs_use_raw_config_on">Hand the active subscription\'s raw config to the core verbatim, with no rewrite</string>
     <string name="subs_use_raw_config_off">When the subscription is a full config that matches the core, pass it through verbatim</string>
-    <string name="subs_use_raw_config_footer">Keeps the subscription\'s original groups and rule structure, injecting only built-in rules such as CN bypass; merge mode and custom rules are not supported. Falls back to rewrite if the core does not match.</string>
+    <string name="subs_use_raw_config_footer">The subscription config reaches the core as-is: groups, DNS, route and rules are all preserved and no rules are injected. Falls back to a minimal rewrite when the core does not match.</string>
     <string name="subs_mix_section">Merge subscriptions (Mix)</string>
     <string name="subs_mix_title">Merge multiple subscriptions</string>
     <string name="subs_mix_unavailable">Unavailable in raw-config mode</string>
