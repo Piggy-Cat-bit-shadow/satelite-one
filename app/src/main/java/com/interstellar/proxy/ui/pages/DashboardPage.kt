@@ -84,12 +84,17 @@ import com.interstellar.proxy.core.CoreGroup
  */
 @Composable
 private fun coreVersionLine(): String {
-    val version = runCatching { Libbox.version() }.getOrNull()?.takeIf { it.isNotBlank() && it != "unknown" }
+    val runtime = runCatching { Libbox.version() }
+        .getOrNull()?.takeIf { it.isNotBlank() && it != "unknown" }
+        ?: BuildConfig.CORE_VERSION
     val rev = BuildConfig.CORE_COMMIT
-    return buildString {
-        append("sing-box")
-        if (version != null) append(" ").append(version) else append(" ").append(BuildConfig.CORE_DESCRIBE)
-        if (rev != "unknown") append(" · ").append(rev)
+    // "<product version> · <revision>": two clearly different things. The
+    // revision comes from the core's own provenance record, so it always
+    // describes the libbox.so that is actually packaged.
+    return if (rev != "unknown" && rev != runtime) {
+        "sing-box $runtime · $rev"
+    } else {
+        "sing-box $runtime"
     }
 }
 

@@ -365,6 +365,7 @@
     <string name="settings_version_title">版本</string>
     <string name="settings_core_title">内核</string>
     <string name="settings_core_source_title">内核来源</string>
+    <string name="settings_core_branch_title">内核分支</string>
     <string name="settings_core_revision_title">内核版本</string>
     <string name="settings_build_date_title">构建时间</string>
     <string name="settings_check_update_title">检查更新</string>

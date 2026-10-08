@@ -70,14 +70,15 @@ enum class SettingsSubPage { Settings, PerApp, Connections, Logs, Rules, Dns, Pr
 
 /** Bottom-dock root tabs (satelite's navbar, phone layout). */
 /**
- * Core provenance line: what libbox reports at runtime plus the revision the
- * APK was built from (injected by app/build.gradle.kts).
+ * What the packaged core reports at runtime. This is `constant.Version` read back
+ * through libbox, i.e. the value actually baked into the shipped libbox.so — not
+ * a value re-derived from a checkout.
  */
 @Composable
-private fun coreVersionLabel(): String {
+private fun coreRuntimeVersion(): String {
     val version = runCatching { io.nekohasekai.libbox.Libbox.version() }
         .getOrNull()?.takeIf { it.isNotBlank() && it != "unknown" }
-    return if (version != null) "sing-box $version" else "sing-box ${BuildConfig.CORE_DESCRIBE}"
+    return version ?: BuildConfig.CORE_VERSION
 }
 
 enum class MainTab { Home, Nodes, Subscriptions, Logs, Settings }
@@ -299,11 +300,21 @@ fun SettingsPage(onOpen: (SettingsSubPage) -> Unit, onProxyChanged: () -> Unit =
             )
             PrefNavRow(title = stringResource(R.string.settings_version_title), value = BuildConfig.VERSION_NAME)
             UpdateCheckRow()
-            PrefNavRow(title = stringResource(R.string.settings_core_title), value = coreVersionLabel())
+            // Product version and git revision are shown as separate rows: the
+            // version string is not a revision, and printing one where the other
+            // belongs is how an APK ends up claiming the wrong core.
+            PrefNavRow(
+                title = stringResource(R.string.settings_core_title),
+                value = "sing-box ${coreRuntimeVersion()}",
+            )
             PrefNavRow(title = stringResource(R.string.settings_core_source_title), value = BuildConfig.CORE_REPO)
             PrefNavRow(
+                title = stringResource(R.string.settings_core_branch_title),
+                value = BuildConfig.CORE_BRANCH,
+            )
+            PrefNavRow(
                 title = stringResource(R.string.settings_core_revision_title),
-                value = "${BuildConfig.CORE_BRANCH} / ${BuildConfig.CORE_COMMIT}",
+                value = BuildConfig.CORE_COMMIT,
             )
             PrefNavRow(title = stringResource(R.string.settings_build_date_title), value = BuildConfig.BUILD_DATE)
         }

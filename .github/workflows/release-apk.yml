@@ -59,50 +59,94 @@ jobs:
           yes | sdkmanager --install "ndk;${NDK_VERSION}" > /dev/null
           echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
 
-      - name: Resolve core revision
+      # Release pins the core: the SHA comes from version.properties, never from
+      # testing HEAD. Re-running the same release tag therefore always rebuilds
+      # from the identical core revision.
+      - name: Resolve pinned core revision
         id: core
         run: |
-          git ls-remote "https://github.com/${CORE_REPO}.git" "refs/heads/${CORE_BRANCH}" \
-            | awk '{print "sha="$1}' >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          SHA="$(grep '^coreCommit=' version.properties | cut -d= -f2 | tr -d ' \r')"
+          if [ -z "$SHA" ]; then
+            echo "::error::version.properties has no coreCommit= entry; a release must pin its core revision"
+            exit 1
+          fi
+          if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::coreCommit must be a full 40-char lowercase commit SHA, got '${SHA}'"
+            exit 1
+          fi
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "Resolved pinned coreCommit=${SHA}"
+          echo "CORE_COMMIT=${SHA}" >> "$GITHUB_ENV"
+          echo "CORE_COMMIT_FULL=${SHA}" >> "$GITHUB_ENV"
+
+      - name: Verify pinned core revision exists upstream
+        env:
+          CORE_SHA: ${{ steps.core.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if ! git ls-remote "https://github.com/${CORE_REPO}.git" | grep -q "^${CORE_SHA}"; then
+            echo "::error::pinned core commit ${CORE_SHA} not found in ${CORE_REPO}"
+            exit 1
+          fi
+          echo "pinned core commit ${CORE_SHA} exists in ${CORE_REPO}"
 
       - name: Cache libbox.aar
         id: libbox
         uses: actions/cache@v4
         with:
-          path: app/libs/libbox.aar
-          key: libbox-${{ env.CORE_REPO }}-${{ env.CORE_BRANCH }}-${{ steps.core.outputs.sha }}
+          path: |
+            app/libs/libbox.aar
+            app/libs/libbox.provenance
+          key: libbox-${{ env.CORE_REPO }}-${{ steps.core.outputs.sha }}
 
       # app/libs 只含 gitignored 的 libbox.aar, checkout 不会创建该目录
       - name: Ensure app/libs exists
         run: mkdir -p app/libs
 
-      - name: Build libbox.aar from ${{ env.CORE_REPO }}@${{ env.CORE_BRANCH }}
+      - name: Build libbox.aar from pinned ${CORE_REPO}@${{ steps.core.outputs.sha }}
         if: steps.libbox.outputs.cache-hit != 'true'
+        env:
+          CORE_SHA: ${{ steps.core.outputs.sha }}
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch "${CORE_BRANCH}" \
-            "https://github.com/${CORE_REPO}.git" /tmp/sing-box
+          git init -q /tmp/sing-box
           cd /tmp/sing-box
+          git remote add origin "https://github.com/${CORE_REPO}.git"
+          git fetch --depth 1 origin "${CORE_SHA}"
+          git checkout -q FETCH_HEAD
+          # prove we are on the pinned revision before building
+          ACTUAL="$(git rev-parse HEAD)"
+          if [ "$ACTUAL" != "${CORE_SHA}" ]; then
+            echo "::error::checked out ${ACTUAL} but pinned coreCommit is ${CORE_SHA}"
+            exit 1
+          fi
           go install "github.com/sagernet/gomobile/cmd/gomobile@${GOMOBILE_VERSION}"
           go install "github.com/sagernet/gomobile/cmd/gobind@${GOMOBILE_VERSION}"
-          # shallow clone cannot describe a tag -> let the builder take the version
-          SING_BOX_BUILD_VERSION="$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)" \
+          # Bake the pinned SHA in as BOTH the version string and the recorded
+          # revision, so the packaged binary is self-describing and verifiable.
+          SING_BOX_BUILD_VERSION="${CORE_SHA}" \
+          SING_BOX_BUILD_COMMIT="${CORE_SHA}" \
             go run ./cmd/internal/build_libbox -target android
           cp libbox.aar "${GITHUB_WORKSPACE}/app/libs/libbox.aar"
+          cp libbox.provenance "${GITHUB_WORKSPACE}/app/libs/libbox.provenance"
+
+      # The core's own provenance record is the single source of truth; it also
+      # has to survive a cache hit, where no checkout exists.
+      - name: Validate core provenance
+        env:
+          CORE_SHA: ${{ steps.core.outputs.sha }}
+        run: python3 .github/scripts/check_core_provenance.py app/libs/libbox.aar app/libs/libbox.provenance "${CORE_SHA}"
 
       - name: Export core build metadata
+        env:
+          CORE_SHA: ${{ steps.core.outputs.sha }}
         run: |
           set -euo pipefail
-          CORE_DIR=/tmp/sing-box
-          if [ -d "$CORE_DIR/.git" ]; then
-            echo "CORE_COMMIT=$(git -C "$CORE_DIR" rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
-            echo "CORE_COMMIT_FULL=$(git -C "$CORE_DIR" rev-parse HEAD)" >> "$GITHUB_ENV"
-            echo "CORE_COMMIT_DATE=$(git -C "$CORE_DIR" log -1 --format=%cI)" >> "$GITHUB_ENV"
-            echo "CORE_DESCRIBE=$(git -C "$CORE_DIR" describe --tags --always)" >> "$GITHUB_ENV"
-          else
-            echo "CORE_COMMIT=${{ steps.core.outputs.sha }}" >> "$GITHUB_ENV"
-          fi
           echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          echo "APP_COMMIT=${GITHUB_SHA}" >> "$GITHUB_ENV"
+          # CORE_COMMIT / CORE_COMMIT_FULL were exported when the SHA was pinned
+          echo "coreCommit=${CORE_SHA}"
 
       # Unit tests run on the debug variant: AGP only creates testDebugUnitTest
       # for this project's configuration.
@@ -162,9 +206,44 @@ jobs:
 
       - name: Generate checksums
         run: |
+          set -euo pipefail
           cd app/build/outputs/apk/release
           sha256sum ./*.apk > SHA256SUMS.txt
           cat SHA256SUMS.txt
+
+      # Machine-readable provenance so any downloaded APK can be traced back to
+      # the exact app commit and core revision that produced it. No secrets.
+      - name: Write build-info.json
+        env:
+          CORE_SHA: ${{ steps.core.outputs.sha }}
+        run: |
+          set -euo pipefail
+          VERSION_NAME="$(grep '^versionName=' version.properties | cut -d= -f2 | tr -d ' \r')"
+          VERSION_CODE="$(grep '^versionCode=' version.properties | cut -d= -f2 | tr -d ' \r')"
+          APK_SHA="$(grep -F 'satelite-one-arm64-v8a-' SHA256SUMS.txt 2>/dev/null | awk '{print $1}' || true)"
+          if [ -z "$APK_SHA" ]; then
+            APK_SHA="$(cd app/build/outputs/apk/release && grep -F 'satelite-one-arm64-v8a-' SHA256SUMS.txt | awk '{print $1}')"
+          fi
+          cat > build-info.json <<JSON
+          {
+            "app_repository": "${GITHUB_REPOSITORY}",
+            "app_version": "${VERSION_NAME}",
+            "app_version_code": ${VERSION_CODE},
+            "app_commit": "${GITHUB_SHA}",
+            "app_ref": "${GITHUB_REF_NAME}",
+            "core_repository": "${CORE_REPO}",
+            "core_commit": "${CORE_SHA}",
+            "core_ref": "pinned",
+            "core_branch_hint": "${CORE_BRANCH}",
+            "core_version_string": "${CORE_SHA}",
+            "core_aar_sha256": "$(sha256sum app/libs/libbox.aar | awk '{print $1}')",
+            "apk_arm64_v8a_sha256": "${APK_SHA}",
+            "build_time": "${BUILD_DATE}",
+            "run_id": "${GITHUB_RUN_ID}"
+          }
+          JSON
+          python3 -c "import json,sys; json.load(open('build-info.json')); print('build-info.json is valid JSON')"
+          cat build-info.json
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
@@ -173,6 +252,7 @@ jobs:
           path: |
             app/build/outputs/apk/release/*.apk
             app/build/outputs/apk/release/SHA256SUMS.txt
+            build-info.json
           if-no-files-found: error
 
       # 更新摘要 = "版本提交"(范围内最后改 version.properties 的那个)的完整
@@ -216,5 +296,6 @@ jobs:
           files: |
             app/build/outputs/apk/release/*.apk
             app/build/outputs/apk/release/SHA256SUMS.txt
+            build-info.json
           body_path: release_notes.md
           fail_on_unmatched_files: true

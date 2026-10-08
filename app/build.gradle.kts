@@ -3,6 +3,7 @@ import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.Properties
+import java.util.zip.ZipFile
 
 plugins {
     id("com.android.application")
@@ -47,7 +48,31 @@ fun gitIn(dir: java.io.File, vararg args: String): String? = runCatching {
 
 val libboxAar = File(projectDir, "libs/libbox.aar")
 
-/** First existing sing-box checkout we can read a revision from. */
+/**
+ * The core build writes libbox.provenance next to libbox.aar, recording the exact
+ * source revision and version string it baked into the binary. This file is the
+ * AUTHORITATIVE source for the app's core metadata.
+ *
+ * Why it exists: the app used to derive CORE_COMMIT from the sing-box checkout at
+ * APK-build time, while constant.Version was baked in at libbox-build time. Those
+ * are two different moments, so editing the core build tooling or advancing the
+ * checkout in between made the APK claim a core revision it did not contain.
+ * Reading the producer's own record removes that failure mode entirely.
+ */
+val libboxProvenance = File(projectDir, "libs/libbox.provenance")
+
+val provenance: Map<String, String> =
+    if (libboxProvenance.isFile) {
+        libboxProvenance.readLines()
+            .mapNotNull { line ->
+                val i = line.indexOf('=')
+                if (i <= 0) null else line.substring(0, i).trim() to line.substring(i + 1).trim()
+            }.toMap()
+    } else {
+        emptyMap()
+    }
+
+/** First existing sing-box checkout — only used when no provenance file is present. */
 val coreCheckout: java.io.File? =
     listOf(
         System.getenv("CORE_CHECKOUT"),
@@ -55,15 +80,26 @@ val coreCheckout: java.io.File? =
         "/tmp/sb/sing-box",
     ).filterNotNull().map(::File).firstOrNull { it.isDirectory }
 
-val coreCommit: String =
-    System.getenv("CORE_COMMIT")?.takeIf { it.isNotBlank() }
-        ?: coreCheckout?.let { gitIn(it, "rev-parse", "--short=12", "HEAD") }
-        ?: "unknown"
-
 val coreCommitFull: String =
-    System.getenv("CORE_COMMIT_FULL")?.takeIf { it.isNotBlank() }
+    provenance["commit"]?.takeIf { it.isNotBlank() && it != "unknown" }
+        ?: System.getenv("CORE_COMMIT_FULL")?.takeIf { it.isNotBlank() }
         ?: coreCheckout?.let { gitIn(it, "rev-parse", "HEAD") }
         ?: "unknown"
+
+val coreCommit: String =
+    if (coreCommitFull != "unknown") coreCommitFull.take(12) else "unknown"
+
+/** Product version string baked into constant.Version (may be a tag, not a SHA). */
+val coreVersion: String =
+    provenance["version"]?.takeIf { it.isNotBlank() } ?: "unknown"
+
+if (libboxAar.exists() && provenance.isEmpty()) {
+    logger.warn(
+        "app/libs/libbox.provenance is missing: core metadata falls back to the local " +
+            "checkout and may not match the packaged libbox.aar. Rebuild the core with " +
+            "build_libbox (it writes the provenance file) or let CI provide CORE_COMMIT.",
+    )
+}
 
 val coreCommitDate: String =
     System.getenv("CORE_COMMIT_DATE")?.takeIf { it.isNotBlank() }
@@ -99,6 +135,8 @@ android {
         buildConfigField("String", "CORE_COMMIT_FULL", "\"$coreCommitFull\"")
         buildConfigField("String", "CORE_COMMIT_DATE", "\"$coreCommitDate\"")
         buildConfigField("String", "CORE_DESCRIBE", "\"$coreDescribe\"")
+        // The version string the core baked in (Libbox.version() must equal this).
+        buildConfigField("String", "CORE_VERSION", "\"$coreVersion\"")
         buildConfigField("String", "BUILD_DATE", "\"$buildDate\"")
         buildConfigField("Boolean", "CORE_PRESENT", libboxAar.exists().toString())
     }
@@ -163,6 +201,164 @@ android {
         // 设置页"版本"行读取 BuildConfig.VERSION_NAME
         buildConfig = true
     }
+}
+
+// ---------------------------------------------------------------------------
+// Core provenance gate
+//
+// Verifies that the libbox.aar being packaged really carries the revision and
+// version we are about to advertise in BuildConfig. Reads the `-X
+// github.com/sagernet/sing-box/constant.Version=<value>` record that Go embeds
+// in the shared library — the same value Libbox.version() returns at runtime —
+// so "About says aaaefb00" can never be true of an APK containing another core.
+//
+// A missing or unreadable AAR is only a warning: this project intentionally
+// supports building without libbox.aar (the dependency is conditional), and the
+// gate must not turn that into a hard error. A mismatch is always fatal.
+// ---------------------------------------------------------------------------
+val verifyCoreProvenance = tasks.register("verifyCoreProvenance") {
+    group = "verification"
+    description = "Assert the packaged libbox carries the advertised core revision/version"
+    val aar = libboxAar
+    val expectedCommit = coreCommitFull
+    val expectedVersion = coreVersion
+    inputs.file(aar).withPropertyName("libboxAar").optional()
+    inputs.property("expectedCommit", expectedCommit)
+    inputs.property("expectedVersion", expectedVersion)
+    outputs.upToDateWhen { false }
+    doLast {
+        if (!aar.isFile) {
+            logger.lifecycle(
+                "verifyCoreProvenance: app/libs/libbox.aar absent — skipping " +
+                    "(no core is packaged in this build)",
+            )
+            return@doLast
+        }
+        if (expectedCommit == "unknown" || expectedVersion == "unknown") {
+            throw GradleException(
+                "Core provenance is unknown but libbox.aar is packaged. Provide " +
+                    "app/libs/libbox.provenance (written by build_libbox) or CORE_COMMIT.",
+            )
+        }
+
+        // constant.Version is linked in as a plain NUL-terminated atom (the -X
+        // symbol path itself does not survive into .rodata), so the honest check
+        // is a byte search for the identity we advertise.
+        val commit = expectedCommit.trim()
+        val version = expectedVersion.trim()
+        // CI builds the core with version == commit == resolved SHA, so this is
+        // exact there. When they differ (e.g. a release tag plus a SHA), the
+        // longest common string is what can be verified.
+        // CI builds the core with version == commit. A tag-style version embeds
+        // the revision (e.g. "v1.2.3-4-g<sha>"), in which case the SHA is the
+        // verifiable part. Anything else cannot be checked against the binary.
+        val candidate = when {
+            commit == version -> commit
+            version.contains(commit) -> commit
+            else -> null
+        }
+        if (candidate == null || candidate.length < 7) {
+            // Do not degrade to a warning: shipping an APK whose advertised core
+            // identity cannot be checked against its own binary is exactly the
+            // failure this gate exists to prevent.
+            throw GradleException(
+                """
+                Core provenance is not verifiable — refusing to ship a mislabelled APK.
+                  provenance version  : $version
+                  provenance revision : $commit
+                These share no comparable value, so the packaged binary cannot be
+                checked against what this APK advertises. Build the core with
+                SING_BOX_BUILD_VERSION=<resolved sha> so version and revision agree.
+                """.trimIndent(),
+            )
+        }
+
+        fun aarContains(needle: String): Boolean {
+            val bytes = needle.toByteArray(Charsets.UTF_8)
+            if (bytes.isEmpty()) return false
+            ZipFile(aar).use { zip ->
+                val entries = zip.entries()
+                while (entries.hasMoreElements()) {
+                    val entry = entries.nextElement()
+                    if (!entry.name.endsWith("libbox.so")) continue
+                    zip.getInputStream(entry).use { input ->
+                        // streamed search: the shared objects are tens of MB each
+                        val chunk = ByteArray(1 shl 20)
+                        val overlap = ByteArray(maxOf(0, bytes.size - 1))
+                        var overlapLen = 0
+                        while (true) {
+                            val n = input.read(chunk)
+                            if (n < 0) break
+                            val hay = ByteArray(overlapLen + n)
+                            System.arraycopy(overlap, 0, hay, 0, overlapLen)
+                            System.arraycopy(chunk, 0, hay, overlapLen, n)
+                            if (indexOfBytes(hay, bytes) >= 0) return true
+                            // carry the tail so a needle split across chunks is caught
+                            overlapLen = minOf(overlap.size, hay.size)
+                            if (overlapLen > 0) {
+                                System.arraycopy(hay, hay.size - overlapLen, overlap, 0, overlapLen)
+                            }
+                        }
+                    }
+                }
+            }
+            return false
+        }
+
+        if (!aarContains(candidate)) {
+            throw GradleException(
+                """
+                Core provenance mismatch — refusing to ship a mislabelled APK.
+                  packaged libbox.aar does not contain : $candidate
+                  BuildConfig CORE_COMMIT (provenance)  : $commit
+                  BuildConfig CORE_VERSION (provenance) : $version
+                The AAR was not built from the revision this APK advertises.
+                Rebuild libbox.aar from the recorded revision (CI passes
+                SING_BOX_BUILD_VERSION=<core sha>), or refresh the provenance file.
+                """.trimIndent(),
+            )
+        }
+        // When the version is a bare revision (CI sets version == commit), it must
+        // appear verbatim as well — otherwise a correct revision paired with a
+        // wrong version would still pass. Tag-style versions are not asserted here:
+        // they are not required to be embedded for the artifact to be traceable,
+        // and the revision check above already pins the binary.
+        val versionIsBareSha = version.length in 7..64 &&
+            version.all { it in "0123456789abcdefABCDEF" }
+        if (versionIsBareSha && version != candidate && !aarContains(version)) {
+            throw GradleException(
+                """
+                Core version mismatch — refusing to ship a mislabelled APK.
+                  packaged libbox.aar does not contain : $version
+                  BuildConfig CORE_VERSION (provenance) : $version
+                The binary was not built with the version string this APK advertises.
+                """.trimIndent(),
+            )
+        }
+
+        logger.lifecycle(
+            "verifyCoreProvenance: OK — packaged libbox carries the advertised " +
+                "core identity '$candidate'" +
+                (if (version != candidate) " with version '$version'" else ""),
+        )
+    }
+}
+
+tasks.matching { it.name == "assembleDebug" || it.name == "assembleRelease" }.configureEach {
+    dependsOn(verifyCoreProvenance)
+}
+
+
+/** Index of [needle] in [hay] (Latin-1 byte compare), or -1. */
+fun indexOfBytes(hay: ByteArray, needle: ByteArray): Int {
+    if (needle.isEmpty() || hay.size < needle.size) return -1
+    outer@ for (i in 0..(hay.size - needle.size)) {
+        for (j in needle.indices) {
+            if (hay[i + j] != needle[j]) continue@outer
+        }
+        return i
+    }
+    return -1
 }
 
 // APK 输出统一以 satelite-one 开头：satelite-one-<abi>-<buildType>.apk

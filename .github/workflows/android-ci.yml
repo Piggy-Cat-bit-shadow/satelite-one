@@ -56,17 +56,28 @@ jobs:
           echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
 
       # 单个内核的 cache key 就是它的 commit —— 内核一变就重建。
+      # 开发 CI 跟随 testing HEAD(最新代码); Release 走 release-apk.yml 的固定 SHA。
       - name: Resolve core revision
         id: core
         run: |
-          git ls-remote "https://github.com/${CORE_REPO}.git" "refs/heads/${CORE_BRANCH}" \
-            | awk '{print "sha="$1}' >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          SHA="$(git ls-remote "https://github.com/${CORE_REPO}.git" "refs/heads/${CORE_BRANCH}" | awk '{print $1}')"
+          if [ -z "$SHA" ]; then
+            echo "::error::could not resolve ${CORE_REPO}@${CORE_BRANCH}"
+            exit 1
+          fi
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "CORE_COMMIT=${SHA}" >> "$GITHUB_ENV"
+          echo "CORE_COMMIT_FULL=${SHA}" >> "$GITHUB_ENV"
+          echo "resolved ${CORE_REPO}@${CORE_BRANCH} = ${SHA}"
 
       - name: Cache libbox.aar
         id: libbox
         uses: actions/cache@v4
         with:
-          path: app/libs/libbox.aar
+          path: |
+            app/libs/libbox.aar
+            app/libs/libbox.provenance
           key: libbox-${{ env.CORE_REPO }}-${{ env.CORE_BRANCH }}-${{ steps.core.outputs.sha }}
 
       # app/libs 只含 gitignore 的 libbox.aar，checkout 不会创建该目录
@@ -77,32 +88,42 @@ jobs:
       # 产出 libbox.aar + libbox-legacy.aar(API 21)，本 app minSdk 24 只需前者。
       - name: Build libbox.aar from ${{ env.CORE_REPO }}@${{ env.CORE_BRANCH }}
         if: steps.libbox.outputs.cache-hit != 'true'
+        env:
+          CORE_SHA: ${{ steps.core.outputs.sha }}
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch "${CORE_BRANCH}" \
-            "https://github.com/${CORE_REPO}.git" /tmp/sing-box
+          git init -q /tmp/sing-box
           cd /tmp/sing-box
+          git remote add origin "https://github.com/${CORE_REPO}.git"
+          git fetch --depth 1 origin "${CORE_SHA}"
+          git checkout -q FETCH_HEAD
+          ACTUAL="$(git rev-parse HEAD)"
+          if [ "$ACTUAL" != "${CORE_SHA}" ]; then
+            echo "::error::checked out ${ACTUAL} but resolved core revision is ${CORE_SHA}"
+            exit 1
+          fi
           go install "github.com/sagernet/gomobile/cmd/gomobile@${GOMOBILE_VERSION}"
           go install "github.com/sagernet/gomobile/cmd/gobind@${GOMOBILE_VERSION}"
-          # shallow clone cannot describe a tag -> let the builder take the version
-          SING_BOX_BUILD_VERSION="$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)" \
+          # Bake the resolved SHA in as BOTH the version string and the recorded
+          # revision so the packaged binary is self-describing.
+          SING_BOX_BUILD_VERSION="${CORE_SHA}" \
+          SING_BOX_BUILD_COMMIT="${CORE_SHA}" \
             go run ./cmd/internal/build_libbox -target android
           cp libbox.aar "${GITHUB_WORKSPACE}/app/libs/libbox.aar"
-          ls -la "${GITHUB_WORKSPACE}/app/libs/libbox.aar"
+          cp libbox.provenance "${GITHUB_WORKSPACE}/app/libs/libbox.provenance"
+          ls -la "${GITHUB_WORKSPACE}/app/libs/"
+
+      # Cache hits skip the build, so verify the artifact against the resolved
+      # revision on every run, not only when it was just compiled.
+      - name: Validate core provenance
+        env:
+          CORE_SHA: ${{ steps.core.outputs.sha }}
+        run: python3 .github/scripts/check_core_provenance.py app/libs/libbox.aar app/libs/libbox.provenance "${CORE_SHA}"
 
       # 构建元数据注入：关于页显示的 core 来源 / 分支 / commit / 构建时间
       - name: Export core build metadata
         run: |
           set -euo pipefail
-          CORE_DIR=/tmp/sing-box
-          if [ -d "$CORE_DIR/.git" ]; then
-            echo "CORE_COMMIT=$(git -C "$CORE_DIR" rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
-            echo "CORE_COMMIT_FULL=$(git -C "$CORE_DIR" rev-parse HEAD)" >> "$GITHUB_ENV"
-            echo "CORE_COMMIT_DATE=$(git -C "$CORE_DIR" log -1 --format=%cI)" >> "$GITHUB_ENV"
-            echo "CORE_DESCRIBE=$(git -C "$CORE_DIR" describe --tags --always)" >> "$GITHUB_ENV"
-          else
-            echo "CORE_COMMIT=${{ steps.core.outputs.sha }}" >> "$GITHUB_ENV"
-          fi
           echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
 
       - name: Unit tests
@@ -111,11 +132,20 @@ jobs:
       - name: Assemble debug APK
         run: ./gradlew :app:assembleDebug --no-daemon --console=plain
 
+      - name: Record artifact checksums
+        run: |
+          set -euo pipefail
+          cd app/build/outputs/apk/debug
+          sha256sum ./*.apk > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
           name: satelite-one-debug-${{ github.sha }}
-          path: app/build/outputs/apk/debug/*.apk
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/debug/SHA256SUMS.txt
           if-no-files-found: error
 
       - name: Upload test reports

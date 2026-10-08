@@ -365,6 +365,7 @@
     <string name="settings_version_title">Version</string>
     <string name="settings_core_title">Core</string>
     <string name="settings_core_source_title">Core source</string>
+    <string name="settings_core_branch_title">Core branch</string>
     <string name="settings_core_revision_title">Core revision</string>
     <string name="settings_build_date_title">Build date</string>
     <string name="settings_check_update_title">Check for updates</string>

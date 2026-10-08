@@ -15,8 +15,10 @@ interstellar.jks
 keystore.properties
 signing.properties
 
-# 112MB sing-box core — rebuild via `make lib_android` (see README)
+# 112MB sing-box core — rebuilt from Piggy-Cat-bit-shadow/sing-box (see README)
 app/libs/libbox.aar
+# provenance record emitted by build_libbox next to the AAR; regenerated with it
+app/libs/libbox.provenance
 
 # sidecar cores (mihomo/xray/hev) — fetched via tools/fetch_cores.py (CI 缓存)
 app/src/main/jniLibs/
