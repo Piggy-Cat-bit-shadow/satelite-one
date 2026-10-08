@@ -223,7 +223,7 @@
     <string name="settings_hero_orbit">轨道</string>
     <string name="settings_accent_title">主题色</string>
     <string name="settings_accent_desc">马卡龙色板,整套界面随之换肤</string>
-    <string name="settings_section_split">分流</string>
+    <string name="settings_section_split">Android 平台</string>
     <string name="settings_per_app_title">应用分流</string>
     <string name="settings_per_app_desc">白名单 / 黑名单控制哪些应用走代理</string>
     <string name="settings_per_app_disabled">关闭</string>

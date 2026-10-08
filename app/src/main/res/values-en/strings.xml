@@ -223,7 +223,7 @@
     <string name="settings_hero_orbit">Orbit</string>
     <string name="settings_accent_title">Accent color</string>
     <string name="settings_accent_desc">Macaron palette; the whole UI re-skins with it</string>
-    <string name="settings_section_split">Routing</string>
+    <string name="settings_section_split">Android</string>
     <string name="settings_per_app_title">App proxy</string>
     <string name="settings_per_app_desc">Whitelist / blacklist controls which apps go through the proxy</string>
     <string name="settings_per_app_disabled">Off</string>

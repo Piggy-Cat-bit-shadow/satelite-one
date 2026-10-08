@@ -24,7 +24,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.mutableStateOf
@@ -45,7 +44,6 @@ import com.interstellar.proxy.R
 import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.data.net.AppUpdateChecker
 import com.interstellar.proxy.ui.components.GlassCard
-import com.interstellar.proxy.ui.components.IosSwitch
 import com.interstellar.proxy.ui.components.PageHeader
 import com.interstellar.proxy.ui.components.SegmentedControl
 import com.interstellar.proxy.ui.components.pressableClick
@@ -193,7 +191,7 @@ fun SettingsPage(onOpen: (SettingsSubPage) -> Unit, onProxyChanged: () -> Unit =
 
         Spacer(Modifier.height(22.dp))
 
-        // ---- 分流 ----
+        // ---- Android 平台 ----
         PrefSectionLabel(stringResource(R.string.settings_section_split))
         GlassCard(modifier = Modifier.fillMaxWidth(), contentPadding = 6.dp) {
             PrefNavRow(
@@ -457,26 +455,6 @@ private fun PrefRowShell(
     }
 }
 
-@Composable
-private fun PrefToggleRow(
-    title: String,
-    desc: String? = null,
-    checked: Boolean,
-    enabled: Boolean = true,
-    onChange: (Boolean) -> Unit,
-) {
-    // A disabled row keeps rendering its saved state but cannot be toggled, so
-    // a setting that only applies in one routing mode cannot be changed while
-    // it is inert.
-    PrefRowShell(title = title, desc = desc) {
-        Box(modifier = Modifier.alpha(if (enabled) 1f else 0.45f)) {
-            IosSwitch(
-                checked = checked,
-                onChange = { if (enabled) onChange(it) },
-            )
-        }
-    }
-}
 
 private enum class SegLayout { Trailing, Below }
 
