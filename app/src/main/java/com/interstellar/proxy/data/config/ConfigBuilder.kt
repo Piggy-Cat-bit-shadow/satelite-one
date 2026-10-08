@@ -1,94 +1,78 @@
 package com.interstellar.proxy.data.config
 
-import com.interstellar.proxy.data.NodeMatcher
-import com.interstellar.proxy.data.model.DnsOverrideEntry
 import com.interstellar.proxy.data.model.NodeType
 import com.interstellar.proxy.data.model.ProxyNode
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.add
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 
 /**
- * Builds the sing-box JSON config from the unified node model.
- * Kotlin counterpart of interstellar-proxy's config/builder.rs + dns_build.rs,
- * adapted to the sing-box 1.14 (rule-actions, typed DNS) schema.
+ * Minimal sing-box config generator for plain node subscriptions.
+ *
+ * Deliberately thin: it emits only what sing-box needs to run the
+ * subscription's nodes behind a selector. Routing policy, geo rule sets, ad
+ * blocking, DNS policy, latency ranking and region grouping are NOT the app's
+ * business — they belong to sing-box itself, or to a raw sing-box config the
+ * user supplies (which is passed through untouched, see
+ * `SubscriptionRepository.regenerateActiveConfig`).
+ *
+ * Emits:
+ *  - one `selector` (手动选择) holding `auto` + every node
+ *  - one `urltest` (`auto`) over every node — the app's sole latency source
+ *  - the node outbounds (protocol conversion only, see [nodeToOutbound])
+ *  - a `direct` outbound (referenced by the LAN rule)
+ *  - a TUN inbound, plus an optional loopback mixed port for subscription refresh
+ *  - a minimal DNS block and a minimal route block
  */
 object ConfigBuilder {
 
     const val GROUP_TAG = "手动选择"
     const val AUTO_TAG = "auto"
     const val DIRECT_TAG = "direct"
-    const val BLOCK_TAG = "block"
-    private const val DNS_HOSTS_TAG = "dns-hosts"
 
-    /** Tags that node names must never collide with. */
-    private val RESERVED_TAGS =
-        setOf(GROUP_TAG, AUTO_TAG, DIRECT_TAG, BLOCK_TAG, "dns-out", DNS_HOSTS_TAG, "tun-in", "mixed-in")
+    /** Tags a node name must never collide with. */
+    private val RESERVED_TAGS = setOf(GROUP_TAG, AUTO_TAG, DIRECT_TAG, "tun-in", "mixed-in")
+
+    /**
+     * Private ranges kept out of the tunnel. Android UX rather than routing
+     * policy: without it the VPN swallows the LAN and local devices become
+     * unreachable. Fixed, not a setting.
+     */
+    private val LAN_ROUTES = listOf("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+
+    // urltest tuning pinned in one place instead of exposed as app settings.
+    // These are sing-box's own knobs; no app-side algorithm sits on top.
+    private const val URLTEST_URL = "https://www.gstatic.com/generate_204"
+    private const val URLTEST_INTERVAL = "5m"
+    private const val URLTEST_TOLERANCE = 50
+    private const val URLTEST_IDLE_TIMEOUT = "30m"
 
     data class BuildOptions(
-        val mode: OutboundMode = OutboundMode.RULE,
-        val bypassLan: Boolean = true,
-        val bypassCn: Boolean = true,
-        /** Route geolocation-!cn (overseas) domains through the proxy group (rule mode). */
-        val overseasProxy: Boolean = false,
-        /** Rule-mode fallback for unmatched traffic: direct instead of the proxy group. */
-        val fallbackDirect: Boolean = false,
-        val adBlock: Boolean = true,
+        /** Node/group tag to pre-select in the selector; falls back to `auto`. */
         val selectedNodeTag: String? = null,
+        /** Loopback mixed port used by the app's own subscription refresh. */
         val mixedPortEnabled: Boolean = true,
         val mixedPort: Int = 2080,
-        // loopback port for sing-box's clash_api (mode switching goes through it)
-        val apiPort: Int = 19090,
-        val apiSecret: String = "",
-        /** User domain→IP injections, resolved by a hosts DNS server first. */
-        val dnsOverrides: List<DnsOverrideEntry> = emptyList(),
-        /** Per-country urltest groups (香港 · 自动, …). Off: only 自动 + nodes. */
-        val regionGroupsEnabled: Boolean = false,
         /** When false, skip TUN so url-test can run without claiming the VPN. */
         val includeTun: Boolean = true,
-        /** Mobile-simple domain→action rules (SimpleRulesStore). */
-        val simpleRules: List<com.interstellar.proxy.data.SimpleRouteRule> = emptyList(),
     )
-
-    /** A derived urltest group: region auto, or a custom-rule filter. */
-    data class DerivedGroup(
-        val tag: String,
-        val members: List<String>,
-        val ruleId: String? = null,
-    )
-
-    enum class OutboundMode { RULE, GLOBAL, DIRECT }
 
     fun build(nodes: List<ProxyNode>, options: BuildOptions): String {
         val tags = dedupeTags(nodes)
-        val used = tags.toMutableSet().apply { addAll(RESERVED_TAGS) }
-        val regionGroups = if (options.regionGroupsEnabled) deriveRegionGroups(tags, used) else emptyList()
-        val customGroups = emptyList<DerivedGroup>()
         val json = buildJsonObject {
             putJsonObject("log") {
                 put("level", "info")
                 put("timestamp", true)
             }
-            putJsonObject("dns") { buildDns(options) }
+            putJsonObject("dns") { buildDns() }
             putJsonArray("inbounds") { buildInbounds(options) }
-            putJsonArray("outbounds") { buildOutbounds(nodes, tags, options, regionGroups, customGroups) }
-            putJsonObject("route") { buildRoute(options, customGroups, resolveSimpleRules(nodes, options)) }
+            putJsonArray("outbounds") { buildOutbounds(nodes, tags, options) }
+            putJsonObject("route") { buildRoute() }
             putJsonObject("experimental") {
-                putJsonObject("clash_api") {
-                    put("external_controller", "127.0.0.1:${options.apiPort}")
-                    if (options.apiSecret.isNotBlank()) put("secret", options.apiSecret)
-                    put("default_mode", when (options.mode) {
-                        OutboundMode.RULE -> "rule"
-                        OutboundMode.GLOBAL -> "global"
-                        OutboundMode.DIRECT -> "direct"
-                    })
-                }
                 putJsonObject("cache_file") {
                     put("enabled", true)
                 }
@@ -108,20 +92,15 @@ object ConfigBuilder {
                     putJsonArray("address") {
                         // v4-only TUN: the underlying network often has no IPv6
                         // exit, and a v6 tun address makes apps dial AAAA targets
-                        // that the direct outbound can never reach — every such
-                        // connection dies with ERR_CONNECTION_RESET. Matches the
-                        // mihomo sidecar VPN and CMFA's default (allowIpv6=false).
+                        // that can never be reached — those connections die with
+                        // ERR_CONNECTION_RESET.
                         add("172.19.0.1/30")
                     }
                     put("mtu", 9000)
                     put("auto_route", true)
                     put("stack", "mixed")
-                    if (options.bypassLan) {
-                        putJsonArray("route_exclude_address") {
-                            add("10.0.0.0/8")
-                            add("172.16.0.0/12")
-                            add("192.168.0.0/16")
-                        }
+                    putJsonArray("route_exclude_address") {
+                        LAN_ROUTES.forEach { add(it) }
                     }
                 },
             )
@@ -144,33 +123,24 @@ object ConfigBuilder {
         nodes: List<ProxyNode>,
         tags: List<String>,
         options: BuildOptions,
-        regionGroups: List<DerivedGroup>,
-        customGroups: List<DerivedGroup>,
     ) {
-        val selectorMembers = buildList {
-            add(AUTO_TAG)
-            addAll(regionGroups.map { it.tag })
-            addAll(tags)
-        }
-        val defaultTag = options.selectedNodeTag?.takeIf { it in selectorMembers } ?: AUTO_TAG
-        // main selector: auto (urltest-all) + per-region urltest + every node
+        val defaultTag = options.selectedNodeTag?.takeIf { it in tags || it == AUTO_TAG } ?: AUTO_TAG
+        // the single selector: auto (urltest over every node) + every node
         add(
             buildJsonObject {
                 put("type", "selector")
                 put("tag", GROUP_TAG)
                 putJsonArray("outbounds") {
-                    selectorMembers.forEach { add(it) }
+                    add(AUTO_TAG)
+                    tags.forEach { add(it) }
                 }
                 put("default", defaultTag)
                 put("interrupt_exist_connections", false)
             },
         )
-        // auto urltest
         if (nodes.isNotEmpty()) {
             add(urltestOutbound(AUTO_TAG, tags))
         }
-        regionGroups.forEach { add(urltestOutbound(it.tag, it.members)) }
-        customGroups.forEach { add(urltestOutbound(it.tag, it.members)) }
         // node outbounds (shadow-tls detours referenced inline)
         val usedTags = mutableSetOf<String>()
         val extras = mutableListOf<JsonElement>()
@@ -190,78 +160,91 @@ object ConfigBuilder {
             add(nodeToOutbound(node, tag, detourTag))
         }
         extras.forEach { add(it) }
-        // fixed outbounds
+        // referenced by the LAN route rule below
         add(buildJsonObject { put("type", "direct"); put("tag", DIRECT_TAG) })
-        add(buildJsonObject { put("type", "block"); put("tag", BLOCK_TAG) })
-        // note: no "dns" outbound — removed in sing-box 1.13, replaced by the
-        // hijack-dns route action above
     }
 
     private fun urltestOutbound(tag: String, members: List<String>): JsonObject = buildJsonObject {
         put("type", "urltest")
         put("tag", tag)
         putJsonArray("outbounds") { members.forEach { add(it) } }
-        put("url", "https://www.gstatic.com/generate_204")
-        put("interval", "5m")
-        put("tolerance", 50)
-        put("idle_timeout", "30m")
+        put("url", URLTEST_URL)
+        put("interval", URLTEST_INTERVAL)
+        put("tolerance", URLTEST_TOLERANCE)
+        put("idle_timeout", URLTEST_IDLE_TIMEOUT)
+    }
+
+    // ---- dns / route ----
+
+    /**
+     * Minimal DNS — exactly enough for Android TUN to resolve reliably.
+     *
+     * - `dns-local` (system resolver) answers queries raised while dialling an
+     *   outbound, i.e. resolving a node's own server domain. Without it a
+     *   remote-only resolver would have to resolve the proxy through the proxy.
+     * - `dns-remote` (DoH through the selector) answers application queries, so
+     *   lookups are not leaked to the underlying network.
+     *
+     * No CN/overseas split, no geo rule sets, no ad blocking, no hosts entries.
+     */
+    private fun kotlinx.serialization.json.JsonObjectBuilder.buildDns() {
+        putJsonArray("servers") {
+            add(
+                buildJsonObject {
+                    put("tag", "dns-local")
+                    put("type", "local")
+                },
+            )
+            add(
+                buildJsonObject {
+                    put("tag", "dns-remote")
+                    put("type", "https")
+                    put("server", "1.1.1.1")
+                    put("detour", GROUP_TAG)
+                },
+            )
+        }
+        putJsonArray("rules") {
+            add(
+                buildJsonObject {
+                    put("outbound", "any")
+                    put("server", "dns-local")
+                },
+            )
+        }
+        put("final", "dns-remote")
+        put("strategy", "prefer_ipv4")
+        put("independent_cache", true)
     }
 
     /**
-     * One urltest per detected region so the node page can switch
-     * "auto among HK / SG / …" without flattening back to a single node.
+     * Minimal route: sniff, hand DNS to the DNS module, keep the LAN out of the
+     * tunnel, send everything else to the selector.
+     *
+     * No geo rule sets, no CN bypass, no overseas rule, no ad blocking, no
+     * user-defined domain rules and no mode-dependent `final`.
      */
-    private fun deriveRegionGroups(tags: List<String>, used: MutableSet<String>): List<DerivedGroup> {
-        val buckets = linkedMapOf<NodeMatcher.Region, MutableList<String>>()
-        for (tag in tags) {
-            val region = NodeMatcher.regionOf(tag) ?: continue
-            buckets.getOrPut(region) { mutableListOf() }.add(tag)
+    private fun kotlinx.serialization.json.JsonObjectBuilder.buildRoute() {
+        putJsonArray("rules") {
+            add(buildJsonObject { put("action", "sniff") })
+            add(
+                buildJsonObject {
+                    put("protocol", "dns")
+                    put("action", "hijack-dns")
+                },
+            )
+            add(
+                buildJsonObject {
+                    put("ip_is_private", true)
+                    put("outbound", DIRECT_TAG)
+                },
+            )
         }
-        return buckets.map { (region, members) ->
-            val preferred = "${region.flag} ${region.name}"
-            val tag = uniqueTag(preferred, used)
-            DerivedGroup(tag, members)
-        }
+        put("final", GROUP_TAG)
+        put("auto_detect_interface", true)
     }
 
-
-    /**
-     * True when [selectedTag] is auto or a per-region urltest group — the
-     * modes where keyword-filter split rules are allowed to override paths.
-     */
-    fun nodeFilterRulesActive(
-        selectedTag: String?,
-        nodes: List<ProxyNode>,
-        regionGroupsEnabled: Boolean = true,
-    ): Boolean {
-        val tag = selectedTag?.takeIf { it.isNotBlank() } ?: AUTO_TAG
-        if (tag == AUTO_TAG) return true
-        if (!regionGroupsEnabled) return false
-        val tags = dedupeTags(nodes)
-        val used = tags.toMutableSet().apply { addAll(RESERVED_TAGS) }
-        return deriveRegionGroups(tags, used).any { it.tag == tag }
-    }
-
-    private fun uniqueTag(preferred: String, used: MutableSet<String>): String {
-        if (used.add(preferred)) return preferred
-        var i = 2
-        var candidate = "$preferred · 自动"
-        if (used.add(candidate)) return candidate
-        while (!used.add(candidate)) {
-            candidate = "$preferred · 自动 ($i)"
-            i++
-        }
-        return candidate
-    }
-
-    private fun shadowTlsTag(baseTag: String, used: MutableSet<String>): String {
-        var tag = "$baseTag-shadowtls"
-        var i = 2
-        while (!used.add(tag)) {
-            tag = "$baseTag-shadowtls-${i++}"
-        }
-        return tag
-    }
+    // ---- node → outbound (protocol conversion only) ----
 
     private fun buildShadowTlsOutbound(node: ProxyNode, tag: String): JsonObject = buildJsonObject {
         put("type", "shadowtls")
@@ -476,228 +459,7 @@ object ConfigBuilder {
         }
     }
 
-    // ---- dns / route ----
-
-    private fun kotlinx.serialization.json.JsonObjectBuilder.buildDns(options: BuildOptions) {
-        putJsonArray("servers") {
-            add(
-                buildJsonObject {
-                    put("tag", "dns-local")
-                    put("type", "local")
-                },
-            )
-            add(
-                buildJsonObject {
-                    put("tag", "dns-cn")
-                    put("type", "udp")
-                    put("server", "223.5.5.5")
-                },
-            )
-            add(
-                buildJsonObject {
-                    put("tag", "dns-remote")
-                    put("type", "https")
-                    put("server", "1.1.1.1")
-                    // sing-box 1.12+ rejects detour→empty direct outbound with a
-                    // fatal error; in DIRECT mode an omitted detour already dials
-                    // straight out the system interface
-                    if (options.mode != OutboundMode.DIRECT) put("detour", GROUP_TAG)
-                },
-            )
-            // user-injected domain→IP mappings (hosts semantics)
-            if (options.dnsOverrides.isNotEmpty()) {
-                add(
-                    buildJsonObject {
-                        put("tag", DNS_HOSTS_TAG)
-                        put("type", "hosts")
-                        putJsonObject("predefined") {
-                            for (entry in options.dnsOverrides) {
-                                for (domain in entry.parsedDomains()) {
-                                    put(domain, entry.ip)
-                                }
-                            }
-                        }
-                    },
-                )
-            }
-        }
-        putJsonArray("rules") {
-            // injected answers win over everything else — node server
-            // addresses included, so forcing a node domain is possible
-            if (options.dnsOverrides.isNotEmpty()) {
-                add(
-                    buildJsonObject {
-                        putJsonArray("domain") {
-                            options.dnsOverrides
-                                .flatMap { it.parsedDomains() }
-                                .distinct()
-                                .forEach { add(it) }
-                        }
-                        put("server", DNS_HOSTS_TAG)
-                    },
-                )
-            }
-            add(
-                buildJsonObject {
-                    put("outbound", "any")
-                    put("server", "dns-local")
-                },
-            )
-            if (options.adBlock) {
-                add(
-                    buildJsonObject {
-                        putJsonArray("rule_set") { add("category-ads-all") }
-                        put("action", "reject")
-                    },
-                )
-            }
-            if (options.mode == OutboundMode.RULE && options.bypassCn) {
-                add(
-                    buildJsonObject {
-                        putJsonArray("rule_set") { add("geosite-cn") }
-                        put("server", "dns-cn")
-                    },
-                )
-            }
-        }
-        // DIRECT mode dials dns-remote (1.1.1.1 DoH) without a detour, which is
-        // unreachable in CN — resolve via CN DNS instead, mirroring mihomo's
-        // DIRECT-mode nameserver (223.5.5.5)
-        put(
-            "final",
-            when (options.mode) {
-                OutboundMode.DIRECT -> "dns-cn"
-                else -> "dns-remote"
-            },
-        )
-        put("strategy", "prefer_ipv4")
-        put("independent_cache", true)
-    }
-
-    /** nodeId → outbound tag for the current node pool. */
-    private fun resolveSimpleRules(
-        nodes: List<ProxyNode>,
-        options: BuildOptions,
-    ): List<Pair<String, String>> = options.simpleRules.mapNotNull { rule ->
-        val outbound = when (rule.action) {
-            com.interstellar.proxy.data.SimpleRouteRule.Action.DIRECT -> DIRECT_TAG
-            com.interstellar.proxy.data.SimpleRouteRule.Action.PROXY -> GROUP_TAG
-            com.interstellar.proxy.data.SimpleRouteRule.Action.NODE ->
-                tagFor(nodes, rule.nodeId ?: return@mapNotNull null) ?: return@mapNotNull null
-        }
-        rule.domain.trim().removePrefix("*.").removeSuffix(".") to outbound
-    }.filter { it.first.isNotBlank() }
-
-    private fun kotlinx.serialization.json.JsonObjectBuilder.buildRoute(
-        options: BuildOptions,
-        customGroups: List<DerivedGroup>,
-        simpleRules: List<Pair<String, String>>,
-    ) {
-        putJsonArray("rules") {
-            add(buildJsonObject { put("action", "sniff") })
-            add(
-                buildJsonObject {
-                    put("protocol", "dns")
-                    put("action", "hijack-dns")
-                },
-            )
-            // user's manual domain rules beat every built-in rule
-            for ((suffix, outbound) in simpleRules) {
-                add(
-                    buildJsonObject {
-                        putJsonArray("domain_suffix") { add(suffix) }
-                        put("outbound", outbound)
-                    },
-                )
-            }
-            if (options.bypassLan) {
-                add(
-                    buildJsonObject {
-                        put("ip_is_private", true)
-                        put("outbound", DIRECT_TAG)
-                    },
-                )
-            }
-            // ads blocked first so tracker domains never reach the CN rule
-            if (options.adBlock) {
-                add(
-                    buildJsonObject {
-                        putJsonArray("rule_set") { add("category-ads-all") }
-                        put("outbound", BLOCK_TAG)
-                    },
-                )
-            }
-            // overseas (geolocation-!cn) domains ride the proxy — matched
-            // before the CN bypass so whitelist-style routing wins for a
-            // domain that appears in both lists
-            if (options.mode == OutboundMode.RULE && options.overseasProxy) {
-                add(
-                    buildJsonObject {
-                        putJsonArray("rule_set") { add("geosite-geolocation-!cn") }
-                        put("outbound", GROUP_TAG)
-                    },
-                )
-            }
-            if (options.mode == OutboundMode.RULE && options.bypassCn) {
-                add(
-                    buildJsonObject {
-                        putJsonArray("rule_set") {
-                            add("geosite-cn")
-                            add("geoip-cn")
-                        }
-                        put("outbound", DIRECT_TAG)
-                    },
-                )
-            }
-        }
-        putJsonArray("rule_set") {
-            if (options.adBlock) {
-                add(ruleSetJson("category-ads-all", com.interstellar.proxy.data.RulesStore.adsAll))
-            }
-            if (options.mode == OutboundMode.RULE && options.overseasProxy) {
-                add(ruleSetJson("geosite-geolocation-!cn", com.interstellar.proxy.data.RulesStore.geolocationNotCn))
-            }
-            if (options.mode == OutboundMode.RULE && options.bypassCn) {
-                add(ruleSetJson("geosite-cn", com.interstellar.proxy.data.RulesStore.geositeCn))
-                add(ruleSetJson("geoip-cn", com.interstellar.proxy.data.RulesStore.geoipCn))
-            }
-        }
-        put("final", when {
-            options.mode == OutboundMode.DIRECT -> DIRECT_TAG
-            // whitelist-style: only rule-matched domains ride the proxy
-            options.mode == OutboundMode.RULE && options.fallbackDirect -> DIRECT_TAG
-            else -> GROUP_TAG
-        })
-        put("auto_detect_interface", true)
-    }
-
     // ---- helpers ----
-
-    /**
-     * Built-in rule set: local file when available (bundled in APK),
-     * remote download as fallback. Also used by RawConfigApplier.
-     */
-    internal fun ruleSetJson(tag: String, asset: com.interstellar.proxy.data.RulesStore.RuleAsset): JsonObject {
-        // runCatching: fall to the remote branch when the app context is
-        // unavailable (JVM unit tests) instead of crashing config generation
-        val file = runCatching { com.interstellar.proxy.data.RulesStore.fileOf(asset) }.getOrNull()
-        return if (file != null && file.isFile && file.length() > 8) {
-            buildJsonObject {
-                put("tag", tag)
-                put("type", "local")
-                put("format", "binary")
-                put("path", file.absolutePath)
-            }
-        } else {
-            buildJsonObject {
-                put("tag", tag)
-                put("type", "remote")
-                put("format", "binary")
-                put("url", "https://raw.githubusercontent.com/SagerNet/sing-${if (tag.startsWith("geoip")) "geoip" else "geosite"}/rule-set/$tag.srs")
-                put("download_detour", DIRECT_TAG)
-            }
-        }
-    }
 
     private fun dedupeTags(nodes: List<ProxyNode>): List<String> {
         val used = mutableSetOf<String>()

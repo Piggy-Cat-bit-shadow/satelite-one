@@ -8,8 +8,7 @@ import kotlinx.serialization.json.jsonObject
 /**
  * Detects whether a subscription body is a full proxy-core config (clash /
  * sing-box / Xray) rather than a plain node list. Raw configs can be kept on
- * disk and fed to the matching core verbatim (plus compatibility shims) —
- * see RawConfigApplier.
+ * disk so a matching format can be fed to the core.
  */
 enum class RawConfigFormat(val wire: String, val label: String) {
     CLASH("clash", "Clash"),

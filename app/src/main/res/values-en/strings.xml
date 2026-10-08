@@ -13,53 +13,10 @@
     <!-- functional group tags (display-layer only, see LocalizedNames) -->
     <string name="group_manual">Manual</string>
     <string name="group_auto">Auto</string>
-    <string name="region_info">ℹ️ Info</string>
-    <string name="region_other">🌐 Others</string>
-    <string name="region_suffix_auto"> · Auto</string>
-    <string name="region_suffix_auto_n"> · Auto (%1$s)</string>
-
-    <!-- simple-rule actions -->
-    <string name="rule_action_direct">Direct</string>
-    <string name="rule_action_proxy">Proxy</string>
-    <string name="rule_action_node">Pinned node</string>
-
-    <!-- country display names -->
-    <string name="country_cn">China</string>
-    <string name="country_hk">Hong Kong</string>
-    <string name="country_tw">Taiwan</string>
-    <string name="country_jp">Japan</string>
-    <string name="country_kr">South Korea</string>
-    <string name="country_sg">Singapore</string>
-    <string name="country_us">United States</string>
-    <string name="country_ca">Canada</string>
-    <string name="country_gb">United Kingdom</string>
-    <string name="country_de">Germany</string>
-    <string name="country_fr">France</string>
-    <string name="country_nl">Netherlands</string>
-    <string name="country_ru">Russia</string>
-    <string name="country_au">Australia</string>
-    <string name="country_in">India</string>
-    <string name="country_tr">Turkey</string>
-    <string name="country_br">Brazil</string>
-    <string name="country_th">Thailand</string>
-    <string name="country_vn">Vietnam</string>
-    <string name="country_my">Malaysia</string>
-    <string name="country_ph">Philippines</string>
-    <string name="country_id">Indonesia</string>
-    <string name="country_it">Italy</string>
-    <string name="country_es">Spain</string>
-    <string name="country_se">Sweden</string>
-    <string name="country_ch">Switzerland</string>
-    <string name="country_ae">UAE</string>
-    <string name="country_ar">Argentina</string>
-
 
     <!-- dashboard node row -->
     <string name="dash_picking">Selecting…</string>
     <string name="dash_node_none">No node selected</string>
-
-    <!-- network probe -->
-    <string name="probe_all_failed">All probe endpoints failed</string>
 
     <!-- language setting -->
     <string name="settings_language_title">Language</string>
@@ -73,7 +30,6 @@
     <string name="vm_config_gen_failed_no_nodes">Config generation failed: no usable nodes in the subscription</string>
     <string name="vm_start_failed">Start failed: %1$s</string>
     <string name="vm_config_update_failed">Failed to update config</string>
-    <string name="vm_rule_update_failed">Rule file update failed: %1$s</string>
     <string name="vm_switch_failed">Switch failed: %1$s</string>
     <string name="vm_test_failed_send">Test failed: could not send command</string>
     <string name="vm_test_failed">Test failed: %1$s</string>
@@ -94,7 +50,6 @@
     <string name="vm_updated_all">Updated all %1$d subscriptions</string>
     <string name="vm_updated_partial">Updated %1$d/%2$d subscriptions</string>
     <string name="vm_keep_one_sub">Keep at least one subscription</string>
-    <string name="vm_probe_failed">Probe failed</string>
 
     <!-- subscription repository -->
     <string name="repo_no_subscription_selected">No subscription selected</string>
@@ -107,14 +62,6 @@
     <string name="repo_refreshed_raw">Refreshed %1$s: %2$s config kept</string>
     <string name="repo_refresh_unparsable">Content unparsable after refresh: %1$s</string>
     <string name="repo_refresh_failed">Refresh failed %1$s: %2$s</string>
-
-    <!-- geo rule updater -->
-    <string name="geo_download_failed">Download failed (%1$s); check the network and retry</string>
-    <string name="geo_updated_all">Rule files updated (%1$d)</string>
-    <string name="geo_updated_partial">Updated %1$d, failed: %2$s</string>
-    <string name="geo_download_short">Download failed</string>
-    <string name="geo_invalid_file">File validation failed (not a valid rule file)</string>
-    <string name="geo_replace_failed">Failed to replace the file</string>
 
     <!-- app update checker -->
     <string name="update_no_location">Redirect is missing the Location header</string>
@@ -135,12 +82,8 @@
     <string name="dash_connecting">Building tunnel…</string>
     <string name="dash_disconnecting">Disconnecting…</string>
     <string name="dash_tap_to_connect">Tap the icon to connect</string>
-    <string name="dash_route_global">Global</string>
-    <string name="dash_route_direct">Direct</string>
-    <string name="dash_route_rule">Rule</string>
     <string name="dash_mode_auto">Auto</string>
     <string name="dash_mode_manual">Manual</string>
-    <string name="dash_label_route">Routing</string>
     <string name="dash_label_scope">App proxy</string>
     <string name="dash_scope_on">On</string>
     <string name="dash_scope_off">Off</string>
@@ -149,12 +92,6 @@
     <string name="dash_caption_session_hint">Connected for · tap for details</string>
     <string name="dash_caption_traffic">Traffic</string>
     <string name="dash_traffic_summary">Σ %1$s · %2$d conns</string>
-    <string name="dash_caption_probe">Exit network</string>
-    <string name="dash_probe_via_proxy">Via proxy</string>
-    <string name="dash_probe_direct">Direct</string>
-    <string name="dash_probing">Probing…</string>
-    <string name="dash_probe_failed">Probe failed · tap to retry</string>
-    <string name="dash_probe_idle">Tap to check the exit IP</string>
     <string name="dash_mix_subs">Mix · %1$d subs</string>
     <string name="dash_subs_none">None</string>
     <string name="dash_caption_subs">Subscription</string>
@@ -265,34 +202,6 @@
     <string name="perapp_loading">Loading app list…</string>
     <string name="perapp_empty">No matching apps</string>
     <string name="perapp_self_suffix">" (this app)"</string>
-    <string name="dns_add">Add</string>
-    <string name="dns_title">Custom DNS records</string>
-    <string name="dns_empty_hint">No custom records yet. For example, pin example.com to 10.0.0.1 so it skips upstream DNS.</string>
-    <string name="dns_raw_mode_hint">Raw config mode passes the subscription config through unchanged, so DNS overrides do not apply and cannot be edited here</string>
-    <string name="dns_footer">Exact-domain matching (like system hosts); subdomains must be added separately, e.g. example.com and www.example.com. Changes regenerate the config immediately and hot-reload a running core.</string>
-    <string name="dns_unnamed">Unnamed record</string>
-    <string name="dns_entry_summary">"%1$d domains  ·  %2$s"</string>
-    <string name="dns_editor_add_title">Add custom record</string>
-    <string name="dns_editor_edit_title">Edit custom record</string>
-    <string name="dns_field_domains">Domains</string>
-    <string name="dns_field_domains_hint">example.com (comma-separated)</string>
-    <string name="dns_field_ip">IP address</string>
-    <string name="dns_field_ip_hint">1.2.3.4 or 2400:3200::1</string>
-    <string name="dns_hint_no_domains">Enter at least one domain</string>
-    <string name="dns_hint_bad_ip">The IP must be a valid IPv4 or IPv6 address</string>
-    <string name="dns_hint_summary">%1$d domains will resolve to %2$s</string>
-    <string name="dns_save">Save</string>
-    <string name="dns_delete">Delete record</string>
-    <string name="rules_title">Routing rules</string>
-    <string name="rules_add">Add</string>
-    <string name="rules_empty_hint">No rules yet · tap Add to create one\nExample: bilibili.com → Direct</string>
-    <string name="rules_footer">Suffix match: example.com covers all its subdomains; custom rules apply before built-ins.</string>
-    <string name="rules_editor_add_title">Add rule</string>
-    <string name="rules_editor_edit_title">Edit rule</string>
-    <string name="rules_no_nodes">The node pool is empty</string>
-    <string name="rules_select_node">Select node</string>
-    <string name="rules_cancel">Cancel</string>
-    <string name="rules_save">Save</string>
     <string name="main_tab_home">Home</string>
     <string name="main_tab_nodes">Nodes</string>
     <string name="main_tab_subs">Subs</string>
@@ -303,9 +212,6 @@
     <string name="settings_subpage_per_app">Per-app proxy</string>
     <string name="settings_subpage_connections">Monitor</string>
     <string name="settings_subpage_logs">System logs</string>
-    <string name="settings_subpage_rules">Routing rules</string>
-    <string name="settings_subpage_dns">DNS overrides</string>
-    <string name="settings_subpage_proxy">Routing settings</string>
     <string name="settings_section_appearance">Appearance</string>
     <string name="settings_theme_title">Theme</string>
     <string name="settings_theme_desc">Follow the system light/dark or lock it</string>
@@ -323,12 +229,6 @@
     <string name="settings_per_app_disabled">Off</string>
     <string name="settings_per_app_whitelist_count">Whitelist · %1$d</string>
     <string name="settings_per_app_blacklist_count">Blacklist · %1$d</string>
-    <string name="settings_routing_desc">Routing mode / rule details / routing rules</string>
-    <string name="settings_mode_global">Global</string>
-    <string name="settings_mode_rule">Rule</string>
-    <string name="settings_dns_desc">Domain → IP resolution overrides</string>
-    <string name="settings_not_set">Not set</string>
-    <string name="settings_enabled_count">%1$d enabled</string>
     <string name="settings_section_diagnostics">Diagnostics</string>
     <string name="settings_logs_desc">Live core log stream</string>
     <string name="settings_section_about">About</string>
@@ -350,34 +250,6 @@
     <string name="settings_check_update_go">Get update</string>
     <string name="settings_check_update_btn">Check</string>
     <string name="settings_check_update_network_error">Network error</string>
-    <string name="settings_routing_mode">Routing mode</string>
-    <string name="settings_mode_title">Mode</string>
-    <string name="settings_mode_desc">Where proxied traffic is headed</string>
-    <string name="settings_routing_mode_footer">Rule mode splits by destination (CN/LAN/custom); global sends everything through the node; direct keeps the VPN but does not proxy.</string>
-    <string name="settings_rule_mode_only">Rule mode only</string>
-    <string name="settings_rule_details">Rule details</string>
-    <string name="settings_bypass_lan_title">Bypass LAN</string>
-    <string name="settings_bypass_lan_desc">NAS, printers and routers skip the proxy</string>
-    <string name="settings_bypass_cn_title">Bypass CN sites</string>
-    <string name="settings_bypass_cn_desc">CN domains and IPs go direct (rule mode only)</string>
-    <string name="settings_overseas_proxy_title">Proxy overseas sites</string>
-    <string name="settings_overseas_proxy_desc">Non-CN domains go through the proxy (geolocation-!cn, rule mode only)</string>
-    <string name="settings_fallback_title">Rule fallback</string>
-    <string name="settings_fallback_desc">Where unmatched traffic goes (rule mode only)</string>
-    <string name="settings_adblock_title">Ad blocking</string>
-    <string name="settings_adblock_desc">Block ad and tracker domains</string>
-    <string name="settings_region_groups_title">Group by country</string>
-    <string name="settings_region_groups_desc">Country url-test groups (Hong Kong, Singapore…) on the nodes page</string>
-    <string name="settings_whitelist_mode_footer">Overseas via proxy + fallback direct = whitelist mode: only rule-matched domains go through the proxy, the rest direct.</string>
-    <string name="settings_custom_rules_desc">Domain → direct / proxy / pinned node</string>
-    <string name="settings_custom_rules_footer">Manual rules match first, ahead of built-ins like CN bypass.</string>
-    <string name="settings_rule_files">Rule files</string>
-    <string name="settings_rule_files_update_title">Update rule files</string>
-    <string name="settings_rule_files_srs">Built-in srs rule sets (%1$s, ~2 MB)</string>
-    <string name="settings_rule_files_update">Update</string>
-    <string name="settings_rule_files_footer">Downloads the latest rules from GitHub; a running core downloads through the current node.</string>
-    <string name="settings_rule_files_last_update">Last updated: %1$s</string>
-    <string name="settings_rule_files_never_updated">Never updated</string>
     <string name="nodes_title">Nodes</string>
     <string name="nodes_empty_mix">No subscriptions checked in Mix, or the selected subscription has no usable nodes</string>
     <string name="nodes_empty_no_subscription">Add and activate a subscription first</string>

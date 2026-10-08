@@ -210,7 +210,7 @@ fun NodesPage(viewModel: AppViewModel) {
             }
         }
         val nodeItems = remember(allItems) { allItems.filterNot(::isGroupItem) }
-        // group references (region / airport sub-groups) ride at the list head
+        // group references (airport sub-groups) ride at the list head
         // as tappable group cards — tapping points THIS group at them. The
         // auto group reference is skipped: the top 自动 tab IS its switch.
         val groupItems = remember(allItems) {

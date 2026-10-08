@@ -11,11 +11,9 @@ import androidx.lifecycle.viewModelScope
 import com.interstellar.proxy.constant.Action
 import com.interstellar.proxy.constant.Status
 import com.interstellar.proxy.data.ConfigStore
-import com.interstellar.proxy.data.DnsOverridesStore
 import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.data.SubscriptionRepository
 import com.interstellar.proxy.data.config.ConfigBuilder
-import com.interstellar.proxy.data.model.DnsOverrideEntry
 import com.interstellar.proxy.data.net.SubscriptionFetcher
 import com.interstellar.proxy.data.subscription.SubscriptionParser
 import io.nekohasekai.libbox.Libbox
@@ -43,15 +41,10 @@ data class SpeedState(
     val downlinkTotal: Long = 0,
 )
 
-data class ClashModeState(
-    val modes: List<String> = emptyList(),
-    val current: String = "rule",
-)
-
 /**
  * Resolve which group a manual url-test should target.
  *
- * urltest groups (auto, per-region) are testable directly, so the requested tag
+ * urltest groups (auto) are testable directly, so the requested tag
  * is honoured. The main entry is a *selector* whose members mix group and node
  * tags; the kernel's per-item pass skips those ("大量未测"), so a selector (or an
  * unknown/blank tag) falls back to [ConfigBuilder.AUTO_TAG], whose members are
@@ -62,14 +55,6 @@ internal fun resolveUrlTestTarget(groupTag: String, groups: List<CoreGroup>): St
     val live = groups.find { it.tag == groupTag }
     val isUrlTest = live != null && live.type.equals("urltest", ignoreCase = true)
     return if (isUrlTest) groupTag else ConfigBuilder.AUTO_TAG
-}
-
-/** Exit-IP probe lifecycle for the dashboard 网络探测 card. */
-sealed interface ProbeState {
-    data object Idle : ProbeState
-    data object Running : ProbeState
-    data class Done(val result: com.interstellar.proxy.data.net.NetProbe.Result) : ProbeState
-    data class Failed(val message: String) : ProbeState
 }
 
 /** Transient feedback pill (subscription updates etc.). */
@@ -102,18 +87,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _history = MutableStateFlow<List<Pair<Long, Long>>>(emptyList())
     val history: StateFlow<List<Pair<Long, Long>>> = _history
 
-    private val _clashMode = MutableStateFlow(ClashModeState())
-    val clashMode: StateFlow<ClashModeState> = _clashMode
-
-    /**
-     * Routing mode as the UI sees it ("rule" | "global" | "direct"). The mode
-     * is BAKED into the generated config (route.final / CN bypass rules), so
-     * this flow is driven by the persisted setting plus optimistic updates —
-     * the core's clash-mode callback alone can't reflect it.
-     */
-    private val _routingMode = MutableStateFlow(Settings.outboundMode.name.lowercase())
-    val routingMode: StateFlow<String> = _routingMode
-
     private val _groups = MutableStateFlow<List<CoreGroup>>(emptyList())
     val groups: StateFlow<List<CoreGroup>> = _groups
 
@@ -134,49 +107,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _proxyScope = MutableStateFlow(readProxyScope())
     val proxyScope: StateFlow<ProxyScope> = _proxyScope
 
-    /** True while a rule/geodata file update is in flight (spinner in the UI). */
-    private val _ruleFilesUpdating = MutableStateFlow(false)
-    val ruleFilesUpdating: StateFlow<Boolean> = _ruleFilesUpdating
-
     private fun readProxyScope() = ProxyScope(
         whitelist = Settings.perAppProxyMode == Settings.PER_APP_PROXY_INCLUDE,
         count = Settings.perAppProxyList.size,
     )
-
-
-    // ---- simple routing rules ----
-
-    private val _simpleRules = MutableStateFlow(com.interstellar.proxy.data.SimpleRulesStore.rules.toList())
-    val simpleRules: StateFlow<List<com.interstellar.proxy.data.SimpleRouteRule>> = _simpleRules
-
-    fun upsertSimpleRule(rule: com.interstellar.proxy.data.SimpleRouteRule) {
-        com.interstellar.proxy.data.SimpleRulesStore.upsert(rule)
-        _simpleRules.value = com.interstellar.proxy.data.SimpleRulesStore.rules.toList()
-        refreshProxyConfig()
-    }
-
-    fun removeSimpleRule(id: String) {
-        com.interstellar.proxy.data.SimpleRulesStore.remove(id)
-        _simpleRules.value = com.interstellar.proxy.data.SimpleRulesStore.rules.toList()
-        refreshProxyConfig()
-    }
-
-    fun setSimpleRuleEnabled(id: String, enabled: Boolean) {
-        com.interstellar.proxy.data.SimpleRulesStore.setEnabled(id, enabled)
-        _simpleRules.value = com.interstellar.proxy.data.SimpleRulesStore.rules.toList()
-        refreshProxyConfig()
-    }
-
-    /** id/tag/name triples of the current node pool for the rule picker. */
-    fun nodePickerEntries(): List<Triple<String, String, String>> {
-        val pool = SubscriptionRepository.poolOf(
-            _subscriptions.value,
-            _activeSubscriptionId.value,
-            _mixEnabled.value,
-            _mixSubscriptionIds.value,
-        )
-        return ConfigBuilder.tagsFor(pool).zip(pool) { tag, node -> Triple(node.id, tag, node.name) }
-    }
 
     /** tag → latest url-test delay (pushed via the outbounds stream). */
     private val _delays = MutableStateFlow<Map<String, Int>>(emptyMap())
@@ -275,9 +209,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _message = MutableStateFlow<String?>(null)
     val message: StateFlow<String?> = _message
 
-    private val _probe = MutableStateFlow<ProbeState>(ProbeState.Idle)
-    val probe: StateFlow<ProbeState> = _probe
-
     private val _toast = MutableStateFlow<UiToast?>(null)
     val toast: StateFlow<UiToast?> = _toast
 
@@ -294,9 +225,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-
-    private val _dnsOverrides = MutableStateFlow(DnsOverridesStore.entries.toList())
-    val dnsOverrides: StateFlow<List<DnsOverrideEntry>> = _dnsOverrides
 
     private var pollJob: Job? = null
     private var startingWatchdog: Job? = null
@@ -321,7 +249,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         listOf(
             CommandClient.ConnectionType.Status,
             CommandClient.ConnectionType.Groups,
-            CommandClient.ConnectionType.ClashMode,
             // delay updates stream through outbounds, not the groups snapshot
             CommandClient.ConnectionType.Outbounds,
         ),
@@ -398,20 +325,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 // and the callers' finally own the testing state.
             }
 
-            override fun initializeClashMode(modeList: List<String>, currentMode: String) {
-                _clashMode.value = ClashModeState(modeList, currentMode)
-                normalizeRoutingMode(currentMode)?.let { _routingMode.value = it }
-            }
-
-            override fun updateClashMode(newMode: String) {
-                _clashMode.value = _clashMode.value.copy(current = newMode)
-                normalizeRoutingMode(newMode)?.let { _routingMode.value = it }
-            }
         },
     )
-
-    private fun normalizeRoutingMode(mode: String): String? =
-        mode.lowercase().takeIf { it == "rule" || it == "global" || it == "direct" }
 
     /** libbox group snapshot → neutral CoreGroup. */
     private fun convertGroup(group: OutboundGroup): CoreGroup {
@@ -488,19 +403,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (_status.value == Status.Started) return
         _status.value = Status.Started
         _connectedAt.value = System.currentTimeMillis()
-        _probe.value = ProbeState.Idle
         Settings.tileActive = true
         if (!autoTested) {
             autoTested = true
             viewModelScope.launch(Dispatchers.IO) {
                 runCatching { CommandTarget.standaloneClient().urlTest(ConfigBuilder.AUTO_TAG) }
-            }
-            // once the url-test settles, refresh the exit-IP card
-            viewModelScope.launch {
-                delay(6_000)
-                if (_status.value == Status.Started && _probe.value == ProbeState.Idle) {
-                    probeNetwork()
-                }
             }
         }
     }
@@ -589,8 +496,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Regenerates the active config from current settings (bypass-LAN,
-     * bypass-CN, ad-block, mode…) and hot-reloads the running core.
+     * Regenerates the active config from current settings (node pick, mix pool,
+     * system proxy…) and hot-reloads the running core.
      */
     fun refreshProxyConfig() {
         viewModelScope.launch(Dispatchers.IO) {
@@ -647,53 +554,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Downloads the latest rule-set files, then reloads so the fresh files
-     * take effect immediately (sing-box re-reads local rule-sets on reload).
-     */
-    fun updateRuleFiles() {
-        if (_ruleFilesUpdating.value) return
-        _ruleFilesUpdating.value = true
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val summary = com.interstellar.proxy.data.net.GeoRuleUpdater.update()
-                _message.value = summary
-                val config = SubscriptionRepository.regenerateActiveConfig()
-                if (config != null && _status.value == Status.Started) {
-                    runCatching { CommandTarget.standaloneClient().serviceReload() }
-                }
-            } catch (e: Exception) {
-                _message.value = str(com.interstellar.proxy.R.string.vm_rule_update_failed, e.message ?: "")
-            } finally {
-                _ruleFilesUpdating.value = false
-            }
-        }
-    }
-
-    fun setClashMode(mode: String) {
-        val normalized = normalizeRoutingMode(mode) ?: return
-        // optimistic: the seg moves immediately, the reload below confirms it
-        _routingMode.value = normalized
-        viewModelScope.launch(Dispatchers.IO) {
-            // keep the core's clash API state in sync (the actual routing is
-            // baked into the regenerated config below)
-            runCatching {
-                CommandTarget.standaloneClient().setClashMode(normalized)
-            }
-            Settings.outboundMode = when (normalized) {
-                "global" -> ConfigBuilder.OutboundMode.GLOBAL
-                "direct" -> ConfigBuilder.OutboundMode.DIRECT
-                else -> ConfigBuilder.OutboundMode.RULE
-            }
-            // regenerate with the new mode, then hot-reload so a running core
-            // picks up the new route.final / CN bypass rules immediately
-            val config = SubscriptionRepository.regenerateActiveConfig()
-            if (config != null && _status.value == Status.Started) {
-                runCatching { CommandTarget.standaloneClient().serviceReload() }
-            }
-        }
-    }
-
     fun selectNode(groupTag: String, itemTag: String) {
         Settings.selectedOutboundTag = itemTag
         _selectedOutboundTag.value = itemTag
@@ -720,30 +580,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
 
 
-    fun upsertDnsOverride(entry: DnsOverrideEntry) {
-        DnsOverridesStore.upsert(entry)
-        _dnsOverrides.value = DnsOverridesStore.entries.toList()
-        refreshProxyConfig()
-    }
-
-    fun removeDnsOverride(id: String) {
-        DnsOverridesStore.remove(id)
-        _dnsOverrides.value = DnsOverridesStore.entries.toList()
-        refreshProxyConfig()
-    }
-
-    fun setDnsOverrideEnabled(id: String, enabled: Boolean) {
-        DnsOverridesStore.setEnabled(id, enabled)
-        _dnsOverrides.value = DnsOverridesStore.entries.toList()
-        refreshProxyConfig()
-    }
-
-
-
     /**
      * Resolve the group a manual url-test should target.
      *
-     * urltest groups (auto, per-region) are testable directly. The main entry is
+     * urltest groups (auto) are testable directly. The main entry is
      * a *selector* whose members mix group and node tags, and the kernel's
      * per-item pass skips those wholesale ("大量未测"), so a selector keeps
      * falling back to [ConfigBuilder.AUTO_TAG], whose members are every node.
@@ -1224,19 +1064,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearMessage() {
         _message.value = null
-    }
-
-    /** One-tap exit-IP probe; races public IP APIs through the running node. */
-    fun probeNetwork() {
-        if (_probe.value == ProbeState.Running) return
-        _probe.value = ProbeState.Running
-        viewModelScope.launch(Dispatchers.IO) {
-            _probe.value = try {
-                ProbeState.Done(com.interstellar.proxy.data.net.NetProbe.probe())
-            } catch (e: Exception) {
-                ProbeState.Failed(e.message ?: str(com.interstellar.proxy.R.string.vm_probe_failed))
-            }
-        }
     }
 
     private fun urlHost(url: String): String = runCatching {

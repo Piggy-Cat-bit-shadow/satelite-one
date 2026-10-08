@@ -49,17 +49,6 @@ UI 采用「航空航天玻璃 + 任务控制台」设计语言：深空底色�
 
 - 分组、节点、延迟、当前选择、搜索、排序、网格/列表布局
 - **URL Test** 走内核的 urltest 组；断连状态下用无 TUN 的 headless 内核完成测速
-- **TCP Ping**：不经内核的直连 TCP 探测（绕过自身 tun），用于快速筛选
-- **智能模式**：周期性实测出口延迟，超阈值时在全池 TCP Ping + 内核测速后择优热切换
-
-### 路由与分流
-
-- **三种模式**：规则 / 全局 / 直连
-- **规则集**：内置 `geosite-cn` / `geoip-cn` / `geosite-geolocation-!cn` / `category-ads-all`
-  二进制规则集（`.srs`）随 APK 打包，可在设置内更新
-- **自定义分流规则**：域名 → 指定节点筛选组（支持分组与规则动作）
-- **DNS 覆盖**：自定义域名 → IP 注入，由 hosts DNS 优先解析
-- **IPv6 / 绕过局域网 / 绕过大陆 / 广告拦截**开关
 
 ### 平台能力
 
@@ -94,8 +83,7 @@ app/src/main/java/com/interstellar/proxy/
 │   ├── SingBoxCore.kt     #   libbox CommandServer + CommandServerHandler
 │   ├── ProxyCore.kt       #   ProxyCore / CoreOverrides / CoreHost
 │   ├── CoreGroup.kt       #   UI 用的中性 outbound 分组 DTO
-│   ├── AppLog.kt
-│   └── DirectPing.kt      #   绕过 tun 的直连 TCP 探测
+│   └── AppLog.kt
 ├── bg/                    # 服务层（移植自 sing-box-for-android 最小集）
 │   ├── BoxService.kt      #   启停编排、通知、Doze pause/wake
 │   ├── VPNService.kt      #   VpnService，把 tun fd 交给 libbox
@@ -108,9 +96,8 @@ app/src/main/java/com/interstellar/proxy/
 │   ├── ConfigStore.kt / Settings.kt / UpdateWorker.kt
 │   ├── SubscriptionRepository.kt
 │   ├── config/ConfigBuilder.kt        # sing-box JSON 生成
-│   ├── config/RawConfigApplier.kt     # 原始 sing-box 配置直通 + 内置规则注入
 │   ├── subscription/                  # Clash YAML / 分享链接 / sing-box JSON 解析
-│   └── net/                           # 订阅抓取、IP 探测、规则集更新、更新检查
+│   └── net/                           # 订阅抓取、更新检查
 └── ui/                    # Compose 页面、组件、主题
 ```
 
@@ -190,17 +177,11 @@ INTERSTELLAR_KEY_PASSWORD
 
 - 只支持 sing-box 能跑的协议；Xray / mihomo 独有功能不保留
 - `ProxyService`（无 TUN 的 headless 内核）只用于「未连接时测速」，配置里不含 tun inbound
-- 直连 TCP Ping 的 UDP-only 协议（hysteria2 / tuic / wireguard / quic）会被跳过并标注
 
 ## Roadmap
 
-- [ ] 内置规则集定期更新（随版本发布更新）
-- [ ] 智能模式参数可配置（阈值 / 巡检间隔）
 - [x] 单内核化（只保留自定义 sing-box）
-- [x] 智能切换（巡检 → Ping 筛选 → 实测择优 → 缓存排序）
 - [x] 订阅自动更新（WorkManager）
-- [x] 路由规则自定义（域名 → 直连 / 代理 / 指定节点）
-- [x] DNS 手动解析覆写（域名 → 固定 IP）
 - [x] 玻璃控制台 UI 重设计
 
 ## 致谢

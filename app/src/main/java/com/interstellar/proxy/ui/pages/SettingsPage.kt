@@ -42,11 +42,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.interstellar.proxy.BuildConfig
 import com.interstellar.proxy.R
-import com.interstellar.proxy.data.DnsOverridesStore
 import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.data.net.AppUpdateChecker
 import com.interstellar.proxy.ui.components.GlassCard
-import com.interstellar.proxy.ui.components.IosSectionFooter
 import com.interstellar.proxy.ui.components.IosSwitch
 import com.interstellar.proxy.ui.components.PageHeader
 import com.interstellar.proxy.ui.components.SegmentedControl
@@ -69,7 +67,7 @@ fun setLanguageChangedListener(listener: () -> Unit) {
     onLanguageChanged = listener
 }
 
-enum class SettingsSubPage { Settings, PerApp, Connections, Logs, Rules, Dns, Proxy }
+enum class SettingsSubPage { Settings, PerApp, Connections, Logs }
 
 /** Bottom-dock root tabs (phone layout). */
 /**
@@ -93,9 +91,6 @@ fun settingsSubPageTitle(page: SettingsSubPage): String = when (page) {
     SettingsSubPage.PerApp -> stringResource(R.string.settings_subpage_per_app)
     SettingsSubPage.Connections -> stringResource(R.string.settings_subpage_connections)
     SettingsSubPage.Logs -> stringResource(R.string.settings_subpage_logs)
-    SettingsSubPage.Rules -> stringResource(R.string.settings_subpage_rules)
-    SettingsSubPage.Dns -> stringResource(R.string.settings_subpage_dns)
-    SettingsSubPage.Proxy -> stringResource(R.string.settings_subpage_proxy)
 }
 
 private fun isIgnoringBatteryOptimizations(context: android.content.Context): Boolean =
@@ -212,29 +207,6 @@ fun SettingsPage(onOpen: (SettingsSubPage) -> Unit, onProxyChanged: () -> Unit =
                         stringResource(R.string.settings_per_app_blacklist_count, Settings.perAppProxyList.size)
                 },
                 onClick = { onOpen(SettingsSubPage.PerApp) },
-            )
-            PrefNavRow(
-                title = stringResource(R.string.settings_subpage_proxy),
-                desc = stringResource(R.string.settings_routing_desc),
-                value = when (Settings.outboundMode) {
-                    com.interstellar.proxy.data.config.ConfigBuilder.OutboundMode.GLOBAL ->
-                        stringResource(R.string.settings_mode_global)
-                    com.interstellar.proxy.data.config.ConfigBuilder.OutboundMode.DIRECT ->
-                        stringResource(R.string.rule_action_direct)
-                    else -> stringResource(R.string.settings_mode_rule)
-                },
-                onClick = { onOpen(SettingsSubPage.Proxy) },
-            )
-            val dnsTotal = DnsOverridesStore.entries.size
-            val dnsOn = DnsOverridesStore.entries.count { it.enabled }
-            PrefNavRow(
-                title = stringResource(R.string.settings_subpage_dns),
-                desc = stringResource(R.string.settings_dns_desc),
-                value = when {
-                    dnsTotal == 0 -> stringResource(R.string.settings_not_set)
-                    else -> stringResource(R.string.settings_enabled_count, dnsOn)
-                },
-                onClick = { onOpen(SettingsSubPage.Dns) },
             )
         }
 
@@ -714,200 +686,5 @@ private fun AccentDot(preset: Accents.Preset, selected: Boolean, modifier: Modif
                 maxLines = 1,
             )
         }
-    }
-}
-
-/**
- * 分流专用设置页: 路由模式 + 应用分流(白/黑名单) + 规则细则 + 规则入口。
- * 首页的状态行跳到这里做实际修改(首页只报状态)。
- */
-@Composable
-fun ProxySettingsPage(viewModel: com.interstellar.proxy.ui.AppViewModel, onOpen: (SettingsSubPage) -> Unit) {
-    val colors = LocalInterstellarColors.current
-    val routingMode by viewModel.routingMode.collectAsState()
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 16.dp),
-    ) {
-        Spacer(Modifier.height(10.dp))
-
-        // ---- 路由模式 ----
-        PrefSectionLabel(stringResource(R.string.settings_routing_mode))
-        GlassCard(modifier = Modifier.fillMaxWidth(), contentPadding = 6.dp) {
-            val modes = listOf(
-                "rule" to stringResource(R.string.settings_mode_rule),
-                "global" to stringResource(R.string.settings_mode_global),
-                "direct" to stringResource(R.string.rule_action_direct),
-            )
-            PrefSegRow(
-                title = stringResource(R.string.settings_mode_title),
-                desc = stringResource(R.string.settings_mode_desc),
-                items = modes.map { it.second },
-                selected = modes.indexOfFirst { it.first == routingMode }.coerceAtLeast(0),
-                layout = SegLayout.Below,
-                onSelect = { i -> viewModel.setClashMode(modes[i].first) },
-            )
-        }
-        IosSectionFooter(stringResource(R.string.settings_routing_mode_footer))
-
-        Spacer(Modifier.height(22.dp))
-
-        // These apply only in Rule mode (ConfigBuilder gates their route rules on
-        // OutboundMode.RULE). Outside it they are inert, so disable the control
-        // and say why — the saved value is left untouched and returns with Rule.
-        val ruleModeOn = routingMode == "rule"
-        val ruleOnlyHint = stringResource(R.string.settings_rule_mode_only)
-
-        // ---- 规则细则 ----
-        PrefSectionLabel(stringResource(R.string.settings_rule_details))
-        GlassCard(modifier = Modifier.fillMaxWidth(), contentPadding = 6.dp) {
-            var bypassLan by remember { mutableStateOf(Settings.bypassLanEnabled) }
-            var bypassCn by remember { mutableStateOf(Settings.bypassCnEnabled) }
-            var overseasProxy by remember { mutableStateOf(Settings.overseasProxyEnabled) }
-            var fallbackDirect by remember { mutableStateOf(Settings.fallbackDirectEnabled) }
-            var adBlock by remember { mutableStateOf(Settings.adBlockEnabled) }
-            var regionGroups by remember { mutableStateOf(Settings.regionGroupsEnabled) }
-            PrefToggleRow(
-                title = stringResource(R.string.settings_bypass_lan_title),
-                desc = stringResource(R.string.settings_bypass_lan_desc),
-                checked = bypassLan,
-                onChange = {
-                    bypassLan = it
-                    Settings.bypassLanEnabled = it
-                    viewModel.refreshProxyConfig()
-                },
-            )
-            PrefToggleRow(
-                title = stringResource(R.string.settings_bypass_cn_title),
-                desc = if (ruleModeOn) {
-                    stringResource(R.string.settings_bypass_cn_desc)
-                } else {
-                    stringResource(R.string.settings_bypass_cn_desc) + " · " + ruleOnlyHint
-                },
-                checked = bypassCn,
-                enabled = ruleModeOn,
-                onChange = {
-                    bypassCn = it
-                    Settings.bypassCnEnabled = it
-                    viewModel.refreshProxyConfig()
-                },
-            )
-            PrefToggleRow(
-                title = stringResource(R.string.settings_overseas_proxy_title),
-                desc = if (ruleModeOn) {
-                    stringResource(R.string.settings_overseas_proxy_desc)
-                } else {
-                    stringResource(R.string.settings_overseas_proxy_desc) + " · " + ruleOnlyHint
-                },
-                checked = overseasProxy,
-                enabled = ruleModeOn,
-                onChange = {
-                    overseasProxy = it
-                    Settings.overseasProxyEnabled = it
-                    viewModel.refreshProxyConfig()
-                },
-            )
-            PrefSegRow(
-                title = stringResource(R.string.settings_fallback_title),
-                desc = if (ruleModeOn) {
-                    stringResource(R.string.settings_fallback_desc)
-                } else {
-                    stringResource(R.string.settings_fallback_desc) + " · " + ruleOnlyHint
-                },
-                items = listOf(
-                    stringResource(R.string.rule_action_proxy),
-                    stringResource(R.string.rule_action_direct),
-                ),
-                selected = if (fallbackDirect) 1 else 0,
-                enabled = ruleModeOn,
-                onSelect = { i ->
-                    fallbackDirect = i == 1
-                    Settings.fallbackDirectEnabled = i == 1
-                    viewModel.refreshProxyConfig()
-                },
-            )
-            PrefToggleRow(
-                title = stringResource(R.string.settings_adblock_title),
-                desc = stringResource(R.string.settings_adblock_desc),
-                checked = adBlock,
-                onChange = {
-                    adBlock = it
-                    Settings.adBlockEnabled = it
-                    viewModel.refreshProxyConfig()
-                },
-            )
-            PrefToggleRow(
-                title = stringResource(R.string.settings_region_groups_title),
-                desc = stringResource(R.string.settings_region_groups_desc),
-                checked = regionGroups,
-                onChange = {
-                    regionGroups = it
-                    Settings.regionGroupsEnabled = it
-                    viewModel.refreshProxyConfig()
-                },
-            )
-        }
-        IosSectionFooter(stringResource(R.string.settings_whitelist_mode_footer))
-
-        Spacer(Modifier.height(22.dp))
-
-        // ---- 规则入口 ----
-        PrefSectionLabel(stringResource(R.string.settings_subpage_rules))
-        GlassCard(modifier = Modifier.fillMaxWidth(), contentPadding = 6.dp) {
-            val ruleOn = com.interstellar.proxy.data.SimpleRulesStore.rules.count { it.enabled }
-            PrefNavRow(
-                title = stringResource(R.string.settings_subpage_rules),
-                desc = stringResource(R.string.settings_custom_rules_desc),
-                value = if (ruleOn == 0) {
-                    stringResource(R.string.settings_not_set)
-                } else {
-                    stringResource(R.string.settings_enabled_count, ruleOn)
-                },
-                onClick = { onOpen(SettingsSubPage.Rules) },
-            )
-        }
-        IosSectionFooter(stringResource(R.string.settings_custom_rules_footer))
-
-        Spacer(Modifier.height(22.dp))
-
-        // ---- 规则文件 ----
-        PrefSectionLabel(stringResource(R.string.settings_rule_files))
-        GlassCard(modifier = Modifier.fillMaxWidth(), contentPadding = 6.dp) {
-            val updating by viewModel.ruleFilesUpdating.collectAsState()
-            PrefRowShell(
-                title = stringResource(R.string.settings_rule_files_update_title),
-                desc = stringResource(R.string.settings_rule_files_srs, "sing-box"),
-            ) {
-                if (updating) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(20.dp),
-                        strokeWidth = 2.dp,
-                        color = colors.primary,
-                    )
-                } else {
-                    CapsuleAction(text = stringResource(R.string.settings_rule_files_update), accent = colors.primary) { viewModel.updateRuleFiles() }
-                }
-            }
-        }
-        val updatedAt = Settings.ruleFilesUpdatedAt
-        IosSectionFooter(
-            stringResource(R.string.settings_rule_files_footer) +
-                if (updatedAt > 0) {
-                    stringResource(
-                        R.string.settings_rule_files_last_update,
-                        java.text.SimpleDateFormat(
-                            "yyyy-MM-dd HH:mm",
-                            java.util.Locale.getDefault(),
-                        ).format(java.util.Date(updatedAt)),
-                    )
-                } else {
-                    stringResource(R.string.settings_rule_files_never_updated)
-                },
-        )
-
-        Spacer(Modifier.height(24.dp))
     }
 }

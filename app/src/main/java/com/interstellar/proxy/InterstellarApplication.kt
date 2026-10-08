@@ -10,7 +10,6 @@ import android.os.PowerManager
 import androidx.core.content.getSystemService
 import io.nekohasekai.libbox.Libbox
 import io.nekohasekai.libbox.SetupOptions
-import com.interstellar.proxy.data.RulesStore
 import com.interstellar.proxy.ktx.wrapAppLocale
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
@@ -52,10 +51,8 @@ class InterstellarApplication : Application() {
             setupLibbox(baseDir, workingDir, tempDir)
         }
 
-        // warm the built-in rule sets copy in the background
         @OptIn(DelicateCoroutinesApi::class)
         GlobalScope.launch(Dispatchers.IO) {
-            runCatching { RulesStore.ensureRules(this@InterstellarApplication) }
             // regenerate the active config if missing (e.g. after a failed
             // generation in a previous run)
             if (com.interstellar.proxy.data.ConfigStore.readActiveConfig() == null) {

@@ -9,9 +9,9 @@ import org.junit.Test
  * A manual url-test must target the group the user is looking at.
  *
  * Regression: `urlTest(groupTag)` accepted a tag but always sent `auto` to the
- * kernel, so tapping 测速 on a 香港/美国/新加坡 tab silently tested a different
- * group. The main entry is a selector (mixed group+node members, which the
- * kernel's per-item pass skips), so it still falls back to `auto`.
+ * kernel, so tapping 测速 on an airport/raw group tab silently tested a different
+ * group. The generated config's single selector mixes group+node members, which
+ * the kernel's per-item pass skips, so a selector keeps falling back to `auto`.
  */
 class UrlTestTargetTest {
 
@@ -35,7 +35,8 @@ class UrlTestTargetTest {
     }
 
     @Test
-    fun `region tab tests that region group, not auto`() {
+    fun `any real urltest group is tested by its own tag, not auto`() {
+        // e.g. groups a raw config or an airport profile defines itself
         check(resolveUrlTestTarget("🇭🇰 香港", groups) == "🇭🇰 香港")
         check(resolveUrlTestTarget("🇺🇸 美国", groups) == "🇺🇸 美国")
     }

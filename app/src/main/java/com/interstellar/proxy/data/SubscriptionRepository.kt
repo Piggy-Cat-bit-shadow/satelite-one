@@ -187,14 +187,11 @@ object SubscriptionRepository {
      */
     @Synchronized
     fun regenerateActiveConfig(includeTun: Boolean = true): String? {
-        // built-in rule sets must exist on disk before local rule-set paths
-        // are embedded into the config
-        RulesStore.ensureRules(InterstellarApplication.application)
-
-        // raw-config path: the active subscription IS a full config for the
-        // running core — feed it through with compatibility shims + built-in
-        // rule injection instead of rewriting. Mix and custom rules do not
-        // apply here; format mismatch / missing file falls through to rewrite.
+        // raw-config path: the active subscription IS a full config for this
+        // core, so it is handed to libbox byte-for-byte. The app injects no
+        // rules, rewrites no DNS, rebuilds no outbounds and never touches
+        // route.final — the config decides the behaviour. Format mismatch or a
+        // missing file falls through to the minimal rewrite below.
         val activeSub = activeSubscription()
         if (Settings.useRawConfigEnabled && activeSub != null) {
             val rawApplied = applyRawConfigIfMatching(activeSub)
@@ -217,29 +214,12 @@ object SubscriptionRepository {
             return null
         }
 
-        var selectedTag = Settings.selectedOutboundTag.takeIf { it.isNotBlank() }
+        val selectedTag = Settings.selectedOutboundTag.takeIf { it.isNotBlank() }
             ?: ConfigBuilder.tagFor(nodes, selectedNodeId)
             ?: ConfigBuilder.AUTO_TAG
-        val regionGroups = Settings.regionGroupsEnabled
-        if (!regionGroups &&
-            selectedTag != ConfigBuilder.AUTO_TAG &&
-            ConfigBuilder.nodeFilterRulesActive(selectedTag, nodes, regionGroupsEnabled = true)
-        ) {
-            selectedTag = ConfigBuilder.AUTO_TAG
-            Settings.selectedOutboundTag = ConfigBuilder.AUTO_TAG
-        }
         val opts = ConfigBuilder.BuildOptions(
-            mode = Settings.outboundMode,
-            bypassLan = Settings.bypassLanEnabled,
-            bypassCn = Settings.bypassCnEnabled,
-            overseasProxy = Settings.overseasProxyEnabled,
-            fallbackDirect = Settings.fallbackDirectEnabled,
-            adBlock = Settings.adBlockEnabled,
             selectedNodeTag = selectedTag,
-            dnsOverrides = DnsOverridesStore.enabled(),
-            regionGroupsEnabled = regionGroups,
             includeTun = includeTun,
-            simpleRules = com.interstellar.proxy.data.SimpleRulesStore.enabled(),
         )
         val content = ConfigBuilder.build(nodes, opts)
         return try {
@@ -258,30 +238,28 @@ object SubscriptionRepository {
         regenerateActiveConfig()
     }
 
-    /** Raw path of [regenerateActiveConfig]; null = not applicable, use the rewrite. */
+    /**
+     * Raw path of [regenerateActiveConfig]; null = not applicable, use the rewrite.
+     *
+     * The subscription body is written out exactly as it was received: no
+     * injected outbounds, no rule sets, no DNS rewrite, no route.final override.
+     * The only thing the app does is ask libbox whether the config is valid.
+     */
     private fun applyRawConfigIfMatching(sub: Subscription): String? {
         val format = com.interstellar.proxy.data.subscription.RawConfigFormat.from(sub.configFormat)
-        // Only a sing-box subscription body can be handed to this core verbatim;
-        // Clash/Xray bodies were only ever pass-through for the removed sidecars.
+        // Only a sing-box body can be handed to this core verbatim; Clash/Xray
+        // bodies were only ever pass-through for the sidecars this client no
+        // longer ships.
         if (format != com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX) return null
         val raw = runCatching { rawFileOf(sub.id).takeIf { it.isFile }?.readText() }.getOrNull() ?: return null
-        val options = com.interstellar.proxy.data.config.RawConfigApplier.Options(
-            mode = Settings.outboundMode,
-            bypassLan = Settings.bypassLanEnabled,
-            bypassCn = Settings.bypassCnEnabled,
-            overseasProxy = Settings.overseasProxyEnabled,
-            fallbackDirect = Settings.fallbackDirectEnabled,
-            adBlock = Settings.adBlockEnabled,
-        )
-        val content = com.interstellar.proxy.data.config.RawConfigApplier.applySingbox(raw, options)
         return try {
-            Libbox.checkConfig(content)
-            ConfigStore.writeActiveConfig(content)
+            Libbox.checkConfig(raw)
+            ConfigStore.writeActiveConfig(raw)
             lastConfigError = null
-            content
+            raw
         } catch (e: Exception) {
             lastConfigError = str(com.interstellar.proxy.R.string.repo_raw_check_failed, e.message ?: "")
-            android.util.Log.e(TAG, "raw config check failed: ${e.message}\n$content", e)
+            android.util.Log.e(TAG, "raw config check failed: ${e.message}", e)
             null
         }
     }

@@ -149,17 +149,6 @@ object Settings {
             commit()
         }
 
-    /**
-     * When true, the config includes one urltest group per detected country
-     * (香港 / 新加坡 / …). Off by default: only 自动 and manual node pick.
-     */
-    var regionGroupsEnabled: Boolean
-        get() = properties.getProperty("regionGroupsEnabled", "false").toBoolean()
-        set(value) {
-            properties.setProperty("regionGroupsEnabled", value.toString())
-            commit()
-        }
-
     /** Last selected outbound tag of the main selector (`auto`, a group, or a node). */
     var selectedOutboundTag: String
         get() = properties.getProperty("selectedOutboundTag", "")
@@ -174,24 +163,6 @@ object Settings {
         get() = properties.getProperty("nodesGridView", "true").toBoolean()
         set(value) {
             properties.setProperty("nodesGridView", value.toString())
-            commit()
-        }
-
-    var outboundMode: com.interstellar.proxy.data.config.ConfigBuilder.OutboundMode
-        get() = when (properties.getProperty("outboundMode", "rule")) {
-            "global" -> com.interstellar.proxy.data.config.ConfigBuilder.OutboundMode.GLOBAL
-            "direct" -> com.interstellar.proxy.data.config.ConfigBuilder.OutboundMode.DIRECT
-            else -> com.interstellar.proxy.data.config.ConfigBuilder.OutboundMode.RULE
-        }
-        set(value) {
-            properties.setProperty(
-                "outboundMode",
-                when (value) {
-                    com.interstellar.proxy.data.config.ConfigBuilder.OutboundMode.GLOBAL -> "global"
-                    com.interstellar.proxy.data.config.ConfigBuilder.OutboundMode.DIRECT -> "direct"
-                    com.interstellar.proxy.data.config.ConfigBuilder.OutboundMode.RULE -> "rule"
-                },
-            )
             commit()
         }
 
@@ -231,54 +202,6 @@ object Settings {
         get() = properties.getProperty("tileActive", "false").toBoolean()
         set(value) {
             properties.setProperty("tileActive", value.toString())
-            commit()
-        }
-
-    /** Route RFC1918 / ULA / link-local directly (and exclude them from TUN). */
-    var bypassLanEnabled: Boolean
-        get() = properties.getProperty("bypassLanEnabled", "true").toBoolean()
-        set(value) {
-            properties.setProperty("bypassLanEnabled", value.toString())
-            commit()
-        }
-
-    /** Route CN domains/IPs direct (built-in geo rule sets). */
-    var bypassCnEnabled: Boolean
-        get() = properties.getProperty("bypassCnEnabled", "true").toBoolean()
-        set(value) {
-            properties.setProperty("bypassCnEnabled", value.toString())
-            commit()
-        }
-
-    /** Route geolocation-!cn (overseas) domains through the proxy (rule mode). */
-    var overseasProxyEnabled: Boolean
-        get() = properties.getProperty("overseasProxyEnabled", "false").toBoolean()
-        set(value) {
-            properties.setProperty("overseasProxyEnabled", value.toString())
-            commit()
-        }
-
-    /** Rule-mode fallback for traffic no rule matched: true = direct, false = proxy. */
-    var fallbackDirectEnabled: Boolean
-        get() = properties.getProperty("fallbackDirectEnabled", "false").toBoolean()
-        set(value) {
-            properties.setProperty("fallbackDirectEnabled", value.toString())
-            commit()
-        }
-
-    /** Epoch millis of the last successful rule/geodata file update (0 = never). */
-    var ruleFilesUpdatedAt: Long
-        get() = properties.getProperty("ruleFilesUpdatedAt", "0")?.toLongOrNull() ?: 0L
-        set(value) {
-            properties.setProperty("ruleFilesUpdatedAt", value.toString())
-            commit()
-        }
-
-    /** Block ad/tracker domains (built-in category-ads-all rule set). */
-    var adBlockEnabled: Boolean
-        get() = properties.getProperty("adBlockEnabled", "true").toBoolean()
-        set(value) {
-            properties.setProperty("adBlockEnabled", value.toString())
             commit()
         }
 

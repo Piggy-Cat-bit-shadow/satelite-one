@@ -61,7 +61,6 @@ import com.interstellar.proxy.data.SubscriptionRepository
 import com.interstellar.proxy.data.config.ConfigBuilder
 import com.interstellar.proxy.ui.AppViewModel
 import com.interstellar.proxy.ui.ConnectionsViewModel
-import com.interstellar.proxy.ui.ProbeState
 import com.interstellar.proxy.ui.components.FaceMark
 import com.interstellar.proxy.ui.components.GlassButton
 import com.interstellar.proxy.ui.components.GlassButtonStyle
@@ -70,7 +69,6 @@ import com.interstellar.proxy.ui.components.OrbitHero
 import com.interstellar.proxy.ui.components.StatusPill
 import com.interstellar.proxy.ui.components.glassSurface
 import com.interstellar.proxy.ui.components.pressableClick
-import com.interstellar.proxy.ui.localizedCountryName
 import com.interstellar.proxy.ui.theme.LocalInterstellarColors
 import com.interstellar.proxy.ui.theme.Motion
 import io.nekohasekai.libbox.Libbox
@@ -105,9 +103,7 @@ fun DashboardPage(
     val connectedAt by viewModel.connectedAt.collectAsState()
     val connections by connectionsViewModel.connections.collectAsState()
     val history by viewModel.history.collectAsState()
-    val routingMode by viewModel.routingMode.collectAsState()
     val proxyScope by viewModel.proxyScope.collectAsState()
-    val probe by viewModel.probe.collectAsState()
     val running = status == Status.Started
     val activeConnectionCount = connections.count { !it.closed }
     // raw configs may not name any group "proxy" — fall back to the first selector
@@ -282,12 +278,7 @@ fun DashboardPage(
 
             Spacer(Modifier.height(12.dp))
 
-            // ── 状态标签: 居中三胶囊, 点击进入对应设置 ──
-            val routingLabel = when (routingMode) {
-                "global" -> stringResource(R.string.dash_route_global)
-                "direct" -> stringResource(R.string.dash_route_direct)
-                else -> stringResource(R.string.dash_route_rule)
-            }
+            // ── 状态标签: 居中胶囊, 点击进入对应设置 ──
             val scopeOn = proxyScope.on
             val switchModeLabel = when (storedSelected) {
                 ConfigBuilder.AUTO_TAG -> stringResource(R.string.dash_mode_auto)
@@ -298,10 +289,6 @@ fun DashboardPage(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                StatusChip(label = stringResource(R.string.dash_label_route), value = routingLabel) {
-                    onOpenSubPage(SettingsSubPage.Proxy)
-                }
-                Spacer(Modifier.width(10.dp))
                 StatusChip(label = stringResource(R.string.dash_label_scope), value = if (scopeOn) stringResource(R.string.dash_scope_on) else stringResource(R.string.dash_scope_off)) {
                     onOpenSubPage(SettingsSubPage.PerApp)
                 }
@@ -409,60 +396,6 @@ fun DashboardPage(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                InstrumentCard(
-                    caption = stringResource(R.string.dash_caption_probe),
-                    onClick = { viewModel.probeNetwork() },
-                    modifier = Modifier.weight(1f),
-                    secondary = {
-                        val sp = probe
-                        if (sp is ProbeState.Done) {
-                            Text(
-                                listOfNotNull(
-                                    localizedCountryName(sp.result.country),
-                                    stringResource(R.string.dash_delay_ms, sp.result.latencyMs),
-                                    if (sp.result.viaProxy) stringResource(R.string.dash_probe_via_proxy) else stringResource(R.string.dash_probe_direct),
-                                ).joinToString(" · "),
-                                color = colors.textTertiary,
-                                fontSize = 11.sp,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                    },
-                ) {
-                    when (val p = probe) {
-                        ProbeState.Running -> Text(
-                            stringResource(R.string.dash_probing),
-                            color = colors.textTertiary,
-                            fontSize = 15.sp,
-                            fontFamily = FontFamily.Monospace,
-                        )
-
-                        is ProbeState.Done -> Text(
-                            p.result.ip,
-                            color = colors.text,
-                            fontSize = 15.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            fontFamily = FontFamily.Monospace,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-
-                        is ProbeState.Failed -> Text(
-                            stringResource(R.string.dash_probe_failed),
-                            color = colors.warning,
-                            fontSize = 12.sp,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-
-                        ProbeState.Idle -> Text(
-                            stringResource(R.string.dash_probe_idle),
-                            color = colors.textTertiary,
-                            fontSize = 13.sp,
-                        )
-                    }
-                }
                 val activeSub = subscriptions.find { it.id == activeSubscriptionId }
                 val quotaSubs = if (mixEnabled) {
                     subscriptions.filter { it.id in mixSubscriptionIds }

@@ -253,9 +253,6 @@ fun AppRoot(
                                 SettingsSubPage.PerApp -> PerAppProxyPage(onBack = { pop() })
                                 SettingsSubPage.Connections -> ConnectionsPage(connectionsViewModel, appViewModel)
                                 SettingsSubPage.Logs -> LogsPage(logsViewModel)
-                                SettingsSubPage.Proxy -> com.interstellar.proxy.ui.pages.ProxySettingsPage(appViewModel) { sub -> push(sub) }
-                                SettingsSubPage.Rules -> com.interstellar.proxy.ui.pages.CustomRulesPage(appViewModel)
-                                SettingsSubPage.Dns -> com.interstellar.proxy.ui.pages.DnsOverridesPage(appViewModel)
                             }
                         }
                     } else {
