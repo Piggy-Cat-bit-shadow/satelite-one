@@ -94,7 +94,6 @@
     <string name="vm_config_update_failed">配置更新失败</string>
     <string name="vm_rule_update_failed">规则文件更新失败:%1$s</string>
     <string name="vm_switch_failed_api">切换失败: 内核 API 不可达</string>
-    <string name="vm_xray_restarted">已重启 Xray 生效</string>
     <string name="vm_switch_failed">切换失败: %1$s</string>
     <string name="vm_test_failed_api">测速失败: 内核 API 不可达</string>
     <string name="vm_test_failed_send">测速失败: 命令发送失败</string>
@@ -365,6 +364,9 @@
     <string name="settings_battery_exempted">已豁免</string>
     <string name="settings_version_title">版本</string>
     <string name="settings_core_title">内核</string>
+    <string name="settings_core_source_title">内核来源</string>
+    <string name="settings_core_revision_title">内核版本</string>
+    <string name="settings_build_date_title">构建时间</string>
     <string name="settings_check_update_title">检查更新</string>
     <string name="settings_check_update_available">发现新版本 v%1$s,点击前往 GitHub 下载</string>
     <string name="settings_check_update_uptodate">当前已是最新版本 (v%1$s)</string>
@@ -395,8 +397,6 @@
     <string name="settings_custom_rules_footer">手动规则优先级最高,先于大陆绕过等内置规则匹配。</string>
     <string name="settings_rule_files">规则文件</string>
     <string name="settings_rule_files_update_title">更新规则文件</string>
-    <string name="settings_rule_files_geo_mihomo">GEO 数据库 geosite + geoip(%1$s,约 12 MB)</string>
-    <string name="settings_rule_files_geo_xray">GEO 数据库 geosite + geoip(%1$s,约 25 MB)</string>
     <string name="settings_rule_files_srs">内置规则集 srs(%1$s,约 2 MB)</string>
     <string name="settings_rule_files_update">更新</string>
     <string name="settings_rule_files_footer">从 GitHub 下载最新规则,内核运行时经当前节点下载。</string>
@@ -479,6 +479,4 @@
     <string name="nodes_detail_no_credentials">此协议无凭据字段</string>
     <string name="nodes_delay_untested">未测</string>
     <string name="nodes_delay_ms_badge_fmt">%1$dms</string>
-    <string name="xray_skipped_nodes">已跳过 %1$d 个 Xray 不支持的节点(tuic/anytls/ssh/shadow-tls/quic)</string>
-    <string name="xray_no_supported_nodes">订阅中没有 Xray 支持的节点 (支持 ss/vmess/vless/trojan/socks/http/wireguard/hysteria2)</string>
 </resources>

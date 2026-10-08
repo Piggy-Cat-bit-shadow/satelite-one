@@ -42,21 +42,6 @@ object Settings {
         }
     }
 
-    var serviceMode: String
-        get() = properties.getProperty("serviceMode", "vpn")
-        set(value) {
-            properties.setProperty("serviceMode", value)
-            commit()
-        }
-
-    /** Active proxy core. sing-box in-process; mihomo/Xray sidecars (multi-core). */
-    var coreKind: com.interstellar.proxy.core.CoreKind
-        get() = com.interstellar.proxy.core.CoreKind.from(properties.getProperty("coreKind", "singbox"))
-        set(value) {
-            properties.setProperty("coreKind", value.wire)
-            commit()
-        }
-
     var allowBypass: Boolean
         get() = properties.getProperty("allowBypass", "false").toBoolean()
         set(value) {
@@ -232,13 +217,6 @@ object Settings {
             commit()
         }
 
-    var apiSecret: String
-        get() = properties.getProperty("apiSecret", "")
-        set(value) {
-            properties.setProperty("apiSecret", value)
-            commit()
-        }
-
     var themeMode: String
         get() = properties.getProperty("themeMode", "light")
         set(value) {
@@ -355,12 +333,6 @@ object Settings {
         set(value) {
             properties.setProperty("lastImportPromptClip", value)
             commit()
-        }
-
-    fun serviceClass(): Class<*> =
-        when (serviceMode) {
-            "proxy" -> com.interstellar.proxy.bg.ProxyService::class.java
-            else -> com.interstellar.proxy.bg.VPNService::class.java
         }
 
 }

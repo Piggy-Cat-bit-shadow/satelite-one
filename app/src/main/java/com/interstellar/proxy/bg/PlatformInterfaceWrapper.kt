@@ -192,6 +192,20 @@ interface PlatformInterfaceWrapper : PlatformInterface {
 
     override fun usePlatformBridge(): Boolean = false
 
+    /**
+     * Android has no auto-redirect path: the core's auto-redirect needs
+     * nftables/TPROXY privileges that a VpnService app does not have. The
+     * fork's own platformInterfaceStub answers exactly this way, so sing-box
+     * falls back to its internal implementation and tun auto_route keeps
+     * working through the fd we hand it in openTun().
+     */
+    override fun usePlatformAutoRedirect(): Boolean = false
+
+    override fun createAutoRedirect(
+        options: ByteArray?,
+        handler: io.nekohasekai.libbox.AutoRedirectHandler?,
+    ): io.nekohasekai.libbox.AutoRedirectSession = error("not supported")
+
     override fun lookupUser(username: String?): PlatformUser = error("not supported")
 
     override fun registerMyInterface(name: String?) {

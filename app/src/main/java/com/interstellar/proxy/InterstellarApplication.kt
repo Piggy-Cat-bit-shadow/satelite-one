@@ -29,10 +29,6 @@ class InterstellarApplication : Application() {
     override fun onCreate() {
         super.onCreate()
 
-        // hev JNI bridge must register on a thread WITH a classloader (main);
-        // a first touch from a coroutine IO thread aborts the whole VM
-        runCatching { com.interstellar.proxy.core.TProxyService.preload() }
-
         // pinned language also drives JVM-default formatting / libbox messages
         val pinnedTag = com.interstellar.proxy.data.Settings.appLanguage
             .takeIf { it != com.interstellar.proxy.ktx.AppLanguage.SYSTEM }

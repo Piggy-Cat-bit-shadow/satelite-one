@@ -47,7 +47,7 @@ class BoxService(private val service: Service, private val platformInterface: Pl
         private const val TAG = "BoxService"
 
         fun start() {
-            start(Settings.serviceClass())
+            start(VPNService::class.java)
         }
 
         /** Core without VPN — used to url-test while the UI stays 未连接. */
@@ -118,8 +118,8 @@ class BoxService(private val service: Service, private val platformInterface: Pl
         )
 
     private suspend fun startCore() {
-        com.interstellar.proxy.core.AppLog.log("service", "启动内核 ${Settings.coreKind.displayName}")
-        core = CoreEngines.create(Settings.coreKind, platformInterface, this).also { it.startup() }
+        com.interstellar.proxy.core.AppLog.log("service", "启动内核 sing-box")
+        core = CoreEngines.create(platformInterface, this).also { it.startup() }
     }
 
     private suspend fun startService() {
@@ -199,9 +199,6 @@ class BoxService(private val service: Service, private val platformInterface: Pl
     override fun onSetSystemProxy(enabled: Boolean) {
         serviceReload()
     }
-
-    override fun openSidecarTun(spec: com.interstellar.proxy.core.SidecarTunSpec): Int? =
-        (service as? VPNService)?.establishSidecarTun(spec)
 
     override fun onCoreTraffic(upPerSecond: Long, downPerSecond: Long) {
         notification.updateTraffic(upPerSecond, downPerSecond)

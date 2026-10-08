@@ -2,7 +2,6 @@ package com.interstellar.proxy.data.net
 
 import android.util.Log
 import com.interstellar.proxy.InterstellarApplication
-import com.interstellar.proxy.core.CoreKind
 import com.interstellar.proxy.data.RulesStore
 import com.interstellar.proxy.data.Settings
 import kotlinx.coroutines.Dispatchers
@@ -58,65 +57,29 @@ object GeoRuleUpdater {
         .proxy(Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", MIXED_PORT)))
         .build()
 
-    /** Same liveness split as SubscriptionFetcher. */
-    private fun coreRunning(): Boolean = when (Settings.coreKind) {
-        CoreKind.SINGBOX ->
-            File(InterstellarApplication.application.filesDir, "command.sock").exists()
+    /** The sing-box command socket exists exactly while the core runs. */
+    private fun coreRunning(): Boolean =
+        File(InterstellarApplication.application.filesDir, "command.sock").exists()
 
-        CoreKind.MIHOMO -> com.interstellar.proxy.core.MihomoCore.Holder.instance != null
-        CoreKind.XRAY -> com.interstellar.proxy.core.XrayCore.Holder.instance != null
-    }
-
-    /** The rule files the given core loads, with their download sources. */
-    private fun filesFor(core: CoreKind): List<GeoFile> {
-        val filesDir = InterstellarApplication.application.filesDir
-        return when (core) {
-            CoreKind.SINGBOX -> listOf(
-                srsFile(
-                    RulesStore.geolocationNotCn,
-                    "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs",
-                ),
-                srsFile(
-                    RulesStore.geositeCn,
-                    "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
-                ),
-                srsFile(
-                    RulesStore.geoipCn,
-                    "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
-                ),
-                srsFile(
-                    RulesStore.adsAll,
-                    "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/category-ads-all.srs",
-                ),
-            )
-
-            CoreKind.MIHOMO -> listOf(
-                geoFile(
-                    "geosite.dat",
-                    File(filesDir, "mihomo/geosite.dat"),
-                    "https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geosite.dat",
-                ),
-                geoFile(
-                    "geoip.metadb",
-                    File(filesDir, "mihomo/geoip.metadb"),
-                    "https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geoip.metadb",
-                ),
-            )
-
-            CoreKind.XRAY -> listOf(
-                geoFile(
-                    "geosite.dat",
-                    File(filesDir, "xray/geosite.dat"),
-                    "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat",
-                ),
-                geoFile(
-                    "geoip.dat",
-                    File(filesDir, "xray/geoip.dat"),
-                    "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat",
-                ),
-            )
-        }
-    }
+    /** The sing-box binary rule sets this client ships, with their sources. */
+    private fun filesFor(): List<GeoFile> = listOf(
+        srsFile(
+            RulesStore.geolocationNotCn,
+            "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs",
+        ),
+        srsFile(
+            RulesStore.geositeCn,
+            "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
+        ),
+        srsFile(
+            RulesStore.geoipCn,
+            "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
+        ),
+        srsFile(
+            RulesStore.adsAll,
+            "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/category-ads-all.srs",
+        ),
+    )
 
     /** srs with a jsdelivr mirror (both repos expose a rule-set branch). */
     private fun srsFile(asset: RulesStore.RuleAsset, url: String): GeoFile = GeoFile(
@@ -127,16 +90,10 @@ object GeoRuleUpdater {
         validate = ::srsValid,
     )
 
-    private fun geoFile(name: String, target: File, url: String): GeoFile =
-        GeoFile(name, listOf(url), target, ::geoValid)
-
     // ---- validation ----
 
     /** Valid srs starts with "SRS\x01" + zlib stream (same sanity as RulesStore). */
     private fun srsValid(f: File): Boolean = f.length() > 8 && startsWith(f, "SRS")
-
-    /** Real .dat/.metadb are multi-MB protobufs; a captive-portal/error page is small or HTML. */
-    private fun geoValid(f: File): Boolean = f.length() > 1_000_000 && !startsWith(f, "<")
 
     private fun startsWith(f: File, prefix: String): Boolean = runCatching {
         f.inputStream().use { input ->
@@ -154,14 +111,14 @@ object GeoRuleUpdater {
     // ---- update ----
 
     /**
-     * Downloads every rule file of [core]. Returns a user-facing summary;
-     * throws when nothing could be updated.
+     * Downloads every rule file. Returns a user-facing summary; throws when
+     * nothing could be updated.
      */
-    suspend fun update(core: CoreKind): String = withContext(Dispatchers.IO) {
+    suspend fun update(): String = withContext(Dispatchers.IO) {
         val throughProxy = coreRunning()
         var ok = 0
         val failed = mutableListOf<String>()
-        for (file in filesFor(core)) {
+        for (file in filesFor()) {
             val attempt = runCatching { download(file, throughProxy) }
             if (attempt.isSuccess) {
                 ok++
@@ -174,12 +131,6 @@ object GeoRuleUpdater {
             error(str(com.interstellar.proxy.R.string.geo_download_failed, failed.joinToString("、")))
         }
         Settings.ruleFilesUpdatedAt = System.currentTimeMillis()
-        // keep the sidecar extraction markers truthful so a later startup's
-        // ensureGeodata() never re-overwrites the fresh files with bundled ones
-        if (core == CoreKind.MIHOMO || core == CoreKind.XRAY) {
-            val dir = if (core == CoreKind.MIHOMO) "mihomo" else "xray"
-            File(File(InterstellarApplication.application.filesDir, dir), "geodata.extracted").writeText("1")
-        }
         if (failed.isEmpty()) {
             str(com.interstellar.proxy.R.string.geo_updated_all, ok)
         } else {

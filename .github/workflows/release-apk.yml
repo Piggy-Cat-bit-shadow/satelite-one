@@ -1,8 +1,11 @@
 # 推送 v* tag 自动编译 release APK 并发布到 GitHub Release
 # 发版: 改 version.properties → 提交 → git tag v<versionName> && git push origin v<versionName>
 #
-# 流程: 构建 sing-box 内核 libbox.aar(app/libs 被 gitignore, CI 从源码重建, 按 tag 缓存)
-#       → 注入签名(可选 secrets) → assembleRelease(按 ABI 分包) → 上传 Release
+# 流程: 从 Piggy-Cat-bit-shadow/sing-box 构建唯一内核 libbox.aar
+#       (app/libs 被 gitignore, CI 从源码重建) → 注入签名(可选 secrets)
+#       → assembleRelease(按 ABI 分包) → 校验和 → 上传 Release
+#
+# 这里没有任何 mihomo / Xray / hev 的下载或编译步骤 —— 本客户端只有一个内核。
 
 name: Release APK
 
@@ -10,14 +13,17 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 env:
-  SINGBOX_TAG: v1.14.0-beta.17
-  GOMOBILE_VERSION: v0.1.12
+  CORE_REPO: Piggy-Cat-bit-shadow/sing-box
+  CORE_BRANCH: testing
   NDK_VERSION: 28.0.13004108
+  GOMOBILE_VERSION: v0.1.12
+  GO_VERSION: '1.25.5'
 
 jobs:
   build:
@@ -39,56 +45,69 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26.6'
+          go-version: ${{ env.GO_VERSION }}
           cache: false
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Cache libbox.aar (sing-box core)
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK ${{ env.NDK_VERSION }}
+        run: |
+          yes | sdkmanager --install "ndk;${NDK_VERSION}" > /dev/null
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Resolve core revision
+        id: core
+        run: |
+          git ls-remote "https://github.com/${CORE_REPO}.git" "refs/heads/${CORE_BRANCH}" \
+            | awk '{print "sha="$1}' >> "$GITHUB_OUTPUT"
+
+      - name: Cache libbox.aar
         id: libbox
         uses: actions/cache@v4
         with:
           path: app/libs/libbox.aar
-          key: libbox-${{ env.SINGBOX_TAG }}
+          key: libbox-${{ env.CORE_REPO }}-${{ env.CORE_BRANCH }}-${{ steps.core.outputs.sha }}
 
-      # app/libs/ 只含 gitignored 的 libbox.aar, checkout 不会创建该目录
+      # app/libs 只含 gitignored 的 libbox.aar, checkout 不会创建该目录
       - name: Ensure app/libs exists
         run: mkdir -p app/libs
 
-      - name: Cache sidecar cores (mihomo cmfa + hev)
-        uses: actions/cache@v4
-        with:
-          path: app/src/main/jniLibs
-          key: sidecar-v2-mihomo-v1.19.30-cmfa-hev-2.17.1-xray-v26.3.27
-
-      # mihomo 官方 android 二进制的 TUN 会读 packages.xml(root-only) fatal,
-      # 必须 cmfa 标签自编译; hev 为 TUN→socks5 JNI 桥(ndk-build)
-      - name: Build sidecar cores
-        run: python tools/fetch_cores.py
-
-      # sing-box v1.14 起移除了 `make lib_android`, 改用 cmd/internal/build_libbox。
-      # 该工具(build_shared/sdk.go)固定使用 NDK 28.0.13004108、强制 openjdk 17,
-      # 产出 libbox.aar + libbox-legacy.aar(io.nekohasekai.libbox), 只需拷贝前者。
-      - name: Build sing-box core (libbox.aar)
+      - name: Build libbox.aar from ${{ env.CORE_REPO }}@${{ env.CORE_BRANCH }}
         if: steps.libbox.outputs.cache-hit != 'true'
         run: |
-          # runner 镜像未把 sdkmanager 加进 PATH, 从 cmdline-tools 目录解析
-          SDKMANAGER="$(ls -d "${ANDROID_HOME}"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort | tail -1)"
-          if [ -z "$SDKMANAGER" ]; then
-            echo "::error::sdkmanager not found under \$ANDROID_HOME/cmdline-tools"
-            exit 1
-          fi
-          yes | "$SDKMANAGER" --install \
-            "ndk;${NDK_VERSION}" \
-            "platforms;android-24" \
-            "platforms;android-21" > /dev/null
-          git clone --depth 1 --branch "${SINGBOX_TAG}" https://github.com/SagerNet/sing-box /tmp/sing-box
+          set -euo pipefail
+          git clone --depth 1 --branch "${CORE_BRANCH}" \
+            "https://github.com/${CORE_REPO}.git" /tmp/sing-box
           cd /tmp/sing-box
-          go install github.com/sagernet/gomobile/cmd/gomobile@${GOMOBILE_VERSION}
-          go install github.com/sagernet/gomobile/cmd/gobind@${GOMOBILE_VERSION}
-          go run ./cmd/internal/build_libbox
+          go install "github.com/sagernet/gomobile/cmd/gomobile@${GOMOBILE_VERSION}"
+          go install "github.com/sagernet/gomobile/cmd/gobind@${GOMOBILE_VERSION}"
+          # shallow clone cannot describe a tag -> let the builder take the version
+          SING_BOX_BUILD_VERSION="$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)" \
+            go run ./cmd/internal/build_libbox -target android
           cp libbox.aar "${GITHUB_WORKSPACE}/app/libs/libbox.aar"
+
+      - name: Export core build metadata
+        run: |
+          set -euo pipefail
+          CORE_DIR=/tmp/sing-box
+          if [ -d "$CORE_DIR/.git" ]; then
+            echo "CORE_COMMIT=$(git -C "$CORE_DIR" rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+            echo "CORE_COMMIT_FULL=$(git -C "$CORE_DIR" rev-parse HEAD)" >> "$GITHUB_ENV"
+            echo "CORE_COMMIT_DATE=$(git -C "$CORE_DIR" log -1 --format=%cI)" >> "$GITHUB_ENV"
+            echo "CORE_DESCRIBE=$(git -C "$CORE_DIR" describe --tags --always)" >> "$GITHUB_ENV"
+          else
+            echo "CORE_COMMIT=${{ steps.core.outputs.sha }}" >> "$GITHUB_ENV"
+          fi
+          echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      # Unit tests run on the debug variant: AGP only creates testDebugUnitTest
+      # for this project's configuration.
+      - name: Unit tests
+        run: ./gradlew :app:testDebugUnitTest --no-daemon --console=plain
 
       # 签名材料不入库。配置以下 repo secrets 后, CI 产物与本地正式签名一致:
       #   INTERSTELLAR_KEYSTORE_B64     base64(interstellar.jks)
@@ -116,6 +135,7 @@ jobs:
           } > signing.properties
 
       - name: Verify tag matches version.properties
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           VERSION=$(grep '^versionName=' version.properties | cut -d= -f2 | tr -d ' \r')
           TAG="${GITHUB_REF_NAME#v}"
@@ -127,27 +147,41 @@ jobs:
       - name: Build release APK
         run: |
           chmod +x gradlew
-          ./gradlew :app:assembleRelease --no-daemon
+          ./gradlew :app:assembleRelease --no-daemon --console=plain
 
       # satelite-one-<abi>-release.apk → satelite-one-<abi>-<tag>.apk
       - name: Rename APKs with tag
         run: |
+          set -euo pipefail
+          SUFFIX="${GITHUB_REF_NAME:-$(grep '^versionName=' version.properties | cut -d= -f2 | tr -d ' \r')}"
           cd app/build/outputs/apk/release
           for f in satelite-one-*-release.apk; do
-            mv "$f" "${f%-release.apk}-${GITHUB_REF_NAME}.apk"
+            mv "$f" "${f%-release.apk}-${SUFFIX}.apk"
           done
+          ls -la
+
+      - name: Generate checksums
+        run: |
+          cd app/build/outputs/apk/release
+          sha256sum ./*.apk > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
           name: satelite-one-${{ github.ref_name }}
-          path: app/build/outputs/apk/release/*.apk
+          path: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/release/SHA256SUMS.txt
+          if-no-files-found: error
 
       # 更新摘要 = "版本提交"(范围内最后改 version.properties 的那个)的完整
       # message(标题+正文), 再附自上一 tag 以来的其余提交。按 version.properties
       # 定位而不是 tag 落点 —— tag 可能落在版本提交之后的杂项提交上(如 v0.5.3)。
       - name: Generate release notes
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
+          set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           PREV_TAG=$(git tag --list 'v*' --sort=-v:refname | grep -vx "$TAG" | head -n1 || true)
           RANGE="${PREV_TAG:+${PREV_TAG}..}${TAG}"
@@ -155,6 +189,12 @@ jobs:
           [ -n "$SUMMARY_COMMIT" ] || SUMMARY_COMMIT="$TAG"
           EXCL=$(git rev-parse --short "$SUMMARY_COMMIT")
           {
+            echo "## 内核"
+            echo
+            echo "- ${CORE_REPO} @ ${CORE_BRANCH}"
+            echo "- commit: \`${CORE_COMMIT:-unknown}\`"
+            echo "- build: ${BUILD_DATE:-unknown}"
+            echo
             echo "## 更新摘要"
             echo
             git log -1 --format='%B' "$SUMMARY_COMMIT"
@@ -170,8 +210,11 @@ jobs:
           cat release_notes.md
 
       - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: app/build/outputs/apk/release/*.apk
+          files: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/release/SHA256SUMS.txt
           body_path: release_notes.md
           fail_on_unmatched_files: true

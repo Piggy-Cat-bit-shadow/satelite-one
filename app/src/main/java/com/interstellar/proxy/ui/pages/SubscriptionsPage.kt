@@ -381,19 +381,11 @@ private fun SubscriptionCard(
             val format = com.interstellar.proxy.data.subscription.RawConfigFormat.from(sub.configFormat)
             if (format != null) {
                 Spacer(Modifier.width(8.dp))
-                // raw only takes effect when the format matches the running
-                // core and the retained body is still on disk — show the truth
+                // raw only takes effect when the body is a sing-box config and
+                // it is still on disk — show the truth
                 val rawOn = Settings.useRawConfigEnabled
-                val coreKind = Settings.coreKind
-                val matchesCore = when (format) {
-                    com.interstellar.proxy.data.subscription.RawConfigFormat.CLASH ->
-                        coreKind == com.interstellar.proxy.core.CoreKind.MIHOMO
-                    com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX ->
-                        coreKind == com.interstellar.proxy.core.CoreKind.SINGBOX
-                    com.interstellar.proxy.data.subscription.RawConfigFormat.XRAY ->
-                        coreKind == com.interstellar.proxy.core.CoreKind.XRAY
-                }
-                val effective = rawOn && matchesCore &&
+                val effective = rawOn &&
+                    format == com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX &&
                     SubscriptionRepository.rawFileOf(sub.id).isFile
                 FormatBadge(
                     label = format.label,

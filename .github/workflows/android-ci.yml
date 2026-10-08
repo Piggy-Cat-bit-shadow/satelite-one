@@ -1,0 +1,127 @@
+# 开发 CI：从 Piggy-Cat-bit-shadow/sing-box 构建 libbox.aar，再编译 debug APK 并跑单元测试。
+#
+# 这个客户端只服务一个内核，所以 CI 只有一个内核构建步骤 —— 没有任何
+# mihomo / Xray / hev 的 sidecar 构建、下载或缓存。
+name: Android CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # 唯一内核：默认分支 testing
+  CORE_REPO: Piggy-Cat-bit-shadow/sing-box
+  CORE_BRANCH: testing
+  # sing-box 的 cmd/internal/build_shared/sdk.go 固定使用这个 NDK，并在
+  # checkJavaVersion() 里硬性要求 openjdk 17。
+  NDK_VERSION: 28.0.13004108
+  GOMOBILE_VERSION: v0.1.12
+  # build_libbox 需要 go.mod 的 go 指令版本 (当前 1.25.5)
+  GO_VERSION: '1.25.5'
+
+jobs:
+  build:
+    name: Build debug APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout app
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK ${{ env.NDK_VERSION }}
+        run: |
+          yes | sdkmanager --install "ndk;${NDK_VERSION}" > /dev/null
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      # 单个内核的 cache key 就是它的 commit —— 内核一变就重建。
+      - name: Resolve core revision
+        id: core
+        run: |
+          git ls-remote "https://github.com/${CORE_REPO}.git" "refs/heads/${CORE_BRANCH}" \
+            | awk '{print "sha="$1}' >> "$GITHUB_OUTPUT"
+
+      - name: Cache libbox.aar
+        id: libbox
+        uses: actions/cache@v4
+        with:
+          path: app/libs/libbox.aar
+          key: libbox-${{ env.CORE_REPO }}-${{ env.CORE_BRANCH }}-${{ steps.core.outputs.sha }}
+
+      # app/libs 只含 gitignore 的 libbox.aar，checkout 不会创建该目录
+      - name: Ensure app/libs exists
+        run: mkdir -p app/libs
+
+      # sing-box v1.14 起移除了 `make lib_android`，改用 cmd/internal/build_libbox，
+      # 产出 libbox.aar + libbox-legacy.aar(API 21)，本 app minSdk 24 只需前者。
+      - name: Build libbox.aar from ${{ env.CORE_REPO }}@${{ env.CORE_BRANCH }}
+        if: steps.libbox.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${CORE_BRANCH}" \
+            "https://github.com/${CORE_REPO}.git" /tmp/sing-box
+          cd /tmp/sing-box
+          go install "github.com/sagernet/gomobile/cmd/gomobile@${GOMOBILE_VERSION}"
+          go install "github.com/sagernet/gomobile/cmd/gobind@${GOMOBILE_VERSION}"
+          # shallow clone cannot describe a tag -> let the builder take the version
+          SING_BOX_BUILD_VERSION="$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)" \
+            go run ./cmd/internal/build_libbox -target android
+          cp libbox.aar "${GITHUB_WORKSPACE}/app/libs/libbox.aar"
+          ls -la "${GITHUB_WORKSPACE}/app/libs/libbox.aar"
+
+      # 构建元数据注入：关于页显示的 core 来源 / 分支 / commit / 构建时间
+      - name: Export core build metadata
+        run: |
+          set -euo pipefail
+          CORE_DIR=/tmp/sing-box
+          if [ -d "$CORE_DIR/.git" ]; then
+            echo "CORE_COMMIT=$(git -C "$CORE_DIR" rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+            echo "CORE_COMMIT_FULL=$(git -C "$CORE_DIR" rev-parse HEAD)" >> "$GITHUB_ENV"
+            echo "CORE_COMMIT_DATE=$(git -C "$CORE_DIR" log -1 --format=%cI)" >> "$GITHUB_ENV"
+            echo "CORE_DESCRIBE=$(git -C "$CORE_DIR" describe --tags --always)" >> "$GITHUB_ENV"
+          else
+            echo "CORE_COMMIT=${{ steps.core.outputs.sha }}" >> "$GITHUB_ENV"
+          fi
+          echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - name: Unit tests
+        run: ./gradlew :app:testDebugUnitTest --no-daemon --console=plain
+
+      - name: Assemble debug APK
+        run: ./gradlew :app:assembleDebug --no-daemon --console=plain
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: satelite-one-debug-${{ github.sha }}
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports-${{ github.sha }}
+          path: app/build/reports/tests/
+          if-no-files-found: ignore

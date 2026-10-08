@@ -94,7 +94,6 @@
     <string name="vm_config_update_failed">Failed to update config</string>
     <string name="vm_rule_update_failed">Rule file update failed: %1$s</string>
     <string name="vm_switch_failed_api">Switch failed: core API unreachable</string>
-    <string name="vm_xray_restarted">Xray restarted to apply</string>
     <string name="vm_switch_failed">Switch failed: %1$s</string>
     <string name="vm_test_failed_api">Test failed: core API unreachable</string>
     <string name="vm_test_failed_send">Test failed: could not send command</string>
@@ -365,6 +364,9 @@
     <string name="settings_battery_exempted">Exempted</string>
     <string name="settings_version_title">Version</string>
     <string name="settings_core_title">Core</string>
+    <string name="settings_core_source_title">Core source</string>
+    <string name="settings_core_revision_title">Core revision</string>
+    <string name="settings_build_date_title">Build date</string>
     <string name="settings_check_update_title">Check for updates</string>
     <string name="settings_check_update_available">New version v%1$s found; tap to get it from GitHub</string>
     <string name="settings_check_update_uptodate">You are on the latest version (v%1$s)</string>
@@ -395,8 +397,6 @@
     <string name="settings_custom_rules_footer">Manual rules match first, ahead of built-ins like CN bypass.</string>
     <string name="settings_rule_files">Rule files</string>
     <string name="settings_rule_files_update_title">Update rule files</string>
-    <string name="settings_rule_files_geo_mihomo">GEO database geosite + geoip (%1$s, ~12 MB)</string>
-    <string name="settings_rule_files_geo_xray">GEO database geosite + geoip (%1$s, ~25 MB)</string>
     <string name="settings_rule_files_srs">Built-in srs rule sets (%1$s, ~2 MB)</string>
     <string name="settings_rule_files_update">Update</string>
     <string name="settings_rule_files_footer">Downloads the latest rules from GitHub; a running core downloads through the current node.</string>
@@ -479,6 +479,4 @@
     <string name="nodes_detail_no_credentials">No credential fields for this protocol</string>
     <string name="nodes_delay_untested">Untested</string>
     <string name="nodes_delay_ms_badge_fmt">%1$dms</string>
-    <string name="xray_skipped_nodes">Skipped %1$d nodes unsupported by Xray (tuic/anytls/ssh/shadow-tls/quic)</string>
-    <string name="xray_no_supported_nodes">No Xray-supported nodes in the subscription (supports ss/vmess/vless/trojan/socks/http/wireguard/hysteria2)</string>
 </resources>

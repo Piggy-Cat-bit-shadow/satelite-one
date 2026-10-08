@@ -73,17 +73,9 @@ object AppUpdateChecker {
         .proxy(Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", MIXED_PORT)))
         .build()
 
-    /** Same liveness split as SubscriptionFetcher. */
-    private fun coreRunning(): Boolean = when (Settings.coreKind) {
-        com.interstellar.proxy.core.CoreKind.SINGBOX ->
-            File(InterstellarApplication.application.filesDir, "command.sock").exists()
-
-        com.interstellar.proxy.core.CoreKind.MIHOMO ->
-            com.interstellar.proxy.core.MihomoCore.Holder.instance != null
-
-        com.interstellar.proxy.core.CoreKind.XRAY ->
-            com.interstellar.proxy.core.XrayCore.Holder.instance != null
-    }
+    /** Same liveness test as SubscriptionFetcher: the command socket. */
+    private fun coreRunning(): Boolean =
+        File(InterstellarApplication.application.filesDir, "command.sock").exists()
 
     private suspend fun fetchLatestTag(): String = withContext(Dispatchers.IO) {
         val clients = buildList {

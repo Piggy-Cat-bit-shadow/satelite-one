@@ -1,22 +1,21 @@
 package com.interstellar.proxy.core
 
+import com.interstellar.proxy.InterstellarApplication
 import io.nekohasekai.libbox.PlatformInterface
 
 /**
  * Engine-agnostic operations the service layer (BoxService) invokes on the
- * active core. Implementations: SingBoxCore (in-process libbox), mihomo /
- * Xray sidecars (Phase 2/3).
+ * core. There is exactly one implementation — [SingBoxCore] — because this
+ * client ships one core only: Piggy-Cat-bit-shadow/sing-box via libbox.
  */
 interface ProxyCore {
-    val kind: CoreKind
-
-    /** Create and start the engine itself (CommandServer / sidecar process). */
+    /** Create and start the engine itself (CommandServer). */
     suspend fun startup()
 
     /** Apply (first start or hot-reload) a generated config. */
     suspend fun applyConfig(config: String, overrides: CoreOverrides)
 
-    /** Doze pause / resume. No-op for engines without the concept. */
+    /** Doze pause / resume. */
     fun pause()
 
     fun wake()
@@ -29,31 +28,19 @@ interface ProxyCore {
 }
 
 /**
- * Neutral start-time overrides; each core maps them onto its own mechanism
- * (sing-box: OverrideOptions; sidecars: applied by the VPN builder instead).
+ * Neutral start-time overrides, mapped onto sing-box's OverrideOptions.
  */
 data class CoreOverrides(
     val autoRedirect: Boolean,
     val perAppEnabled: Boolean,
     val perAppInclude: Boolean,
     val perAppPackages: Set<String>,
-    /** Tag the UI wants selected (mihomo applies it via Clash API post-start). */
+    /** Tag the UI wants selected. */
     val selectedTag: String? = null,
 )
 
 /** Neutral system-proxy state (BoxService ↔ core, decoupled from libbox types). */
 data class SystemProxyState(val available: Boolean, val enabled: Boolean)
-
-/** Tun spec a sidecar core needs before spawning (fd inheritance). */
-data class SidecarTunSpec(
-    /** Hosts/IPs to exclude from VPN routes (node servers + DNS upstreams). */
-    val exclusions: List<String>,
-    val perAppEnabled: Boolean,
-    val perAppInclude: Boolean,
-    val perAppPackages: Set<String>,
-    val allowBypass: Boolean,
-    val mtu: Int = 9000,
-)
 
 /** Core → service callbacks. */
 interface CoreHost {
@@ -67,29 +54,13 @@ interface CoreHost {
 
     fun onSetSystemProxy(enabled: Boolean)
 
-    /**
-     * Establish a VPN tun for a sidecar core and return its (CLOEXEC-cleared)
-     * fd for config embedding; null when not in VPN mode.
-     */
-    fun openSidecarTun(spec: SidecarTunSpec): Int? = null
-
     /** Per-second traffic sample for the persistent notification. */
     fun onCoreTraffic(upPerSecond: Long, downPerSecond: Long) {}
 }
 
 object CoreEngines {
-    /**
-     * Unknown / not-yet-shipped kinds fall back to sing-box so a stale
-     * settings file can never brick the service.
-     */
     fun create(
-        kind: CoreKind,
         platformInterface: PlatformInterface,
         host: CoreHost,
-    ): ProxyCore =
-        when (kind) {
-            CoreKind.SINGBOX -> SingBoxCore(platformInterface, host)
-            CoreKind.MIHOMO -> MihomoCore(com.interstellar.proxy.InterstellarApplication.application, host)
-            CoreKind.XRAY -> XrayCore(com.interstellar.proxy.InterstellarApplication.application, host)
-        }
+    ): ProxyCore = SingBoxCore(platformInterface, host)
 }

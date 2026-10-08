@@ -74,37 +74,13 @@ object NetProbe {
             .build()
     }
 
-    /** Xray's local inbound is socks-only (no mixed http). */
-    private val proxiedSocksClient: OkHttpClient by lazy {
-        OkHttpClient.Builder()
-            .connectTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
-            .readTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
-            .followRedirects(true)
-            .proxy(Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", MIXED_PORT)))
-            .build()
-    }
-
-    private fun proxiedClient(): OkHttpClient =
-        if (com.interstellar.proxy.data.Settings.coreKind == com.interstellar.proxy.core.CoreKind.XRAY) {
-            proxiedSocksClient
-        } else {
-            proxiedHttpClient
-        }
+    private fun proxiedClient(): OkHttpClient = proxiedHttpClient
 
     /**
-     * sing-box's command socket exists exactly while it runs; the sidecar
-     * cores expose their Holder handles instead.
+     * The sing-box command socket exists exactly while the core runs.
      */
-    private fun coreRunning(): Boolean = when (com.interstellar.proxy.data.Settings.coreKind) {
-        com.interstellar.proxy.core.CoreKind.SINGBOX ->
-            File(InterstellarApplication.application.filesDir, "command.sock").exists()
-
-        com.interstellar.proxy.core.CoreKind.MIHOMO ->
-            com.interstellar.proxy.core.MihomoCore.Holder.instance != null
-
-        com.interstellar.proxy.core.CoreKind.XRAY ->
-            com.interstellar.proxy.core.XrayCore.Holder.instance != null
-    }
+    private fun coreRunning(): Boolean =
+        File(InterstellarApplication.application.filesDir, "command.sock").exists()
 
     /**
      * Race all endpoints on the given path; first valid answer wins.

@@ -23,12 +23,9 @@ import com.interstellar.proxy.data.subscription.SubscriptionParser
 import io.nekohasekai.libbox.Libbox
 import io.nekohasekai.libbox.OutboundGroup
 import io.nekohasekai.libbox.StatusMessage
-import com.interstellar.proxy.core.ClashApiClient
 import com.interstellar.proxy.core.CoreGroup
 import com.interstellar.proxy.core.CoreGroupItem
-import com.interstellar.proxy.core.CoreKind
 import com.interstellar.proxy.core.DirectPing
-import com.interstellar.proxy.core.MihomoCore
 import com.interstellar.proxy.utils.CommandClient
 import com.interstellar.proxy.utils.CommandTarget
 import kotlinx.coroutines.Dispatchers
@@ -40,12 +37,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
-import com.interstellar.proxy.data.subscription.arr
 import com.interstellar.proxy.data.subscription.str
-import com.interstellar.proxy.data.subscription.strList
-import java.security.SecureRandom
 
 data class SpeedState(
     val uplinkPerSecond: Long = 0,
@@ -126,14 +118,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      */
     private val _staticGroups = MutableStateFlow<List<CoreGroup>>(emptyList())
     val staticGroups: StateFlow<List<CoreGroup>> = _staticGroups
-
-    /** Observable engine kind — drives the dashboard core segmented control. */
-    private val _coreKind = MutableStateFlow(Settings.coreKind)
-    val coreKind: StateFlow<CoreKind> = _coreKind
-
-    /** Active connection count from the mihomo API (dashboard core card). */
-    private val _mihomoConnectionCount = MutableStateFlow(0)
-    val mihomoConnectionCount: StateFlow<Int> = _mihomoConnectionCount
 
     /** App-proxy scope as the UI sees it (drives the dashboard status row). */
     data class ProxyScope(val whitelist: Boolean, val count: Int) {
@@ -302,7 +286,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             },
             currentTag = { smartCurrentTag() },
             socksPort = 2080,
-            useSocksProxy = { Settings.coreKind == CoreKind.XRAY },
+            // sing-box's mixed inbound speaks HTTP CONNECT; there is no
+            // socks-only inbound in this client
+            useSocksProxy = { false },
             requestKernelDelays = { requestKernelGroupDelays() },
             applySwitch = { tag -> applySmartSwitch(tag) },
             pool = {
@@ -324,40 +310,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         return _groups.value.find { it.tag == GROUP_TAG }?.selected?.takeIf { it.isNotBlank() }
     }
 
-    /** sing-box/mihomo: group url-test + settle; Xray has no API → null. */
+    /** Run a group url-test through libbox and return the resulting delays. */
     private suspend fun requestKernelGroupDelays(): Map<String, Int>? {
-        return when (Settings.coreKind) {
-            CoreKind.SINGBOX -> {
-                if (!runKernelUrlTest(manual = false)) return null
-                _delays.value
-            }
-
-            CoreKind.MIHOMO -> {
-                clashApi.groupDelay(ConfigBuilder.AUTO_TAG) ?: return null
-                _delays.value
-            }
-
-            CoreKind.XRAY -> null
-        }
+        if (!runKernelUrlTest(manual = false)) return null
+        return _delays.value
     }
 
     /** Hot-switch the running core; persists smartActiveTag on success. */
     private suspend fun applySmartSwitch(tag: String): Boolean {
-        val ok = when (Settings.coreKind) {
-            CoreKind.MIHOMO -> runCatching { clashApi.select(ConfigBuilder.GROUP_TAG, tag) }.isSuccess
-
-            CoreKind.SINGBOX -> runCatching {
-                CommandTarget.standaloneClient().selectOutbound(ConfigBuilder.GROUP_TAG, tag)
-            }.isSuccess
-
-            CoreKind.XRAY -> {
-                Settings.smartActiveTag = tag
-                SubscriptionRepository.regenerateActiveConfig()
-                runCatching {
-                    com.interstellar.proxy.core.XrayCore.Holder.instance?.restartFromConfigStore()
-                }.isSuccess
-            }
-        }
+        val ok = runCatching {
+            CommandTarget.standaloneClient().selectOutbound(ConfigBuilder.GROUP_TAG, tag)
+        }.isSuccess
         if (ok) {
             Settings.smartActiveTag = tag
         }
@@ -548,13 +511,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private fun normalizeRoutingMode(mode: String): String? =
         mode.lowercase().takeIf { it == "rule" || it == "global" || it == "direct" }
 
-    // ---- mihomo live bridge (Clash REST → same state the libbox client feeds) ----
-
-    private val clashApi by lazy { ClashApiClient(MihomoCore.API_PORT, Settings.apiSecret) }
-    private var mihomoJob: Job? = null
-    private var mihomoLastDown = -1L
-    private var mihomoLastUp = -1L
-
     /** libbox group snapshot → neutral CoreGroup. */
     private fun convertGroup(group: OutboundGroup): CoreGroup {
         val iterator = group.items
@@ -571,117 +527,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
-    private fun startMihomoBridge() {
-        if (mihomoJob?.isActive == true) return
-        mihomoJob = viewModelScope.launch(Dispatchers.IO) {
-            while (isActive) {
-                when (Settings.coreKind) {
-                    CoreKind.MIHOMO -> runCatching { pollMihomoOnce() }
-                    CoreKind.XRAY -> runCatching { pollXrayOnce() }
-                    CoreKind.SINGBOX -> Unit
-                }
-                delay(2000)
-            }
-        }
-    }
-
-    /**
-     * Xray has no control API — the live bridge only carries the hev TUN
-     * counters (traffic card) and promotes Starting → Started once the
-     * inbound is up; node/delay state stays pool-driven.
-     */
-    private fun pollXrayOnce() {
-        if (probing) return
-        if (_status.value == Status.Starting) markStarted()
-        if (!com.interstellar.proxy.core.TProxyService.running) return
-        // hev counters: [txPackets, txBytes, rxPackets, rxBytes]
-        val stats = com.interstellar.proxy.core.TProxyService.stats() ?: return
-        val tx = stats.getOrElse(1) { 0L }
-        val rx = stats.getOrElse(3) { 0L }
-        if (mihomoLastDown >= 0 && rx >= mihomoLastDown && tx >= mihomoLastUp) {
-            _speed.value = SpeedState(
-                uplinkPerSecond = (tx - mihomoLastUp) / 2,
-                downlinkPerSecond = (rx - mihomoLastDown) / 2,
-                uplinkTotal = tx,
-                downlinkTotal = rx,
-            )
-            _history.value =
-                (_history.value + ((rx - mihomoLastDown) / 2 to (tx - mihomoLastUp) / 2)).takeLast(60)
-        }
-        mihomoLastDown = rx
-        mihomoLastUp = tx
-    }
-
-    private suspend fun pollMihomoOnce() {
-        if (clashApi.version() == null) {
-            // core unreachable (dead or mid-respawn): drop the dead snapshot
-            // so the nodes page falls back to groups parsed from the on-disk
-            // config instead of showing the old core's last state forever
-            if (_groups.value.isNotEmpty()) _groups.value = emptyList()
-            return
-        }
-        if (probing) return
-        if (_status.value == Status.Starting) markStarted()
-
-        clashApi.proxies()?.let { proxies ->
-            val delays = mutableMapOf<String, Int>()
-            for ((name, v) in proxies) {
-                val history = v.jsonObject["history"]?.let { h ->
-                    (h as? kotlinx.serialization.json.JsonArray)?.lastOrNull()?.jsonObject
-                }
-                history?.get("delay")?.jsonPrimitive?.content?.toIntOrNull()?.let { delays[name] = it }
-            }
-            _delays.value = delays
-            val groups = proxies.values.mapNotNull { entry ->
-                val obj = entry.jsonObject
-                val tag = obj["name"]?.jsonPrimitive?.content ?: return@mapNotNull null
-                if (tag in setOf("GLOBAL", "DIRECT", "REJECT", "COMPATIBLE", "PASS")) return@mapNotNull null
-                val all = obj["all"] as? kotlinx.serialization.json.JsonArray ?: return@mapNotNull null
-                if (all.isEmpty()) return@mapNotNull null
-                CoreGroup(
-                    tag = tag,
-                    type = obj["type"]?.jsonPrimitive?.content ?: "Selector",
-                    selected = obj["now"]?.jsonPrimitive?.content,
-                    items = all.map { nameEl ->
-                        val name = nameEl.jsonPrimitive.content
-                        CoreGroupItem(name, proxies[name]?.jsonObject?.get("type")?.jsonPrimitive?.content ?: "", delays[name] ?: 0, 0L)
-                    },
-                )
-            }
-            _groups.value = groups
-            refreshSplitRuleStatus()
-        }
-
-        clashApi.connections()?.let { conn ->
-            (conn["connections"] as? kotlinx.serialization.json.JsonArray)?.let {
-                _mihomoConnectionCount.value = it.size
-            }
-            val down = conn["downloadTotal"]?.jsonPrimitive?.content?.toLongOrNull() ?: return@let
-            val up = conn["uploadTotal"]?.jsonPrimitive?.content?.toLongOrNull() ?: return@let
-            if (mihomoLastDown >= 0 && down >= mihomoLastDown && up >= mihomoLastUp) {
-                _speed.value = SpeedState(
-                    uplinkPerSecond = (up - mihomoLastUp) / 2,
-                    downlinkPerSecond = (down - mihomoLastDown) / 2,
-                    uplinkTotal = up,
-                    downlinkTotal = down,
-                )
-                _history.value = (_history.value + ((down - mihomoLastDown) / 2 to (up - mihomoLastUp) / 2)).takeLast(60)
-            }
-            mihomoLastDown = down
-            mihomoLastUp = up
-        }
-    }
-
     init {
-        ensureApiSecret()
         // the nodes page shows these until the core runs and live groups arrive
         refreshStaticGroups()
     }
 
     fun connect() {
-        // libbox command socket only exists for the sing-box engine
-        if (Settings.coreKind == CoreKind.SINGBOX) commandClient.connect()
-        startMihomoBridge()
+        commandClient.connect()
         registerStoppedReceiver()
         if (Settings.selectedOutboundTag == com.interstellar.proxy.data.config.ConfigBuilder.SMART_TAG) {
             smartEngine.start()
@@ -693,7 +545,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             while (isActive) {
                 delay(2000)
                 if (_status.value == Status.Starting || _status.value == Status.Stopped) {
-                    if (Settings.coreKind == CoreKind.SINGBOX) commandClient.connect()
+                    commandClient.connect()
                 }
             }
         }
@@ -702,10 +554,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun disconnect() {
         pollJob?.cancel()
         pollJob = null
-        mihomoJob?.cancel()
-        mihomoJob = null
-        mihomoLastDown = -1L
-        mihomoLastUp = -1L
         startingWatchdog?.cancel()
         startingWatchdog = null
         unregisterStoppedReceiver()
@@ -734,16 +582,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         runCatching { getApplication<Application>().unregisterReceiver(receiver) }
     }
 
-    private fun ensureApiSecret() {
-        if (Settings.apiSecret.isBlank()) {
-            val bytes = ByteArray(16)
-            SecureRandom().nextBytes(bytes)
-            Settings.apiSecret = android.util.Base64.encodeToString(
-                bytes,
-                android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP,
-            )
-        }
-    }
 
     private fun markStarted() {
         startingWatchdog?.cancel()
@@ -798,7 +636,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private fun applySocketDrop() {
         // connection errors from the (sing-box only) command client must not
         // tear down a healthy sidecar engine
-        if (Settings.coreKind != CoreKind.SINGBOX) return
+
         when (_status.value) {
             Status.Stopping -> markStopped()
             Status.Started -> armStartingWatchdog(SOCKET_DROP_TIMEOUT_MS)
@@ -863,7 +701,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     ?: str(com.interstellar.proxy.R.string.vm_config_update_failed)
                 return@launch
             }
-            _staticGroups.value = parseStaticGroups(config, Settings.coreKind)
+            _staticGroups.value = parseSingboxGroups(config)
             // a switch during Starting would otherwise be silently dropped: the
             // in-flight start already consumed the previous config and no
             // reload fires — wait for the start to settle, then apply
@@ -875,17 +713,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             if (_status.value == Status.Started) {
-                when (Settings.coreKind) {
-                    CoreKind.MIHOMO -> runCatching {
-                        com.interstellar.proxy.core.MihomoCore.Holder.instance?.refreshFromConfigStore()
-                    }
-
-                    CoreKind.XRAY -> runCatching {
-                        com.interstellar.proxy.core.XrayCore.Holder.instance?.restartFromConfigStore()
-                    }
-
-                    CoreKind.SINGBOX -> runCatching { CommandTarget.standaloneClient().serviceReload() }
-                }
+                runCatching { CommandTarget.standaloneClient().serviceReload() }
             }
         }
     }
@@ -894,47 +722,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun refreshStaticGroups() {
         viewModelScope.launch(Dispatchers.IO) {
             val content = com.interstellar.proxy.data.ConfigStore.readActiveConfig()
-            _staticGroups.value =
-                content?.let { parseStaticGroups(it, Settings.coreKind) } ?: emptyList()
-        }
-    }
-
-    /**
-     * Groups out of a generated/raw config: mihomo proxy-groups or sing-box
-     * selector/urltest outbounds. Xray has no group concept — callers fall
-     * back to the stored node pool.
-     */
-    private fun parseStaticGroups(content: String, coreKind: CoreKind): List<CoreGroup> =
-        runCatching {
-            when (coreKind) {
-                CoreKind.MIHOMO -> parseClashGroups(content)
-                CoreKind.SINGBOX -> parseSingboxGroups(content)
-                CoreKind.XRAY -> emptyList()
-            }
-        }.getOrDefault(emptyList())
-
-    private fun parseClashGroups(yaml: String): List<CoreGroup> {
-        val json = com.interstellar.proxy.data.subscription.YamlToJson.convert(yaml) ?: return emptyList()
-        val groups = json.arr("proxy-groups") ?: return emptyList()
-        // members that reference another group get that group's type, so the
-        // nodes page can render them as group cards while the core is stopped
-        val typeByName = groups.mapNotNull { el ->
-            (el as? kotlinx.serialization.json.JsonObject)?.let { g ->
-                g.str("name")?.let { it to (g.str("type") ?: "select").lowercase() }
-            }
-        }.toMap()
-        return groups.mapNotNull { el ->
-            val g = el as? kotlinx.serialization.json.JsonObject ?: return@mapNotNull null
-            val name = g.str("name") ?: return@mapNotNull null
-            CoreGroup(
-                tag = name,
-                type = (g.str("type") ?: "select").lowercase(),
-                // runtime state unknown while stopped — highlight nothing
-                selected = null,
-                items = (g.strList("proxies") ?: emptyList()).map {
-                    CoreGroupItem(it, typeByName[it] ?: "")
-                },
-            )
+            _staticGroups.value = content?.let { parseSingboxGroups(it) } ?: emptyList()
         }
     }
 
@@ -961,77 +749,24 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Downloads the latest rule/geodata files for the active core, then
-     * reloads so the fresh files take effect immediately: sing-box re-reads
-     * local rule-sets on service reload; sidecars get a full respawn
-     * (mihomo/xray only load geodata at process spawn).
+     * Downloads the latest rule-set files, then reloads so the fresh files
+     * take effect immediately (sing-box re-reads local rule-sets on reload).
      */
     fun updateRuleFiles() {
         if (_ruleFilesUpdating.value) return
         _ruleFilesUpdating.value = true
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val summary = com.interstellar.proxy.data.net.GeoRuleUpdater.update(Settings.coreKind)
+                val summary = com.interstellar.proxy.data.net.GeoRuleUpdater.update()
                 _message.value = summary
                 val config = SubscriptionRepository.regenerateActiveConfig()
                 if (config != null && _status.value == Status.Started) {
-                    when (Settings.coreKind) {
-                        CoreKind.MIHOMO -> runCatching {
-                            com.interstellar.proxy.core.MihomoCore.Holder.instance?.restartFromConfigStore()
-                        }
-
-                        CoreKind.XRAY -> runCatching {
-                            com.interstellar.proxy.core.XrayCore.Holder.instance?.restartFromConfigStore()
-                        }
-
-                        CoreKind.SINGBOX -> runCatching { CommandTarget.standaloneClient().serviceReload() }
-                    }
+                    runCatching { CommandTarget.standaloneClient().serviceReload() }
                 }
             } catch (e: Exception) {
                 _message.value = str(com.interstellar.proxy.R.string.vm_rule_update_failed, e.message ?: "")
             } finally {
                 _ruleFilesUpdating.value = false
-            }
-        }
-    }
-
-    /**
-     * Switch the active engine: stop the running service (an in-flight core
-     * can't morph into another), regenerate the config for the new core and
-     * start it again.
-     */
-    fun switchCore(kind: CoreKind) {
-        if (Settings.coreKind == kind) return
-        viewModelScope.launch(Dispatchers.IO) {
-            val wasRunning = _status.value == Status.Started || _status.value == Status.Starting
-            if (wasRunning) {
-                com.interstellar.proxy.bg.BoxService.stop()
-                var waited = 0
-                while (_status.value != Status.Stopped && waited < 10_000) {
-                    delay(200)
-                    waited += 200
-                }
-            }
-            com.interstellar.proxy.core.AppLog.log("core", "切换内核 → ${kind.displayName}")
-            smartEngine.stop() // probe client type follows the new core
-            Settings.coreKind = kind
-            _coreKind.value = kind
-            _groups.value = emptyList()
-            _delays.value = emptyMap()
-            mihomoLastDown = -1L
-            mihomoLastUp = -1L
-            val config = SubscriptionRepository.regenerateActiveConfig()
-            if (config == null) {
-                _message.value = SubscriptionRepository.lastConfigError
-                    ?: str(com.interstellar.proxy.R.string.vm_config_update_failed)
-                return@launch
-            }
-            _staticGroups.value = parseStaticGroups(config, kind)
-            if (wasRunning) {
-                com.interstellar.proxy.bg.BoxService.start()
-                if (Settings.selectedOutboundTag == com.interstellar.proxy.data.config.ConfigBuilder.SMART_TAG) {
-                    smartEngine.start()
-                }
             }
         }
     }
@@ -1071,35 +806,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
         viewModelScope.launch(Dispatchers.IO) {
             if (_status.value == Status.Started) {
-                when (Settings.coreKind) {
-                    CoreKind.MIHOMO -> {
-                        val ok = runCatching { clashApi.select(groupTag, itemTag) }.getOrDefault(false)
-                        if (!ok) _message.value = str(com.interstellar.proxy.R.string.vm_switch_failed_api)
-                        runCatching { pollMihomoOnce() }
-                    }
-
-                    CoreKind.XRAY -> {
-                        // Xray has no selector — regenerate + respawn ("重启生效")
-                        SubscriptionRepository.regenerateActiveConfig()
-                        runCatching {
-                            com.interstellar.proxy.core.XrayCore.Holder.instance?.restartFromConfigStore()
-                        }.onSuccess {
-                            _message.value = str(com.interstellar.proxy.R.string.vm_xray_restarted)
-                        }
-                    }
-
-                    CoreKind.SINGBOX -> runCatching {
-                        CommandTarget.standaloneClient().selectOutbound(groupTag, itemTag)
-                    }.onFailure {
-                        _message.value = str(com.interstellar.proxy.R.string.vm_switch_failed, it.message ?: "")
-                    }
+                runCatching {
+                    CommandTarget.standaloneClient().selectOutbound(groupTag, itemTag)
+                }.onFailure {
+                    _message.value = str(com.interstellar.proxy.R.string.vm_switch_failed, it.message ?: "")
                 }
             } else {
                 // stopped: bake the pick into the regenerated config and
                 // refresh the static groups so the page reflects it at once
                 val config = SubscriptionRepository.regenerateActiveConfig()
                 if (config != null) {
-                    _staticGroups.value = parseStaticGroups(config, Settings.coreKind)
+                    _staticGroups.value = parseSingboxGroups(config)
                 }
                 _selectedOutboundTag.value = Settings.selectedOutboundTag
             }
@@ -1173,35 +890,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 if (_status.value == Status.Started) {
-                    when (Settings.coreKind) {
-                        CoreKind.MIHOMO -> {
-                            val result = clashApi.groupDelay(groupTag)
-                            if (result != null) {
-                                _delays.value = _delays.value.toMutableMap().also { map ->
-                                    result.forEach { (name, delay) -> map[name] = delay }
-                                }
-                                _testProgress.value = result.size to result.size
-                            } else {
-                                _message.value = str(com.interstellar.proxy.R.string.vm_test_failed_api)
-                            }
-                        }
-
-                        // no API — TCP ping the pool directly, no core involved
-                        CoreKind.XRAY -> tcpPingPool()
-
-                        CoreKind.SINGBOX -> {
-                            // test the AUTO urltest group (members = every node
-                            // tag), not the selector: the selector's mixed
-                            // group+node items get skipped wholesale by the
-                            // kernel's per-item pass — that's the "大量未测"
-                            // at the bottom. Mirrors the mihomo path
-                            // (groupDelay(AUTO_TAG)) and the disconnected path.
-                            if (!runKernelUrlTest(manual = true)) {
-                                _message.value = str(com.interstellar.proxy.R.string.vm_test_failed_send)
-                            }
-                        }
+                    // Test the AUTO urltest group (members = every node tag),
+                    // not the selector: the selector's mixed group+node items
+                    // get skipped wholesale by the kernel's per-item pass —
+                    // that's the "大量未测" at the bottom.
+                    if (!runKernelUrlTest(manual = true)) {
+                        _message.value = str(com.interstellar.proxy.R.string.vm_test_failed_send)
                     }
-                    if (Settings.coreKind == CoreKind.MIHOMO) delay(12_000)
                 } else {
                     runDisconnectedUrlTest()
                 }
@@ -1280,15 +975,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      * 未连接. Restores the previous config afterwards.
      */
     private suspend fun runDisconnectedUrlTest() {
-        // Xray delay = direct TCP pings; spinning a headless core buys nothing
-        if (Settings.coreKind == CoreKind.XRAY) {
-            tcpPingPool()
-            return
-        }
         probing = true
         probeSocketUp = false
         val previous = ConfigStore.readActiveConfig()
-        val isMihomo = Settings.coreKind == CoreKind.MIHOMO
         try {
             val probe = SubscriptionRepository.regenerateActiveConfig(includeTun = false)
                 ?: throw IllegalStateException(
@@ -1296,52 +985,32 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         ?: str(com.interstellar.proxy.R.string.vm_no_test_config),
                 )
             com.interstellar.proxy.bg.BoxService.startHeadless()
-            if (isMihomo) {
-                // wait for the Clash REST API instead of the libbox socket
-                var connected = false
-                for (i in 0 until 150) {
-                    delay(200)
-                    if (_status.value == Status.Starting || _status.value == Status.Started) return
-                    if (runCatching { clashApi.version() }.getOrNull() != null) {
-                        connected = true
-                        break
-                    }
+            commandClient.connect()
+            // Wait for the command socket. Cold boot (FGS scheduling, rule-set
+            // init) can take well over 6s — probing a raw command client is a
+            // slow-failing gRPC dial, so key off our own connection instead.
+            var connected = false
+            for (i in 0 until 150) { // 150 × 200ms = 30s budget
+                delay(200)
+                if (_status.value == Status.Starting || _status.value == Status.Started) return
+                if (probeSocketUp) {
+                    connected = true
+                    break
                 }
-                if (!connected) throw IllegalStateException(str(com.interstellar.proxy.R.string.vm_test_service_timeout))
-                val result = clashApi.groupDelay(ConfigBuilder.AUTO_TAG)
-                    ?: throw IllegalStateException(str(com.interstellar.proxy.R.string.vm_test_cmd_failed))
-                _delays.value = _delays.value.toMutableMap().also { map ->
-                    result.forEach { (name, delay) -> map[name] = delay }
-                }
-                delay(1_000)
-            } else {
-                commandClient.connect()
-                // Wait for the command socket. Cold boot (FGS scheduling, rule-set
-                // init) can take well over 6s — probing a raw command client is a
-                // slow-failing gRPC dial, so key off our own connection instead.
-                var connected = false
-                for (i in 0 until 150) { // 150 × 200ms = 30s budget
-                    delay(200)
-                    if (_status.value == Status.Starting || _status.value == Status.Started) return
-                    if (probeSocketUp) {
-                        connected = true
-                        break
-                    }
-                    // a failed dial is not retried inside CommandClient — re-kick it
-                    if (i > 0 && i % 10 == 0) commandClient.connect()
-                }
-                if (!connected) throw IllegalStateException(str(com.interstellar.proxy.R.string.vm_test_service_timeout))
-                kernelTestManual = true // manual run: progress + settle own the UI state
-                testStartEpoch = System.currentTimeMillis() / 1000
-                val ok = runCatching {
-                    CommandTarget.standaloneClient().urlTest(ConfigBuilder.AUTO_TAG)
-                }.isSuccess
-                if (!ok) throw IllegalStateException(str(com.interstellar.proxy.R.string.vm_test_cmd_failed))
-                // bounded by the kernel's per-node timeout (15s) + margin —
-                // a fixed 10s here used to cut the headless core mid-run and
-                // leave the bottom nodes 未测
-                awaitUrlTestSettled()
+                // a failed dial is not retried inside CommandClient — re-kick it
+                if (i > 0 && i % 10 == 0) commandClient.connect()
             }
+            if (!connected) throw IllegalStateException(str(com.interstellar.proxy.R.string.vm_test_service_timeout))
+            kernelTestManual = true // manual run: progress + settle own the UI state
+            testStartEpoch = System.currentTimeMillis() / 1000
+            val ok = runCatching {
+                CommandTarget.standaloneClient().urlTest(ConfigBuilder.AUTO_TAG)
+            }.isSuccess
+            if (!ok) throw IllegalStateException(str(com.interstellar.proxy.R.string.vm_test_cmd_failed))
+            // bounded by the kernel's per-node timeout (15s) + margin —
+            // a fixed 10s here used to cut the headless core mid-run and
+            // leave the bottom nodes 未测
+            awaitUrlTestSettled()
         } finally {
             probeSocketUp = false
             val takenOver = _status.value == Status.Starting || _status.value == Status.Started
@@ -1524,8 +1193,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             SubscriptionParser.Result.Empty -> {
-                // full Xray configs carry no extractable nodes but are valid raw
-                // bodies — import them as raw-only subscriptions
+                // a raw config may carry no extractable nodes but still be a
+                // valid body — import it as a raw-only subscription
                 if (format != null) {
                     SubscriptionRepository.upsert(
                         SubscriptionRepository.Subscription(
@@ -1584,7 +1253,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     SubscriptionParser.Result.Empty ->
                         if (format != null) {
                             SubscriptionRepository.upsert(
-                                sub.copy(configFormat = format, lastUpdated = System.currentTimeMillis()),
+                                sub.copy(
+                                    configFormat = format,
+                                    uploadBytes = result.uploadBytes,
+                                    downloadBytes = result.downloadBytes,
+                                    totalBytes = result.totalBytes,
+                                    expireSeconds = result.expireSeconds,
+                                    lastUpdated = System.currentTimeMillis(),
+                                ),
                             )
                             showToast(str(com.interstellar.proxy.R.string.vm_config_kept, sub.name), UiToast.Kind.Success)
                         } else {
@@ -1638,7 +1314,24 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                             true
                                         }
 
-                                        SubscriptionParser.Result.Empty -> false
+                                        SubscriptionParser.Result.Empty -> {
+                                            val fmt = SubscriptionRepository.saveRawBody(sub.id, result.body)
+                                            if (fmt != null) {
+                                                SubscriptionRepository.upsert(
+                                                    sub.copy(
+                                                        configFormat = fmt,
+                                                        uploadBytes = result.uploadBytes,
+                                                        downloadBytes = result.downloadBytes,
+                                                        totalBytes = result.totalBytes,
+                                                        expireSeconds = result.expireSeconds,
+                                                        lastUpdated = System.currentTimeMillis(),
+                                                    ),
+                                                )
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
                                     }
                                 }.getOrDefault(false)
                                 if (success) ok++
@@ -1708,8 +1401,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         SubscriptionRepository.activeSubscriptionId = id
         _activeSubscriptionId.value = id
         refreshSplitRuleStatus()
-        // regenerate + hot-reload per core (mihomo API reload / Xray respawn /
-        // sing-box service reload) — a bare serviceReload() only reaches sing-box
+        // regenerate + hot-reload the running core
         refreshProxyConfig()
     }
 
@@ -1747,8 +1439,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Rebuilds the config from the new pool and hot-reloads the running core. */
     private fun applyPoolChange() {
-        // refreshProxyConfig regenerates from the new pool and dispatches the
-        // per-core reload (mihomo API / Xray respawn / sing-box serviceReload)
+        // refreshProxyConfig regenerates from the new pool and reloads the core
         refreshProxyConfig()
     }
 

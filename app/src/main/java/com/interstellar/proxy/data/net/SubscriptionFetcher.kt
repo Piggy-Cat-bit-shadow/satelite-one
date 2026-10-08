@@ -32,19 +32,10 @@ object SubscriptionFetcher {
         .build()
 
     /**
-     * Per-core liveness (same split as NetProbe): sing-box owns the command
-     * socket, sidecar cores expose their Holder handles.
+     * The sing-box command socket exists exactly while the core runs.
      */
-    private fun coreRunning(): Boolean = when (com.interstellar.proxy.data.Settings.coreKind) {
-        com.interstellar.proxy.core.CoreKind.SINGBOX ->
-            File(InterstellarApplication.application.filesDir, "command.sock").exists()
-
-        com.interstellar.proxy.core.CoreKind.MIHOMO ->
-            com.interstellar.proxy.core.MihomoCore.Holder.instance != null
-
-        com.interstellar.proxy.core.CoreKind.XRAY ->
-            com.interstellar.proxy.core.XrayCore.Holder.instance != null
-    }
+    private fun coreRunning(): Boolean =
+        File(InterstellarApplication.application.filesDir, "command.sock").exists()
 
     data class FetchResult(
         val body: String,
@@ -112,8 +103,16 @@ object SubscriptionFetcher {
         })
     }
 
-    // upload=123; download=456; total=789; expire=1750000000
-    private fun parseSubscriptionUserinfo(header: String): Map<String, Long> {
+    /**
+     * `Subscription-Userinfo` → raw fields, e.g.
+     * `upload=123; download=456; total=789; expire=1750000000`.
+     *
+     * Deliberately total: a missing header yields an empty map, a malformed
+     * pair is dropped, and a non-numeric value is dropped, so callers can
+     * default each field to 0 and degrade gracefully. `internal` so unit tests
+     * can pin the contract — the UI's quota/expiry display depends on it.
+     */
+    internal fun parseSubscriptionUserinfo(header: String): Map<String, Long> {
         return header.split(';')
             .mapNotNull { part ->
                 val key = part.substringBefore('=').trim().lowercase()

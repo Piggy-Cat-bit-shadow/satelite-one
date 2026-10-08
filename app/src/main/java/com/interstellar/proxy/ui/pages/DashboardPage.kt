@@ -67,19 +67,31 @@ import com.interstellar.proxy.ui.components.GlassButton
 import com.interstellar.proxy.ui.components.GlassButtonStyle
 import com.interstellar.proxy.ui.components.GlassCard
 import com.interstellar.proxy.ui.components.OrbitHero
-import com.interstellar.proxy.ui.components.SegmentedControl
 import com.interstellar.proxy.ui.components.StatusPill
 import com.interstellar.proxy.ui.components.glassSurface
 import com.interstellar.proxy.ui.components.pressableClick
 import com.interstellar.proxy.ui.localizedCountryName
+import com.interstellar.proxy.BuildConfig
 import com.interstellar.proxy.ui.theme.LocalInterstellarColors
 import com.interstellar.proxy.ui.theme.Motion
 import io.nekohasekai.libbox.Libbox
 import com.interstellar.proxy.core.CoreGroup
 
-private const val CORE_VERSION = "sing-box 1.14.0"
-private const val MIHOMO_VERSION = "mihomo v1.19.30"
-private const val XRAY_VERSION_CARD = "Xray v26.3.27"
+/**
+ * Core identity line: the fork this APK was built against plus the revision
+ * libbox reports at runtime. This client has exactly one core, so there is no
+ * selector — only provenance.
+ */
+@Composable
+private fun coreVersionLine(): String {
+    val version = runCatching { Libbox.version() }.getOrNull()?.takeIf { it.isNotBlank() && it != "unknown" }
+    val rev = BuildConfig.CORE_COMMIT
+    return buildString {
+        append("sing-box")
+        if (version != null) append(" ").append(version) else append(" ").append(BuildConfig.CORE_DESCRIBE)
+        if (rev != "unknown") append(" · ").append(rev)
+    }
+}
 
 @Composable
 fun DashboardPage(
@@ -105,9 +117,7 @@ fun DashboardPage(
     val connections by connectionsViewModel.connections.collectAsState()
     val history by viewModel.history.collectAsState()
     val routingMode by viewModel.routingMode.collectAsState()
-    val coreKind by viewModel.coreKind.collectAsState()
     val proxyScope by viewModel.proxyScope.collectAsState()
-    val mihomoConnectionCount by viewModel.mihomoConnectionCount.collectAsState()
     val probe by viewModel.probe.collectAsState()
     val running = status == Status.Started
     val activeConnectionCount = connections.count { !it.closed }
@@ -330,11 +340,7 @@ fun DashboardPage(
 
             Spacer(Modifier.height(8.dp))
 
-            val coreOrder = listOf(
-                com.interstellar.proxy.core.CoreKind.SINGBOX,
-                com.interstellar.proxy.core.CoreKind.MIHOMO,
-                com.interstellar.proxy.core.CoreKind.XRAY,
-            )
+            // Core identity (no selector — this client ships one core).
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth(),
@@ -347,17 +353,14 @@ fun DashboardPage(
                     letterSpacing = 1.sp,
                     modifier = Modifier.width(30.dp),
                 )
-                SegmentedControl(
-                    items = coreOrder.map { it.displayName },
-                    selected = coreOrder.indexOf(coreKind).coerceAtLeast(0),
-                    onSelect = { i ->
-                        val picked = coreOrder[i]
-                        if (!busy && status != Status.Starting) {
-                            viewModel.switchCore(picked)
-                        }
-                    },
+                Text(
+                    coreVersionLine(),
+                    color = colors.textSecondary,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f),
-                    controlHeight = 40.dp,
                 )
             }
 
@@ -377,13 +380,8 @@ fun DashboardPage(
                     onClick = { onOpenSubPage(SettingsSubPage.Logs) },
                     modifier = Modifier.weight(1f),
                     secondary = {
-                        val coreLabel = when (coreKind) {
-                            com.interstellar.proxy.core.CoreKind.MIHOMO -> MIHOMO_VERSION
-                            com.interstellar.proxy.core.CoreKind.XRAY -> XRAY_VERSION_CARD
-                            else -> CORE_VERSION
-                        }
                         Text(
-                            coreLabel,
+                            BuildConfig.CORE_REPO,
                             color = colors.textTertiary,
                             fontSize = 11.sp,
                             maxLines = 1,
@@ -413,10 +411,7 @@ fun DashboardPage(
                         )
                     }
                 }
-                val connectionCount = when (coreKind) {
-                    com.interstellar.proxy.core.CoreKind.MIHOMO -> mihomoConnectionCount
-                    else -> activeConnectionCount
-                }
+                val connectionCount = activeConnectionCount
                 InstrumentCard(
                     caption = stringResource(R.string.dash_caption_traffic),
                     onClick = { onOpenSubPage(SettingsSubPage.Connections) },

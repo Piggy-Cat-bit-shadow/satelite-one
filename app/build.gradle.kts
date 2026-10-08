@@ -1,4 +1,7 @@
 import com.android.build.api.variant.FilterConfiguration
+import java.time.Instant
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
 import java.util.Properties
 
 plugins {
@@ -20,6 +23,64 @@ val versionProps = Properties().apply {
     rootProject.file("version.properties").inputStream().use { load(it) }
 }
 
+// ---------------------------------------------------------------------------
+// Core provenance
+//
+// This client ships exactly ONE core: Piggy-Cat-bit-shadow/sing-box. The
+// libbox.aar in app/libs is produced from that fork, so its revision must be
+// recorded at build time — "which core built this APK" is the first question
+// in any bug report. CI exports CORE_COMMIT / CORE_BRANCH; a local build falls
+// back to the sibling checkout at ../sing-box (i.e. /tmp/sb/sing-box during
+// development), then to "unknown".
+// ---------------------------------------------------------------------------
+val coreRepo = "Piggy-Cat-bit-shadow/sing-box"
+val coreBranch = System.getenv("CORE_BRANCH")?.takeIf { it.isNotBlank() } ?: "testing"
+
+fun gitIn(dir: java.io.File, vararg args: String): String? = runCatching {
+    val proc = ProcessBuilder(listOf("git", "-C", dir.absolutePath) + args)
+        .redirectErrorStream(true)
+        .start()
+    val out = proc.inputStream.bufferedReader().readText().trim()
+    proc.waitFor()
+    out.takeIf { proc.exitValue() == 0 && it.isNotBlank() && !it.startsWith("fatal") }
+}.getOrNull()
+
+val libboxAar = File(projectDir, "libs/libbox.aar")
+
+/** First existing sing-box checkout we can read a revision from. */
+val coreCheckout: java.io.File? =
+    listOf(
+        System.getenv("CORE_CHECKOUT"),
+        rootProject.projectDir.parentFile?.resolve("sing-box")?.absolutePath,
+        "/tmp/sb/sing-box",
+    ).filterNotNull().map(::File).firstOrNull { it.isDirectory }
+
+val coreCommit: String =
+    System.getenv("CORE_COMMIT")?.takeIf { it.isNotBlank() }
+        ?: coreCheckout?.let { gitIn(it, "rev-parse", "--short=12", "HEAD") }
+        ?: "unknown"
+
+val coreCommitFull: String =
+    System.getenv("CORE_COMMIT_FULL")?.takeIf { it.isNotBlank() }
+        ?: coreCheckout?.let { gitIn(it, "rev-parse", "HEAD") }
+        ?: "unknown"
+
+val coreCommitDate: String =
+    System.getenv("CORE_COMMIT_DATE")?.takeIf { it.isNotBlank() }
+        ?: coreCheckout?.let { gitIn(it, "log", "-1", "--format=%cI") }
+        ?: "unknown"
+
+val coreDescribe: String =
+    System.getenv("CORE_DESCRIBE")?.takeIf { it.isNotBlank() }
+        ?: coreCheckout?.let { gitIn(it, "describe", "--tags", "--always") }
+        ?: "unknown"
+
+val buildDate: String =
+    System.getenv("BUILD_DATE")?.takeIf { it.isNotBlank() }
+        ?: DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'")
+            .withZone(ZoneOffset.UTC)
+            .format(Instant.now())
+
 android {
     namespace = "com.interstellar.proxy"
     compileSdk = 36
@@ -30,7 +91,18 @@ android {
         targetSdk = 36
         versionCode = versionProps.getProperty("versionCode").toInt()
         versionName = versionProps.getProperty("versionName")
+
+        // Surfaced on the dashboard core card and in Settings → About.
+        buildConfigField("String", "CORE_REPO", "\"$coreRepo\"")
+        buildConfigField("String", "CORE_BRANCH", "\"$coreBranch\"")
+        buildConfigField("String", "CORE_COMMIT", "\"$coreCommit\"")
+        buildConfigField("String", "CORE_COMMIT_FULL", "\"$coreCommitFull\"")
+        buildConfigField("String", "CORE_COMMIT_DATE", "\"$coreCommitDate\"")
+        buildConfigField("String", "CORE_DESCRIBE", "\"$coreDescribe\"")
+        buildConfigField("String", "BUILD_DATE", "\"$buildDate\"")
+        buildConfigField("Boolean", "CORE_PRESENT", libboxAar.exists().toString())
     }
+
 
     signingConfigs {
         create("release") {
@@ -62,13 +134,16 @@ android {
         }
     }
 
-    // per-ABI APKs: ~40MB instead of one 146MB universal blob
+    // per-ABI APKs instead of one huge universal blob.
+    // arm64-v8a is the shipping target; x86_64 is kept for emulator debug runs.
+    // armeabi-v7a / x86 were dropped: 32-bit devices are not a target for this
+    // client and carrying two extra 70MB+ libbox variants only bloated CI.
     splits {
         abi {
             isEnable = true
             reset()
-            include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
-            isUniversalApk = true
+            include("arm64-v8a", "x86_64")
+            isUniversalApk = false
         }
     }
 

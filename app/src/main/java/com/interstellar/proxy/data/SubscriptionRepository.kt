@@ -242,7 +242,6 @@ object SubscriptionRepository {
             fallbackDirect = Settings.fallbackDirectEnabled,
             adBlock = Settings.adBlockEnabled,
             selectedNodeTag = selectedTag,
-            apiSecret = Settings.apiSecret,
             customRules = CustomRulesStore.rules.toList(),
             dnsOverrides = DnsOverridesStore.enabled(),
             applyNodeFilterRules = Settings.splitRulesEnabled &&
@@ -251,20 +250,9 @@ object SubscriptionRepository {
             includeTun = includeTun,
             simpleRules = com.interstellar.proxy.data.SimpleRulesStore.enabled(),
         )
-        val coreKind = Settings.coreKind
-        val content =
-            if (coreKind == com.interstellar.proxy.core.CoreKind.MIHOMO) {
-                com.interstellar.proxy.data.config.MihomoConfigBuilder.build(nodes, opts)
-            } else if (coreKind == com.interstellar.proxy.core.CoreKind.XRAY) {
-                com.interstellar.proxy.data.config.XrayConfigBuilder.build(nodes, opts)
-            } else {
-                ConfigBuilder.build(nodes, opts)
-            }
+        val content = ConfigBuilder.build(nodes, opts)
         return try {
-            // libbox only validates sing-box JSON; sidecars self-validate at spawn
-            if (coreKind == com.interstellar.proxy.core.CoreKind.SINGBOX) {
-                Libbox.checkConfig(content)
-            }
+            Libbox.checkConfig(content)
             ConfigStore.writeActiveConfig(content)
             lastConfigError = null
             content
@@ -282,17 +270,9 @@ object SubscriptionRepository {
     /** Raw path of [regenerateActiveConfig]; null = not applicable, use the rewrite. */
     private fun applyRawConfigIfMatching(sub: Subscription): String? {
         val format = com.interstellar.proxy.data.subscription.RawConfigFormat.from(sub.configFormat)
-        val coreKind = Settings.coreKind
-        val matches = when (format) {
-            com.interstellar.proxy.data.subscription.RawConfigFormat.CLASH ->
-                coreKind == com.interstellar.proxy.core.CoreKind.MIHOMO
-            com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX ->
-                coreKind == com.interstellar.proxy.core.CoreKind.SINGBOX
-            com.interstellar.proxy.data.subscription.RawConfigFormat.XRAY ->
-                coreKind == com.interstellar.proxy.core.CoreKind.XRAY
-            null -> false
-        }
-        if (!matches) return null
+        // Only a sing-box subscription body can be handed to this core verbatim;
+        // Clash/Xray bodies were only ever pass-through for the removed sidecars.
+        if (format != com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX) return null
         val raw = runCatching { rawFileOf(sub.id).takeIf { it.isFile }?.readText() }.getOrNull() ?: return null
         val options = com.interstellar.proxy.data.config.RawConfigApplier.Options(
             mode = Settings.outboundMode,
@@ -301,22 +281,10 @@ object SubscriptionRepository {
             overseasProxy = Settings.overseasProxyEnabled,
             fallbackDirect = Settings.fallbackDirectEnabled,
             adBlock = Settings.adBlockEnabled,
-            apiSecret = Settings.apiSecret,
         )
-        val content = when (format) {
-            com.interstellar.proxy.data.subscription.RawConfigFormat.CLASH ->
-                com.interstellar.proxy.data.config.RawConfigApplier.applyClash(raw, options)
-            com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX ->
-                com.interstellar.proxy.data.config.RawConfigApplier.applySingbox(raw, options)
-            com.interstellar.proxy.data.subscription.RawConfigFormat.XRAY ->
-                com.interstellar.proxy.data.config.RawConfigApplier.applyXray(raw, options)
-            null -> return null
-        }
+        val content = com.interstellar.proxy.data.config.RawConfigApplier.applySingbox(raw, options)
         return try {
-            // libbox only validates sing-box JSON; sidecars self-validate at spawn
-            if (coreKind == com.interstellar.proxy.core.CoreKind.SINGBOX) {
-                Libbox.checkConfig(content)
-            }
+            Libbox.checkConfig(content)
             ConfigStore.writeActiveConfig(content)
             lastConfigError = null
             content
@@ -354,10 +322,20 @@ object SubscriptionRepository {
                 }
 
                 com.interstellar.proxy.data.subscription.SubscriptionParser.Result.Empty ->
-                    // e.g. a full Xray config: no nodes to extract, but the raw
-                    // body is retained and usable in raw mode with a matching core
+                    // e.g. a full sing-box profile: no nodes to extract, but the
+                    // raw body is retained and usable in raw mode. Quota still
+                    // belongs to this subscription, so keep it fresh too.
                     if (format != null) {
-                        upsert(sub.copy(configFormat = format, lastUpdated = System.currentTimeMillis()))
+                        upsert(
+                            sub.copy(
+                                configFormat = format,
+                                uploadBytes = result.uploadBytes,
+                                downloadBytes = result.downloadBytes,
+                                totalBytes = result.totalBytes,
+                                expireSeconds = result.expireSeconds,
+                                lastUpdated = System.currentTimeMillis(),
+                            ),
+                        )
                         str(
                             com.interstellar.proxy.R.string.repo_refreshed_raw,
                             sub.name,

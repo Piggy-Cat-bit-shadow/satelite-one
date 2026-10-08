@@ -10,15 +10,14 @@ import io.nekohasekai.libbox.PlatformInterface
 import io.nekohasekai.libbox.SystemProxyStatus
 
 /**
- * sing-box in-process engine — the pre-multi-core BoxService code, moved
- * verbatim behind ProxyCore. Behavior is unchanged.
+ * The sing-box in-process engine. libbox.aar is built from
+ * Piggy-Cat-bit-shadow/sing-box (branch testing) — the only core this
+ * client ships.
  */
 class SingBoxCore(
     private val platformInterface: PlatformInterface,
     private val host: CoreHost,
 ) : ProxyCore, CommandServerHandler {
-    override val kind = CoreKind.SINGBOX
-
     private var commandServer: CommandServer? = null
     private fun server(): CommandServer = checkNotNull(commandServer) { "core not started" }
 

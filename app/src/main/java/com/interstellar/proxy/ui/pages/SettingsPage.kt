@@ -69,6 +69,17 @@ fun setLanguageChangedListener(listener: () -> Unit) {
 enum class SettingsSubPage { Settings, PerApp, Connections, Logs, Rules, Dns, Proxy }
 
 /** Bottom-dock root tabs (satelite's navbar, phone layout). */
+/**
+ * Core provenance line: what libbox reports at runtime plus the revision the
+ * APK was built from (injected by app/build.gradle.kts).
+ */
+@Composable
+private fun coreVersionLabel(): String {
+    val version = runCatching { io.nekohasekai.libbox.Libbox.version() }
+        .getOrNull()?.takeIf { it.isNotBlank() && it != "unknown" }
+    return if (version != null) "sing-box $version" else "sing-box ${BuildConfig.CORE_DESCRIBE}"
+}
+
 enum class MainTab { Home, Nodes, Subscriptions, Logs, Settings }
 
 /** hiddify-style: phone uses 2 tabs (Home/Settings); these pages push in. */
@@ -288,7 +299,13 @@ fun SettingsPage(onOpen: (SettingsSubPage) -> Unit, onProxyChanged: () -> Unit =
             )
             PrefNavRow(title = stringResource(R.string.settings_version_title), value = BuildConfig.VERSION_NAME)
             UpdateCheckRow()
-            PrefNavRow(title = stringResource(R.string.settings_core_title), value = "sing-box 1.14.0")
+            PrefNavRow(title = stringResource(R.string.settings_core_title), value = coreVersionLabel())
+            PrefNavRow(title = stringResource(R.string.settings_core_source_title), value = BuildConfig.CORE_REPO)
+            PrefNavRow(
+                title = stringResource(R.string.settings_core_revision_title),
+                value = "${BuildConfig.CORE_BRANCH} / ${BuildConfig.CORE_COMMIT}",
+            )
+            PrefNavRow(title = stringResource(R.string.settings_build_date_title), value = BuildConfig.BUILD_DATE)
         }
 
         Spacer(Modifier.height(20.dp))
@@ -750,14 +767,7 @@ fun ProxySettingsPage(viewModel: com.interstellar.proxy.ui.AppViewModel, onOpen:
             val updating by viewModel.ruleFilesUpdating.collectAsState()
             PrefRowShell(
                 title = stringResource(R.string.settings_rule_files_update_title),
-                desc = when (Settings.coreKind) {
-                    com.interstellar.proxy.core.CoreKind.MIHOMO ->
-                        stringResource(R.string.settings_rule_files_geo_mihomo, Settings.coreKind.displayName)
-                    com.interstellar.proxy.core.CoreKind.XRAY ->
-                        stringResource(R.string.settings_rule_files_geo_xray, Settings.coreKind.displayName)
-                    else ->
-                        stringResource(R.string.settings_rule_files_srs, Settings.coreKind.displayName)
-                },
+                desc = stringResource(R.string.settings_rule_files_srs, "sing-box"),
             ) {
                 if (updating) {
                     CircularProgressIndicator(
