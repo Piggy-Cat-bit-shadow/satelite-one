@@ -93,16 +93,29 @@ jobs:
           echo "CORE_COMMIT=${SHA}" >> "$GITHUB_ENV"
           echo "CORE_COMMIT_FULL=${SHA}" >> "$GITHUB_ENV"
 
-      - name: Verify pinned core revision exists upstream
+      # Verify the pin is real BEFORE the cache can short-circuit anything.
+      # `git ls-remote` lists ref TIPS only, so it can never confirm an ancestor
+      # commit; fetching the SHA is the actual existence check. This runs
+      # unconditionally, so a cache hit is covered too.
+      - name: Verify pinned core revision is fetchable
         env:
           CORE_SHA: ${{ steps.core.outputs.sha }}
         run: |
           set -euo pipefail
-          if ! git ls-remote "https://github.com/${CORE_REPO}.git" | grep -q "^${CORE_SHA}"; then
-            echo "::error::pinned core commit ${CORE_SHA} not found in ${CORE_REPO}"
+          rm -rf /tmp/pin-check
+          git init -q /tmp/pin-check
+          cd /tmp/pin-check
+          git remote add origin "https://github.com/${CORE_REPO}.git"
+          if ! git fetch --depth 1 origin "${CORE_SHA}" 2>/dev/null; then
+            echo "::error::pinned core commit ${CORE_SHA} is not fetchable from ${CORE_REPO}"
             exit 1
           fi
-          echo "pinned core commit ${CORE_SHA} exists in ${CORE_REPO}"
+          FETCHED="$(git rev-parse FETCH_HEAD)"
+          if [ "$FETCHED" != "${CORE_SHA}" ]; then
+            echo "::error::fetched ${FETCHED} but pinned coreCommit is ${CORE_SHA}"
+            exit 1
+          fi
+          echo "pinned core commit ${CORE_SHA} is fetchable from ${CORE_REPO}"
 
       - name: Cache libbox.aar
         id: libbox
