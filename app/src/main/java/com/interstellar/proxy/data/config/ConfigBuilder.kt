@@ -48,7 +48,7 @@ object ConfigBuilder {
         val selectedNodeTag: String? = null,
         val mixedPortEnabled: Boolean = true,
         val mixedPort: Int = 2080,
-        // keep in sync with MihomoCore.API_PORT (19090 — never clash's 9090 default)
+        // loopback port for sing-box's clash_api (mode switching goes through it)
         val apiPort: Int = 19090,
         val apiSecret: String = "",
         val customRules: List<CustomRouteRule> = emptyList(),

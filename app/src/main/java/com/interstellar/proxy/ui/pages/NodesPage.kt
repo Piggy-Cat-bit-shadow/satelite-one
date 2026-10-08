@@ -80,7 +80,7 @@ private data class NodeEntry(
 }
 
 private fun isGroupItem(item: NodeEntry): Boolean {
-    // mihomo reports "Selector"/"URLTest" capitalized, libbox lowercase
+    // libbox reports group types lowercase
     val t = item.type.lowercase()
     return item.tag == ConfigBuilder.AUTO_TAG || t == "urltest" || t == "selector"
 }

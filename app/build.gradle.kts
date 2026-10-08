@@ -406,7 +406,7 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     testImplementation("junit:junit:4.13.2")
-    // real org.json for JVM tests — XrayConfigBuilder builds on it and the
-    // SDK stub throws "not mocked"
+    // real org.json on the test classpath: SmartSwitchEngine uses org.json, and
+    // the SDK stub throws "not mocked" under plain JVM unit tests
     testImplementation("org.json:json:20240303")
 }

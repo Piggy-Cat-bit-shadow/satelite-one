@@ -51,7 +51,7 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
 
     /**
      * Set by close(): the service notification is gone. A late traffic
-     * callback (mihomo poller races core shutdown — trafficJob is cancelled
+     * callback (a race with core shutdown — the traffic job is cancelled
      * only after close) must not re-post it via NotificationManager.notify —
      * that re-posted notification is no longer bound to the foreground
      * service and survives stopSelf() as a stale "still connected" one.

@@ -12,20 +12,16 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
-import org.json.JSONArray
-import org.json.JSONObject
 
 /**
- * Feeds a retained raw subscription config to the matching core with minimal,
- * surgical edits — the original structure (proxies, groups, DNS, rules) is
- * preserved; we only fix what the in-app service model depends on and prepend
- * the built-in geo rules the user enabled. Deliberately NOT a rewrite: airport
- * configs carry YAML anchors, provider quirks and hand-tuned rules.
+ * Feeds a retained raw subscription config to sing-box with minimal, surgical
+ * edits — the original structure (outbounds, groups, DNS, rules) is preserved;
+ * we only fix what the in-app service model depends on and prepend the built-in
+ * rule sets the user enabled. Deliberately NOT a rewrite: upstream profiles
+ * carry provider quirks and hand-tuned rules.
  *
- *  - clash → mihomo: line-based edits (YAML anchors survive byte-for-byte)
- *  - sing-box → sing-box: JSON tree edits via kotlinx.serialization
- *  - Xray → Xray: JSON tree edits via org.json; inbounds are replaced with
- *    the app's socks bridge (the hev TUN tunnel only speaks to 127.0.0.1:2080)
+ * Only sing-box bodies are handled (see [applySingbox]); Clash and Xray bodies
+ * were pass-through only for the sidecar engines this client no longer ships.
  */
 object RawConfigApplier {
 
