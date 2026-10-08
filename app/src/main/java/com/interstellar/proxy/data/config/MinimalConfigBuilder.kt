@@ -90,8 +90,12 @@ object MinimalConfigBuilder {
                     put("type", "tun")
                     put("tag", "tun-in")
                     // No `stack`: the netstack is sing-box's choice, not ours.
-                    // Writing "mixed"/"gvisor" here is what used to force every
-                    // Android libbox to be compiled with gVisor.
+                    //
+                    // sing-tun's NewStack maps an empty stack to the Go netstack
+                    // ("case "", "go""), so omitting the field needs no gVisor at
+                    // all — writing "mixed"/"gvisor" here is exactly what used to
+                    // force every Android libbox to be compiled with it. sing-box
+                    // also marks the option deprecated (OptionTunStack).
                     //
                     // No `mtu` either: sing-box's default applies.
                     putJsonArray("address") {
