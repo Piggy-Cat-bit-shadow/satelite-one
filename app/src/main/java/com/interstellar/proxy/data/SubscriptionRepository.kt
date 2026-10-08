@@ -220,12 +220,6 @@ object SubscriptionRepository {
         var selectedTag = Settings.selectedOutboundTag.takeIf { it.isNotBlank() }
             ?: ConfigBuilder.tagFor(nodes, selectedNodeId)
             ?: ConfigBuilder.AUTO_TAG
-        // smart mode: bake in the engine's current pick (fall back to auto
-        // on a cold start); the engine refines it via hot-switches later
-        if (selectedTag == com.interstellar.proxy.data.config.ConfigBuilder.SMART_TAG) {
-            selectedTag = Settings.smartActiveTag.takeIf { it.isNotBlank() }
-                ?: ConfigBuilder.AUTO_TAG
-        }
         val regionGroups = Settings.regionGroupsEnabled
         if (!regionGroups &&
             selectedTag != ConfigBuilder.AUTO_TAG &&

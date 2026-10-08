@@ -13,7 +13,6 @@
     <!-- functional group tags (display-layer only, see LocalizedNames) -->
     <string name="group_manual">Manual</string>
     <string name="group_auto">Auto</string>
-    <string name="group_smart">Smart</string>
     <string name="region_info">ℹ️ Info</string>
     <string name="region_other">🌐 Others</string>
     <string name="region_suffix_auto"> · Auto</string>
@@ -54,22 +53,6 @@
     <string name="country_ae">UAE</string>
     <string name="country_ar">Argentina</string>
 
-    <!-- smart switch engine phases / alerts -->
-    <string name="smart_phase_idle">Idle</string>
-    <string name="smart_phase_patrolling">Patrolling</string>
-    <string name="smart_phase_patrol_error">Patrol error: %1$s</string>
-    <string name="smart_phase_healthy">Healthy %1$dms</string>
-    <string name="smart_phase_ping_scan">Ping scan</string>
-    <string name="smart_phase_real_test">Latency test</string>
-    <string name="smart_phase_cooldown">Cooldown</string>
-    <string name="smart_phase_switched">Switched %1$dms</string>
-    <string name="smart_phase_keep">Keeping %1$dms</string>
-    <string name="smart_phase_failed">Selection failed</string>
-    <string name="smart_alert_no_pool">No node pool available</string>
-    <string name="smart_alert_no_candidates">No low-latency candidates</string>
-    <string name="smart_alert_no_qualified">No node met the latency bar</string>
-    <string name="smart_alert_round_too_long">Round took %1$ds</string>
-    <string name="smart_idle_hint">Auto-selects after connecting</string>
 
     <!-- dashboard node row -->
     <string name="dash_picking">Selecting…</string>
@@ -97,11 +80,6 @@
     <string name="vm_no_test_config">Could not generate a test config</string>
     <string name="vm_test_service_timeout">Timed out waiting for the test service</string>
     <string name="vm_test_cmd_failed">Failed to send the test command</string>
-    <string name="vm_no_nodes_to_test">No nodes to test</string>
-    <string name="vm_all_udp">All nodes use UDP protocols, which TCP ping cannot test — use url-test instead</string>
-    <string name="vm_ping_timeout">Timeout</string>
-    <string name="vm_ping_refused">Connection refused</string>
-    <string name="vm_ping_dns_failed">DNS resolution failed</string>
     <string name="vm_download_failed">Download failed: %1$s · the subscription host may be unreachable directly; try again with the proxy on</string>
     <string name="vm_local_subscription">Local subscription</string>
     <string name="vm_imported_nodes">Imported %1$d nodes</string>
@@ -161,7 +139,6 @@
     <string name="dash_route_direct">Direct</string>
     <string name="dash_route_rule">Rule</string>
     <string name="dash_mode_auto">Auto</string>
-    <string name="dash_mode_smart">Smart</string>
     <string name="dash_mode_manual">Manual</string>
     <string name="dash_label_route">Routing</string>
     <string name="dash_label_scope">App proxy</string>
@@ -411,14 +388,12 @@
     <string name="nodes_view_grid">Grid</string>
     <string name="nodes_url_test">Test</string>
     <string name="nodes_url_testing">Testing</string>
-    <string name="nodes_ping_running">Pinging</string>
     <string name="nodes_mode_running_fmt">%1$s…</string>
     <string name="nodes_mode_done_fmt">%1$s done</string>
     <string name="nodes_summary_pending_hint">Stats appear when finished</string>
     <string name="nodes_summary_stats_fmt">%1$d nodes · %2$d ok · %3$d failed</string>
     <string name="nodes_summary_tap_close">Tap to close</string>
     <string name="nodes_summary_delays_fmt">min %1$dms · P50 %2$dms · P95 %3$dms · max %4$dms</string>
-    <string name="nodes_summary_skipped_udp_fmt">Skipped %1$d UDP-only nodes (hysteria2/tuic/wireguard cannot be TCP-pinged; use url-test)</string>
     <string name="nodes_summary_fail_reason_fmt">Failure reasons: %1$s</string>
     <string name="nodes_test_fail_generic">Timed out or handshake failed</string>
     <string name="nodes_group_urltest_arrow">Auto url-test group ›</string>

@@ -23,7 +23,6 @@ import io.nekohasekai.libbox.OutboundGroup
 import io.nekohasekai.libbox.StatusMessage
 import com.interstellar.proxy.core.CoreGroup
 import com.interstellar.proxy.core.CoreGroupItem
-import com.interstellar.proxy.core.DirectPing
 import com.interstellar.proxy.utils.CommandClient
 import com.interstellar.proxy.utils.CommandTarget
 import kotlinx.coroutines.Dispatchers
@@ -191,13 +190,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _testProgress = MutableStateFlow<Pair<Int, Int>?>(null)
     val testProgress: StateFlow<Pair<Int, Int>?> = _testProgress
 
-    private val _pingProgress = MutableStateFlow<Pair<Int, Int>?>(null)
-    val pingProgress: StateFlow<Pair<Int, Int>?> = _pingProgress
-
     /** Epoch seconds when the current url-test run started (0 = idle). */
     @Volatile private var testStartEpoch = 0L
 
-    /** Serializes kernel url-test runs (manual button vs smart engine). */
+    /** Serializes kernel url-test runs. */
     private val kernelUrlTestMutex = kotlinx.coroutines.sync.Mutex()
 
     /** True while the in-flight kernel url-test run belongs to the manual button. */
@@ -263,76 +259,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _addSubError = MutableStateFlow<String?>(null)
     val addSubError: StateFlow<String?> = _addSubError
 
-    // ---- smart switch (智能模式) ----
-
-    private val _smartState = MutableStateFlow(SmartSwitchEngine.SmartState())
-    val smartState: StateFlow<SmartSwitchEngine.SmartState> = _smartState
-
-    val smartEngine: SmartSwitchEngine by lazy {
-        SmartSwitchEngine(
-            isActive = {
-                _status.value == Status.Started &&
-                    Settings.selectedOutboundTag == com.interstellar.proxy.data.config.ConfigBuilder.SMART_TAG
-            },
-            currentTag = { smartCurrentTag() },
-            socksPort = 2080,
-            // sing-box's mixed inbound speaks HTTP CONNECT; there is no
-            // socks-only inbound in this client
-            useSocksProxy = { false },
-            requestKernelDelays = { requestKernelGroupDelays() },
-            applySwitch = { tag -> applySmartSwitch(tag) },
-            pool = {
-                SubscriptionRepository.poolOf(
-                    _subscriptions.value,
-                    _activeSubscriptionId.value,
-                    _mixEnabled.value,
-                    _mixSubscriptionIds.value,
-                )
-            },
-            // 智能行为细节走 AppLog("smart") 在日志页呈现; 严重状态由首页 SmartStatusLine(state.alert) 呈现
-            onStateChanged = { _smartState.value = it },
-        )
-    }
-
-    /** The node smart mode currently rides on (falls back to the live group selection). */
-    private fun smartCurrentTag(): String? {
-        Settings.smartActiveTag.takeIf { it.isNotBlank() }?.let { return it }
-        return _groups.value.find { it.tag == GROUP_TAG }?.selected?.takeIf { it.isNotBlank() }
-    }
-
-    /** Run a group url-test through libbox and return the resulting delays. */
-    private suspend fun requestKernelGroupDelays(): Map<String, Int>? {
-        if (!runKernelUrlTest(manual = false)) return null
-        return _delays.value
-    }
-
-    /** Hot-switch the running core; persists smartActiveTag on success. */
-    private suspend fun applySmartSwitch(tag: String): Boolean {
-        val ok = runCatching {
-            CommandTarget.standaloneClient().selectOutbound(ConfigBuilder.GROUP_TAG, tag)
-        }.isSuccess
-        if (ok) {
-            Settings.smartActiveTag = tag
-        }
-        return ok
-    }
-
-    /** User picked 智能 in the node page: mark mode, bake config, kick the engine. */
-    fun selectSmartMode() {
-        if (Settings.selectedOutboundTag == ConfigBuilder.SMART_TAG) return
-        Settings.selectedOutboundTag = ConfigBuilder.SMART_TAG
-        _selectedOutboundTag.value = ConfigBuilder.SMART_TAG
-        viewModelScope.launch(Dispatchers.IO) {
-            if (_status.value == Status.Started) {
-                // hot-apply the effective selection (smartActiveTag / auto)
-                Settings.smartActiveTag.takeIf { it.isNotBlank() }?.let { applySmartSwitch(it) }
-            } else {
-                SubscriptionRepository.regenerateActiveConfig()
-            }
-            smartEngine.start()
-        }
-    }
-
     /** Abort an in-flight subscription import (dialog 取消). */
     fun cancelAddSubscription() {
         addSubJob?.cancel()
@@ -356,10 +282,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     val toast: StateFlow<UiToast?> = _toast
 
     private var toastClearJob: Job? = null
-
-    /** True while the concurrent TCP ping sweep runs. */
-    private val _pinging = MutableStateFlow(false)
-    val pinging: StateFlow<Boolean> = _pinging
 
     private val delaysMutex = kotlinx.coroutines.sync.Mutex()
 
@@ -390,7 +312,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         const val STARTING_TIMEOUT_MS = 15_000L
         const val SOCKET_DROP_TIMEOUT_MS = 400L
 
-        /** Sentinel delay for timed-out / unreachable nodes (ping & url-test). */
+        /** Sentinel delay for timed-out / unreachable nodes (url-test). */
         const val TIMEOUT_DELAY = 65535
     }
 
@@ -454,9 +376,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     map[item.tag] = item.urlTestDelay
                 }
                 _delays.value = map
-                // url-test progress: count results stamped after this run
-                // started. Only the manual run owns the UI state — smart
-                // runs settle silently underneath.
+                // url-test progress: count results stamped after this run started
                 if (testStartEpoch > 0) {
                     val done = outbounds.count { it.urlTestTime >= testStartEpoch }
                     val prevTotal = _testProgress.value?.second ?: 0
@@ -473,10 +393,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }
                 }
-                // NB: snapshots can arrive at any moment (smart rounds,
-                // delayed pushes) and must never kill an in-flight run —
-                // the settle branch above and the callers' finally own the
-                // testing state.
+                // NB: snapshots can arrive at any moment (delayed pushes) and
+                // must never kill an in-flight run — the settle branch above
+                // and the callers' finally own the testing state.
             }
 
             override fun initializeClashMode(modeList: List<String>, currentMode: String) {
@@ -518,9 +437,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun connect() {
         commandClient.connect()
         registerStoppedReceiver()
-        if (Settings.selectedOutboundTag == com.interstellar.proxy.data.config.ConfigBuilder.SMART_TAG) {
-            smartEngine.start()
-        }
         // poll-reconnect: the box may start/stop at any time, and a failed
         // connect (server not up yet) must be retried to reflect the state
         pollJob?.cancel()
@@ -781,10 +697,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun selectNode(groupTag: String, itemTag: String) {
         Settings.selectedOutboundTag = itemTag
         _selectedOutboundTag.value = itemTag
-        // picking a concrete node exits smart mode
-        if (itemTag != com.interstellar.proxy.data.config.ConfigBuilder.SMART_TAG) {
-            smartEngine.stop()
-        }
         viewModelScope.launch(Dispatchers.IO) {
             if (_status.value == Status.Started) {
                 runCatching {
@@ -892,10 +804,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * One kernel url-test run over the AUTO group, serialized between the
-     * manual button and the smart engine: both send the same command, and
-     * without the mutex one run's stream pushes would settle the other's
-     * wait (or let a stray push kill the manual spinner mid-run). Marks the
+     * One kernel url-test run, serialized: without the mutex one run's stream
+     * pushes would settle another run's wait (or let a stray push kill the
+     * spinner mid-run). Marks the
      * run epoch, sends the command, then waits for the outbounds stream to
      * report every member stamped after the epoch — bounded by the kernel's
      * per-node timeout plus margin. False = the command could not be sent.
@@ -974,102 +885,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 else SubscriptionRepository.regenerateActiveConfig()
             }
             probing = false
-        }
-    }
-
-    /** Aggregated per-run ping outcome for the summary bar. */
-    data class PingReport(
-        val failed: Int,
-        val skippedUdp: Int,
-        val reasons: Map<String, Int>,
-    )
-
-    @Volatile
-    var lastPingReport: PingReport? = null
-        private set
-
-    /**
-     * Concurrent direct TCP ping over the current pool (satelite-style):
-     * no core required, results stream into [delays] one by one so a
-     * delay-sorted list re-orders immediately. Failed connects are marked
-     * with the TIMEOUT sentinel and classified into [lastPingReport].
-     * UDP-only protocols (hysteria2/tuic/wireguard/quic) can't be TCP-pinged
-     * and are skipped with a note. Sockets bypass our own tun via
-     * [DirectPing] — a plain connect would handshake with the local tun
-     * stack (~3-4ms) while the VPN is up.
-     */
-    fun tcpPingPool() {
-        if (_pinging.value) return
-        _pinging.value = true
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                // while connected, the tracker decides between a real
-                // physical-network ping and a meaningless tun-loop ping
-                DirectPing.warmup(if (_status.value == Status.Started) 1_500 else 0)
-                val pool = SubscriptionRepository.poolOf(
-                    _subscriptions.value,
-                    _activeSubscriptionId.value,
-                    _mixEnabled.value,
-                    _mixSubscriptionIds.value,
-                )
-                if (pool.isEmpty()) {
-                    showToast(str(com.interstellar.proxy.R.string.vm_no_nodes_to_test), UiToast.Kind.Error)
-                    return@launch
-                }
-                val udpOnly = setOf(
-                    com.interstellar.proxy.data.model.NodeType.HYSTERIA2,
-                    com.interstellar.proxy.data.model.NodeType.TUIC,
-                    com.interstellar.proxy.data.model.NodeType.WIREGUARD,
-                )
-                val pairs = pool.zip(ConfigBuilder.tagsFor(pool))
-                    .filter { (node, _) -> node.type !in udpOnly && node.network != "quic" }
-                val skippedUdp = pool.size - pairs.size
-                if (pairs.isEmpty()) {
-                    lastPingReport = PingReport(0, skippedUdp, emptyMap())
-                    showToast(str(com.interstellar.proxy.R.string.vm_all_udp), UiToast.Kind.Error)
-                    return@launch
-                }
-                _pingProgress.value = 0 to pairs.size
-                val done = java.util.concurrent.atomic.AtomicInteger()
-                val failed = java.util.concurrent.atomic.AtomicInteger()
-                val reasons = java.util.concurrent.ConcurrentHashMap<String, Int>()
-                val semaphore = kotlinx.coroutines.sync.Semaphore(12)
-                kotlinx.coroutines.coroutineScope {
-                    pairs.forEach { (node, tag) ->
-                        launch {
-                            semaphore.withPermit {
-                                val outcome = runCatching {
-                                    DirectPing.tcpConnect(node.server, node.port, 3000)
-                                }
-                                val value = when {
-                                    outcome.exceptionOrNull() != null -> TIMEOUT_DELAY
-                                    else -> outcome.getOrDefault(0).coerceAtLeast(1)
-                                }
-                                if (value == TIMEOUT_DELAY) {
-                                    failed.incrementAndGet()
-                                    val reason = when (val e = outcome.exceptionOrNull()) {
-                                        null -> str(com.interstellar.proxy.R.string.vm_ping_timeout)
-                                        is java.net.SocketTimeoutException -> str(com.interstellar.proxy.R.string.vm_ping_timeout)
-                                        is java.net.ConnectException -> str(com.interstellar.proxy.R.string.vm_ping_refused)
-                                        is java.net.UnknownHostException -> str(com.interstellar.proxy.R.string.vm_ping_dns_failed)
-                                        else -> e.message?.take(18)?.takeIf { it.isNotBlank() }
-                                            ?: e.javaClass.simpleName
-                                    }
-                                    reasons.merge(reason, 1, Int::plus)
-                                }
-                                delaysMutex.withLock {
-                                    _delays.value = _delays.value.toMutableMap().also { it[tag] = value }
-                                }
-                                _pingProgress.value = done.incrementAndGet() to pairs.size
-                            }
-                        }
-                    }
-                }
-                lastPingReport = PingReport(failed.get(), skippedUdp, reasons.toMap())
-            } finally {
-                _pinging.value = false
-                _pingProgress.value = null
-            }
         }
     }
 

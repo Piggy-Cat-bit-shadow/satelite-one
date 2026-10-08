@@ -55,10 +55,4 @@ class UrlTestTargetTest {
     fun `group type match is case-insensitive so live snapshots still resolve`() {
         check(resolveUrlTestTarget("🇭🇰 香港", listOf(group("🇭🇰 香港", "URLTest"))) == "🇭🇰 香港")
     }
-
-    @Test
-    fun `smart tab is not a urltest group so it falls back to auto`() {
-        // smart is a virtual UI tab backed by the SmartSwitchEngine, not a kernel group
-        check(resolveUrlTestTarget(ConfigBuilder.SMART_TAG, groups) == ConfigBuilder.AUTO_TAG)
-    }
 }

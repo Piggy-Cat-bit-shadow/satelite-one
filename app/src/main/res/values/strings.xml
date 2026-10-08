@@ -13,7 +13,6 @@
     <!-- functional group tags (display-layer only, see LocalizedNames) -->
     <string name="group_manual">手动选择</string>
     <string name="group_auto">自动</string>
-    <string name="group_smart">智能</string>
     <string name="region_info">ℹ️ 信息</string>
     <string name="region_other">🌐 其他</string>
     <string name="region_suffix_auto"> · 自动</string>
@@ -54,22 +53,6 @@
     <string name="country_ae">阿联酋</string>
     <string name="country_ar">阿根廷</string>
 
-    <!-- smart switch engine phases / alerts -->
-    <string name="smart_phase_idle">空闲</string>
-    <string name="smart_phase_patrolling">巡检中</string>
-    <string name="smart_phase_patrol_error">巡检异常: %1$s</string>
-    <string name="smart_phase_healthy">正常 %1$dms</string>
-    <string name="smart_phase_ping_scan">Ping 扫描</string>
-    <string name="smart_phase_real_test">实测筛选</string>
-    <string name="smart_phase_cooldown">冷却中</string>
-    <string name="smart_phase_switched">已切换 %1$dms</string>
-    <string name="smart_phase_keep">保持 %1$dms</string>
-    <string name="smart_phase_failed">筛选失败</string>
-    <string name="smart_alert_no_pool">无可用节点池</string>
-    <string name="smart_alert_no_candidates">无低延迟备选</string>
-    <string name="smart_alert_no_qualified">未找到延迟达标节点</string>
-    <string name="smart_alert_round_too_long">筛选耗时 %1$ds</string>
-    <string name="smart_idle_hint">连接后自动择优</string>
 
     <!-- dashboard node row -->
     <string name="dash_picking">选择中…</string>
@@ -97,11 +80,6 @@
     <string name="vm_no_test_config">无法生成测速配置</string>
     <string name="vm_test_service_timeout">测速服务启动超时</string>
     <string name="vm_test_cmd_failed">测速命令发送失败</string>
-    <string name="vm_no_nodes_to_test">没有可测的节点</string>
-    <string name="vm_all_udp">全部节点为 UDP 协议, 不支持 TCP Ping, 请用测速</string>
-    <string name="vm_ping_timeout">超时</string>
-    <string name="vm_ping_refused">连接被拒</string>
-    <string name="vm_ping_dns_failed">域名解析失败</string>
     <string name="vm_download_failed">下载失败: %1$s · 订阅域名可能无法直连, 建议开启代理后重试</string>
     <string name="vm_local_subscription">本地订阅</string>
     <string name="vm_imported_nodes">已导入 %1$d 个节点</string>
@@ -161,7 +139,6 @@
     <string name="dash_route_direct">直连</string>
     <string name="dash_route_rule">规则</string>
     <string name="dash_mode_auto">自动</string>
-    <string name="dash_mode_smart">智能</string>
     <string name="dash_mode_manual">手动</string>
     <string name="dash_label_route">路由模式</string>
     <string name="dash_label_scope">应用分流</string>
@@ -411,14 +388,12 @@
     <string name="nodes_view_grid">网格</string>
     <string name="nodes_url_test">测速</string>
     <string name="nodes_url_testing">测速中</string>
-    <string name="nodes_ping_running">Ping中</string>
     <string name="nodes_mode_running_fmt">%1$s中</string>
     <string name="nodes_mode_done_fmt">%1$s完成</string>
     <string name="nodes_summary_pending_hint">完成后展示统计</string>
     <string name="nodes_summary_stats_fmt">%1$d 节点 · 成功 %2$d · 失败 %3$d</string>
     <string name="nodes_summary_tap_close">点按关闭</string>
     <string name="nodes_summary_delays_fmt">最低 %1$dms · P50 %2$dms · P95 %3$dms · 最高 %4$dms</string>
-    <string name="nodes_summary_skipped_udp_fmt">已跳过 %1$d 个 UDP 协议节点 (hysteria2/tuic/wireguard 不支持 TCP Ping, 请用测速)</string>
     <string name="nodes_summary_fail_reason_fmt">失败原因: %1$s</string>
     <string name="nodes_test_fail_generic">超时或握手失败</string>
     <string name="nodes_group_urltest_arrow">自动测速分组 ›</string>

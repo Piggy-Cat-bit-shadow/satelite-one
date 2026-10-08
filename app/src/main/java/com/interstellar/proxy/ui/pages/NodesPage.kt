@@ -105,16 +105,15 @@ fun NodesPage(viewModel: AppViewModel) {
     val mixIds by viewModel.mixSubscriptionIds.collectAsState()
     val storedSelected by viewModel.selectedOutboundTag.collectAsState()
     val gridView by viewModel.nodesGridView.collectAsState()
-    val smartState by viewModel.smartState.collectAsState()
     var sortMode by rememberSaveable { mutableStateOf(0) } // 0 延迟 1 名称
     var detailItem by remember { mutableStateOf<NodeEntry?>(null) }
     // group tabs: live groups from the core (mihomo raw configs carry their
     // own proxy-groups; rewritten configs carry ours). null = main tab.
     var activeTab by rememberSaveable { mutableStateOf<String?>(null) }
 
-    // 虚拟 自动/智能 分组只在程序自己生成的配置结构上有意义:机场原始
-    // 配置自带自动选择分组,再插一个只会重复,且其选择目标 (auto/smart)
-    // 在原始配置里不存在,点了必然无效。判定:存在我们生成的 auto 组。
+    // 虚拟 自动 分组只在程序自己生成的配置结构上有意义:机场原始配置自带
+    // 自动选择分组,再插一个只会重复,且其选择目标 (auto) 在原始配置里
+    // 不存在,点了必然无效。判定:存在我们生成的 auto 组。
     val autoGroup = groups.find { it.tag == ConfigBuilder.AUTO_TAG }
     val virtualTabs = autoGroup != null
 
@@ -126,7 +125,6 @@ fun NodesPage(viewModel: AppViewModel) {
     val currentTab: com.interstellar.proxy.core.CoreGroup? =
         activeTab?.let { t -> groups.find { it.tag == t } } ?: mainGroup
     val isMainTab = currentTab?.tag == mainGroup?.tag
-    val isSmartTab = virtualTabs && activeTab == ConfigBuilder.SMART_TAG
     val tabSelectable = currentTab?.type?.equals("selector", ignoreCase = true) == true
     // the pool the generated config runs on: active sub, or the mix union
     val storedNodes = remember(subscriptions, activeId, mixEnabled, mixIds) {
@@ -146,25 +144,20 @@ fun NodesPage(viewModel: AppViewModel) {
         }
     }
 
-    // ── 底部测速/Ping 进度条与完成摘要 ──
+    // ── 底部测速进度条与完成摘要 ──
     val testProg by viewModel.testProgress.collectAsState()
-    val pingRunning by viewModel.pinging.collectAsState()
-    val pingProg by viewModel.pingProgress.collectAsState()
     var testSummary by remember { mutableStateOf<NodesTestSummary?>(null) }
     var prevRunning by remember { mutableStateOf(false) }
-    var lastMode by remember { mutableStateOf("测速") }
-    val testRunning = testing || pingRunning
+    val testRunning = testing
     // resolved in composition: computeNodesTestSummary runs outside composable scope
     val genericFailNote = stringResource(R.string.nodes_test_fail_generic)
     LaunchedEffect(testRunning) {
         if (testRunning) {
-            lastMode = if (pingRunning) "Ping" else "测速"
             testSummary = null // a new run clears the old summary
         } else if (prevRunning) {
             // just finished — snapshot stats over the current pool tags
             val tags = ConfigBuilder.tagsFor(storedNodes)
-            val pingReport = if (lastMode == "Ping") viewModel.lastPingReport else null
-            testSummary = computeNodesTestSummary(lastMode, tags, delays, pingReport, genericFailNote)
+            testSummary = computeNodesTestSummary(tags, delays, genericFailNote)
         }
         prevRunning = testRunning
     }
@@ -223,9 +216,6 @@ fun NodesPage(viewModel: AppViewModel) {
         val groupItems = remember(allItems) {
             allItems.filter(::isGroupItem).filterNot { it.tag == ConfigBuilder.AUTO_TAG }
         }
-        // smart mode is only ever visible in the STORED selection (the live
-        // group always names a concrete node) — it wins the highlight race;
-        // on the smart tab highlight the node the engine currently rides.
         // Selection precedence: LIVE core state first (fresh truth), then the
         // stored pick (instant feedback while the stopped core just baked it
         // into the config), then the config's baked default. Static-first
@@ -235,13 +225,11 @@ fun NodesPage(viewModel: AppViewModel) {
         val mainRuntimeSelected: String? = when {
             mainGroup == null -> null
             else -> liveSelectedByTag[mainGroup.tag]
-                ?: storedSelected?.takeIf { it.isNotBlank() && it != ConfigBuilder.SMART_TAG }
+                ?: storedSelected?.takeIf { it.isNotBlank() }
                 ?: mainGroup.selected
         }?.takeIf { it.isNotBlank() }
         val selectedTag = when {
-            isSmartTab -> smartState.currentTag ?: ""
             !isMainTab -> runtimeSelected ?: ""
-            storedSelected == ConfigBuilder.SMART_TAG -> ConfigBuilder.SMART_TAG
             else -> {
                 val sel = mainRuntimeSelected
                 // 选中项本身是个分组(auto / 机场 ♻️)时,高亮穿透到该分组
@@ -274,7 +262,6 @@ fun NodesPage(viewModel: AppViewModel) {
         val tabs = buildList {
             if (virtualTabs) {
                 add(GroupTab(ConfigBuilder.AUTO_TAG, auto = true))
-                add(GroupTab(ConfigBuilder.SMART_TAG, auto = false))
             }
             groups.filterNot { virtualTabs && it.tag == ConfigBuilder.AUTO_TAG }.forEach {
                 add(GroupTab(it.tag, auto = it.type.equals("urltest", ignoreCase = true)))
@@ -286,13 +273,6 @@ fun NodesPage(viewModel: AppViewModel) {
                 selectedTag = activeTab ?: mainGroup?.tag,
                 onSelect = { tag ->
                     when {
-                        tag == ConfigBuilder.SMART_TAG -> {
-                            activeTab = ConfigBuilder.SMART_TAG
-                            // tapping the smart tab engages the engine (a node
-                            // pick inside exits it, mirroring the old card)
-                            viewModel.selectSmartMode()
-                        }
-
                         else -> {
                             activeTab = if (tag == mainGroup?.tag) null else tag
                             // tapping a urltest group tab (自动 / airport ♻️)
@@ -393,54 +373,6 @@ fun NodesPage(viewModel: AppViewModel) {
                     Text(stringResource(R.string.nodes_url_test), color = colors.primary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
-            Spacer(Modifier.width(8.dp))
-            // 直连 TCP Ping：不依赖内核，即时并发，结果流式回填
-            val pinging by viewModel.pinging.collectAsState()
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(if (pinging) colors.primaryMuted else colors.bgDeep)
-                    .pressableClick { viewModel.tcpPingPool() }
-                    .padding(horizontal = 14.dp, vertical = 10.dp),
-            ) {
-                if (pinging) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        val transition = androidx.compose.animation.core.rememberInfiniteTransition(label = "spinP")
-                        val sweep by transition.animateFloat(
-                            initialValue = 0f,
-                            targetValue = 360f,
-                            animationSpec = androidx.compose.animation.core.infiniteRepeatable(
-                                androidx.compose.animation.core.tween(
-                                    900,
-                                    easing = androidx.compose.animation.core.LinearEasing,
-                                ),
-                            ),
-                            label = "spinPA",
-                        )
-                        androidx.compose.foundation.Canvas(modifier = Modifier.size(14.dp)) {
-                            drawArc(
-                                color = colors.accent,
-                                startAngle = sweep,
-                                sweepAngle = 270f,
-                                useCenter = false,
-                                style = androidx.compose.ui.graphics.drawscope.Stroke(
-                                    2.dp.toPx(),
-                                    cap = androidx.compose.ui.graphics.StrokeCap.Round,
-                                ),
-                            )
-                        }
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            stringResource(R.string.nodes_ping_running),
-                            color = colors.accent,
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                    }
-                } else {
-                    Text("Ping", color = colors.accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                }
-            }
         }
         Spacer(Modifier.height(10.dp))
 
@@ -459,8 +391,7 @@ fun NodesPage(viewModel: AppViewModel) {
         if (testRunning || testSummary != null) {
             TestSummaryBar(
                 running = testRunning,
-                mode = lastMode,
-                progress = if (pingRunning) pingProg else testProg,
+                progress = testProg,
                 summary = testSummary,
                 onDismiss = { testSummary = null },
                 modifier = Modifier.padding(bottom = 8.dp),
@@ -481,7 +412,6 @@ fun NodesPage(viewModel: AppViewModel) {
         val nodeCtx = androidx.compose.ui.platform.LocalContext.current
         val onNodeTap: (NodeEntry) -> Unit = { item ->
             when {
-                item.tag == ConfigBuilder.SMART_TAG -> viewModel.selectSmartMode()
                 // urltest groups pick their own node — selection taps are no-ops
                 !tabSelectable && !isMainTab -> Unit
                 else -> viewModel.selectNode(currentTab?.tag ?: ConfigBuilder.GROUP_TAG, item.tag)
@@ -503,10 +433,7 @@ fun NodesPage(viewModel: AppViewModel) {
                     contentPadding = PaddingValues(bottom = 12.dp),
                     modifier = Modifier.fillMaxSize(),
                 ) {
-                items(displayed, key = { it.tag }) { item ->
-                    androidx.compose.foundation.layout.Box(
-                        modifier = Modifier.alpha(if (item.tag == ConfigBuilder.SMART_TAG && selectedTag != ConfigBuilder.SMART_TAG) 0.6f else 1f),
-                    ) {
+                    items(displayed, key = { it.tag }) { item ->
                         NodeGridCell(
                             item = item,
                             delay = delays[item.tag] ?: item.delay,
@@ -515,7 +442,6 @@ fun NodesPage(viewModel: AppViewModel) {
                             onLongPress = { if (!isGroupItem(item)) detailItem = item },
                         )
                     }
-                }
                 }
             }
         } else {
@@ -527,17 +453,13 @@ fun NodesPage(viewModel: AppViewModel) {
                     .fillMaxWidth(),
             ) {
                 items(displayed, key = { it.tag }) { item ->
-                    Box(
-                        modifier = Modifier.alpha(if (item.tag == ConfigBuilder.SMART_TAG && selectedTag != ConfigBuilder.SMART_TAG) 0.6f else 1f),
-                    ) {
-                        NodeRow(
-                            item = item,
-                            delay = delays[item.tag] ?: item.delay,
-                            selected = item.tag == selectedTag,
-                            onClick = { onNodeTap(item) },
-                            onLongPress = { if (!isGroupItem(item)) detailItem = item },
-                        )
-                    }
+                    NodeRow(
+                        item = item,
+                        delay = delays[item.tag] ?: item.delay,
+                        selected = item.tag == selectedTag,
+                        onClick = { onNodeTap(item) },
+                        onLongPress = { if (!isGroupItem(item)) detailItem = item },
+                    )
                 }
             }
         }
@@ -548,9 +470,8 @@ fun NodesPage(viewModel: AppViewModel) {
     }
 }
 
-/** Stats snapshot shown after a url-test / ping run finishes. */
+/** Stats snapshot shown after a url-test run finishes. */
 private data class NodesTestSummary(
-    val mode: String,
     val total: Int,
     val okCount: Int,
     val minMs: Int,
@@ -558,37 +479,22 @@ private data class NodesTestSummary(
     val p50: Int,
     val p95: Int,
     val failed: Int = 0,
-    /** Aggregated failure reasons ("超时 12 · 连接被拒 3"), or a generic note for kernel tests. */
+    /** Generic note for nodes the kernel reported as timed out / failed. */
     val failNote: String? = null,
-    /** UDP-protocol nodes TCP ping can't cover (use url-test instead). */
-    val skippedUdp: Int = 0,
 )
 
 /** ok = tested with a real delay (sentinels and untested excluded). */
 private fun computeNodesTestSummary(
-    mode: String,
     tags: List<String>,
     delays: Map<String, Int>,
-    pingReport: com.interstellar.proxy.ui.AppViewModel.PingReport? = null,
     genericFailNote: String,
 ): NodesTestSummary {
     val values = tags.mapNotNull { tag ->
         delays[tag]?.takeIf { it > 0 && it < 65_000 }
     }.sorted()
     fun pct(p: Double) = if (values.isEmpty()) 0 else values[((values.size - 1) * p).toInt()]
-    val skippedUdp = pingReport?.skippedUdp ?: 0
-    val failed = pingReport?.failed ?: (tags.size - values.size - 0).coerceAtLeast(0)
-    val failNote = when {
-        failed <= 0 -> null
-
-        pingReport != null && pingReport.reasons.isNotEmpty() ->
-            pingReport.reasons.entries.sortedByDescending { it.value }
-                .joinToString(" · ") { "${it.key} ${it.value}" }
-
-        else -> genericFailNote
-    }
+    val failed = (tags.size - values.size).coerceAtLeast(0)
     return NodesTestSummary(
-        mode = mode,
         total = tags.size,
         okCount = values.size,
         minMs = values.firstOrNull() ?: 0,
@@ -596,23 +502,20 @@ private fun computeNodesTestSummary(
         p50 = pct(0.50),
         p95 = pct(0.95),
         failed = failed,
-        failNote = failNote,
-        skippedUdp = skippedUdp,
+        failNote = if (failed > 0) genericFailNote else null,
     )
 }
 
 @Composable
 private fun TestSummaryBar(
     running: Boolean,
-    mode: String,
     progress: Pair<Int, Int>?,
     summary: NodesTestSummary?,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalInterstellarColors.current
-    // lastMode stores the raw functional value ("Ping"/"测速") — localize at display
-    val modeLabel = if (mode == "Ping") "Ping" else stringResource(R.string.nodes_url_test)
+    val modeLabel = stringResource(R.string.nodes_url_test)
     Column(
         modifier = modifier
             .fillMaxWidth()
@@ -655,8 +558,7 @@ private fun TestSummaryBar(
                 trackColor = colors.primaryMuted,
             )
         } else if (summary != null) {
-            val summaryModeLabel =
-                if (summary.mode == "Ping") "Ping" else stringResource(R.string.nodes_url_test)
+            val summaryModeLabel = stringResource(R.string.nodes_url_test)
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     stringResource(R.string.nodes_mode_done_fmt, summaryModeLabel),
@@ -691,14 +593,6 @@ private fun TestSummaryBar(
                     color = colors.textTertiary,
                     fontSize = 12.sp,
                     fontFamily = FontFamily.Monospace,
-                )
-            }
-            if (summary.skippedUdp > 0) {
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    stringResource(R.string.nodes_summary_skipped_udp_fmt, summary.skippedUdp),
-                    color = colors.warning,
-                    fontSize = 11.sp,
                 )
             }
             if (summary.failNote != null) {

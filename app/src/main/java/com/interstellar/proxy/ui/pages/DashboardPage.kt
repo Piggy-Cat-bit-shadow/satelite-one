@@ -291,7 +291,6 @@ fun DashboardPage(
             val scopeOn = proxyScope.on
             val switchModeLabel = when (storedSelected) {
                 ConfigBuilder.AUTO_TAG -> stringResource(R.string.dash_mode_auto)
-                ConfigBuilder.SMART_TAG -> stringResource(R.string.dash_mode_smart)
                 else -> stringResource(R.string.dash_mode_manual)
             }
             Row(
@@ -310,16 +309,6 @@ fun DashboardPage(
                 StatusChip(label = stringResource(R.string.dash_label_switch), value = switchModeLabel) {
                     onOpenTab(MainTab.Nodes)
                 }
-            }
-
-            // 智能模式状态行: 悬于内核切换上方
-            if (storedSelected == ConfigBuilder.SMART_TAG) {
-                val smartState by viewModel.smartState.collectAsState()
-                SmartStatusLine(
-                    state = smartState,
-                    running = running,
-                    onClick = { onOpenTab(MainTab.Nodes) },
-                )
             }
 
             Spacer(Modifier.height(8.dp))
@@ -654,50 +643,6 @@ private fun InstrumentCard(
 }
 
 /** All four dashboard instruments share one exact height so the grid stays uniform. */
-/** Smart-mode status line, shown above the core segment while smart is on. */
-@Composable
-private fun SmartStatusLine(
-    state: com.interstellar.proxy.ui.SmartSwitchEngine.SmartState,
-    running: Boolean,
-    onClick: () -> Unit,
-) {
-    val colors = LocalInterstellarColors.current
-    val context = androidx.compose.ui.platform.LocalContext.current
-    val delayText = state.currentDelayMs.takeIf { it > 0 }?.let { "${it}ms" }
-    val body = when {
-        !running -> stringResource(R.string.smart_idle_hint)
-        state.alert != null -> com.interstellar.proxy.ui.LocalizedNames.smartAlertText(context, state.alert)
-        else -> buildString {
-            append(com.interstellar.proxy.ui.LocalizedNames.smartPhaseText(context, state.phase))
-            state.currentTag?.let { append(" · " + com.interstellar.proxy.ui.LocalizedNames.groupName(context, it)) }
-            delayText?.let { append(" · $it") }
-        }
-    }
-    Row(
-        horizontalArrangement = Arrangement.Center,
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .fillMaxWidth()
-            .pressableClick(onClick = onClick)
-            .padding(horizontal = 8.dp, vertical = 2.dp),
-    ) {
-        Text(
-            stringResource(R.string.group_smart),
-            color = colors.primary,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.SemiBold,
-        )
-        Spacer(Modifier.width(6.dp))
-        Text(
-            body,
-            color = if (state.alert != null) colors.warning else colors.textTertiary,
-            fontSize = 11.sp,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.padding(end = 4.dp),
-        )
-    }
-}
 
 @Composable
 private fun StatusChip(label: String, value: String, onClick: () -> Unit) {
