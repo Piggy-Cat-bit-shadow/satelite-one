@@ -311,14 +311,14 @@ CommandServer  : close, closeService, pause, wake
 gradlew.bat --no-daemon --max-workers=2 --console=plain :app:testDebugUnitTest :app:compileDebugKotlin
 ```
 
-**`192 PASS / 0 FAIL / 0 ERROR / 0 SKIP`，19 个测试类**（起始 `58b8309` 为 176/18 类）。
+**`195 PASS / 0 FAIL / 0 ERROR / 0 SKIP`，19 个测试类**（起始 `58b8309` 为 176/18 类）。
 `:app:compileDebugKotlin` PASS。
 
 本轮新增/扩充：
 
 | 类 | 变化 |
 |---|---|
-| `ScreenFactOrderingTest` | **新增 12 例**：A01 陈旧快照必须被拒 / A02 正常顺序 / A03 启动即息屏 / A04 幂等 / A04b 只有真实跳变才递增版本 / A05 完整事件流 / A06 100 次交替 / A07 旧形状破坏性对照 / B01 屏幕处理文件不得调用 wake/pause / B02 不得含重连与定时原语 / A08+A09 install 闩（含 8 线程×200 轮）/ **E01** 网络路径不得触及唤醒事实 / **E02** reportDeviceWake 唯一产生点且必须是 USER_PRESENT / **E03** 屏幕处理文件不得重建隧道 |
+| `ScreenFactOrderingTest` | **新增 15 例**：A01 陈旧快照必须被拒 / A02 正常顺序 / A03 启动即息屏 / A04 幂等 / A04b 只有真实跳变才递增版本 / A05 完整事件流 / A06 100 次交替 / A07 旧形状破坏性对照 / B01 屏幕处理文件不得调用 wake/pause / B02 不得含重连与定时原语 / A08+A09 install 闩（含 8 线程×200 轮）/ **E01** 网络路径不得触及唤醒事实 / **E02** reportDeviceWake 唯一产生点且必须是 USER_PRESENT / **E03** 屏幕处理文件不得重建隧道/ **E01** 网络路径不得触及唤醒事实 / **E02** reportDeviceWake 唯一产生点且必须是 USER_PRESENT / **E03** 屏幕处理文件不得重建隧道 |
 | `PlatformFactsTest` | **+4 例**：B 在 A 被 drain 期间保持绑定并继续收事件 / 不可证明的 drain 必须返回 false 且不挂死（真实 5 s 超时路径）/ 全部 trim 级别原样按序到达 / detach 后不再收到 trim |
 
 ### E-5 破坏性对照汇总
@@ -333,7 +333,8 @@ gradlew.bat --no-daemon --max-workers=2 --console=plain :app:testDebugUnitTest :
 | 项 | 值 |
 |---|---|
 | 上一轮真实构建 run | `37985013617` on `58b8309`（`core_ref=c35faabf…`）：**success**，含 `Unit tests`、`Validate core provenance`、`Assemble debug APK` |
-| 本轮最终 SHA 的 CI | **`CI_NOT_RUN`** —— 本轮 3 个 commit（`7275c0f` / `32cc6cc` / `a5a6783`）推送后**未取回 Actions 结论**，故不声称其通过 |
+| 候选 APK 构建（在最终 HEAD 上） | run **`37994573941`** on **`1efaa8f`** |
+| 候选 APK 构建（前一次） | run `37993838252` on `c9691263`：**success**。因随后又推送了纯测试提交，为保持“候选 APK == 最终 SHA”的身份精确，在最终 SHA 上重新 dispatch；两者 `core_ref` 均为 `c35faabf…` |
 | 候选 APK 是否已用于设备复测 | **否** —— APK 已构建成功，但**尚未安装与复跑**，见 F 节 |
 
 ---
@@ -368,7 +369,7 @@ gradlew.bat --no-daemon --max-workers=2 --console=plain :app:testDebugUnitTest :
 | `EMULATOR_ONLY` | ✅ 全部设备证据均来自 `emulator-5554` |
 | `POWER_NOT_QUANTIFIED` | ✅ 无对照功耗样本，不写省电百分比 |
 | `REAL_DEVICE_PENDING` | ✅ |
-| `CI_NOT_RUN`（本轮最终 SHA） | ✅ 本轮 5 个 commit 推送后未取回 Actions 结论 |
+| `CANDIDATE_BUILT_NOT_RETESTED` | ✅ 候选 APK 已在最终 SHA 上构建，**但尚未安装到设备复跑**。因此“改前成功、改后未测”的风险**未消除** |
 | **不写** | `READY_FOR_RELEASE`、`REAL_DEVICE_PASS`、`FULL_APPLE_PARITY` |
 
 ### G-1 剩余事项
@@ -376,7 +377,7 @@ gradlew.bat --no-daemon --max-workers=2 --console=plain :app:testDebugUnitTest :
 1. **Gate 4-B**：在 `58b8309` 原版上跑息屏/网络基线，再用 `core_ref=c35faabf…` 构建**新 APK**
    复跑同场景。本段**未执行**，因此"修改前成功、修改后未测"的假验收风险**尚未消除**。
 2. **T01–T12**：设备端场景矩阵，见 D 节。
-3. **本轮最终 SHA 的 CI**：未取回。
+3. **Gate 4-B 的设备复测**：候选 APK 已构建，**尚未安装复跑** —— 当前最主要的未闭环项。
 4. **真机验收**：OEM 省电、蜂窝切换、实体热点、长 Doze、真实 `onRevoke`。
 
 ### G-2 需要内核介入的将来工单（**不立即操作内核**）
