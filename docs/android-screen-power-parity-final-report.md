@@ -223,6 +223,11 @@ CommandServer  : close, closeService, pause, wake
 3. **充电态屏蔽了 Doze。** `dumpsys deviceidle` 报 `mCharging=true`，Doze 在充电时不进入，
    所以也无法用"强制 Doze 后观察"这条替代路径。
 
+4. **测量陷阱（记录备查）**：测试用的本地出口日志**会轮转** —— 实测同一时刻按行计数得 265 条而
+   日志内的高水位编号已到 242，且两次外部计数从 274 变成 265。"新连接数 = 后计数 − 前计数"因此会
+   算出 **0 的假阴性**。本次是靠**时间戳**（t≈12274 s 落在窗口内）才判对的。凡用该日志做增量统计，
+   都必须改用时间戳区间，不能用计数差。
+
 **结论**：这一项需要**真机 + 真实前台业务流（下载/通话/热点）**才能测，属
 `REAL_DEVICE_PENDING`，在模拟器上标 `NOT_RUN` 是准确的，不该用间接证据冒充。
 
@@ -236,11 +241,11 @@ CommandServer  : close, closeService, pause, wake
 | T01 | 亮屏使用 10 分钟 | **NOT_RUN** | 未做长时基线 |
 | T02 | 关屏 3 秒再亮屏 | **PARTIAL** | D-0 已证明屏幕事实序列正确、无额外重连；**未测**首包延迟等延迟指标 |
 | T03 | 关屏 5 秒再亮屏 | **PARTIAL** | 同上 |
-| T04 | 关屏 15 秒再解锁 | **BLOCKED** | 实测 `isKeyguardShowing=false` 且 `mDreamingLockscreen=false`，本 AVD **不显示锁屏**，`ACTION_USER_PRESENT` 不会发出 —— 解锁沿无从产生 |
+| T04 | 关屏 15 秒再解锁 | **BLOCKED** | 两条独立证据：① `locksettings get-disabled` = **true**，本 AVD 根本没有锁屏（`isKeyguardShowing=false`、`mDreamingLockscreen=false`）；② 尝试直接投递该广播被平台拒绝：`am broadcast -a android.intent.action.USER_PRESENT` → **`SecurityException: not allowed to send broadcast … from uid=2000`**（受保护广播，shell 身份发不出）。因此解锁沿在本环境既**不会自然发生**也**无法人工触发** |
 | T05 | 关屏 2 / 15 / 30 分钟 | **BLOCKED** | `dumpsys deviceidle` 报 `mCharging=true`，Doze 在充电时不进入 |
-| T06 | 锁屏通知亮屏不解锁 ×10 | **BLOCKED** | 同 T04：无锁屏可亮 |
+| T06 | 锁屏通知亮屏不解锁 ×10 | **BLOCKED** | 同 T04：无锁屏可亮（`locksettings get-disabled=true`） |
 | T07 | 息屏时通话 / 下载 / 热点 | **BLOCKED** | 模拟器无蜂窝、无热点、无真实通话 |
-| T08 | 屏幕开着但 App 在后台，其他 App 走 VPN | **PARTIAL** | App 退后台（HOME，**屏幕保持点亮**）后事实链正确：`platform fact: foreground=false`，`screen` **未**变化（仍为 true）—— 两个事实确实独立；隧道全程存活（`tun0=1`、FGS 1、pid 不变）、**0 次重连**。**但**该 45 s 窗口内出口 0 条新连接，所以"其他 App 的流量继续被转发"这条**未取得流量证据** |
+| T08 | 屏幕开着但 App 在后台，其他 App 走 VPN | **PASS** | App 退后台（HOME，**屏幕保持点亮**）后 `platform fact: foreground=false attached=true`，而 `screen` **未**变化 —— 两个事实确实独立。**并且该窗口内真的发生了隧道路径流量**：出口在 t≈12274 s 记录 4 条新 CONNECT（`www.gstatic.com:443`、`1.1.1.1:443`、`74.125.137.188:5228`，源端口 61331–61337，即 GMS 新开的连接），全部走 `10.0.2.2:18080` 这条隧道。隧道全程存活（`tun0=1`、FGS 1、pid 不变）、**0 次重连**、0 crash。**这是 G4「退后台不得断开他人流量」的直接证据** |
 | T09 | 关屏过程中 Wi-Fi↔蜂窝切换 | **BLOCKED** | 模拟器无蜂窝 |
 | T10 | 屏幕关闭期间 Stop/Start/Start/Stop | **NOT_RUN（方法不可行）** | 实测把屏幕关掉后注入的点击**根本不到达应用**：6 轮盲点之后 `startProxy invoked` 计数为 **0**，即那 6 轮**没有发生**。显示屏关闭时注入触摸由显示控制器丢弃，因此"息屏期间用 UI 触发 Stop/Start"在本手段下不可行。旁证：`screen=false`/`foreground=false` 两条事实被正确采集，隧道全程未断、0 次重连 —— 但这**不能**替代本场景 |
 | T11 | 应用被系统结束后重启 | **PASS** | `am kill` 被**拒绝**（应用持有前台服务，实测 pid 不变）；改用 `am force-stop`：pid 消失、`tun0=0`、通知 0（资源全部释放），重新拉起 pid 变化，启动时事实正确上报 `screen-seed=true` 与 `foreground=true`，`attached=false`（内核确实尚未启动）。0 crash |
