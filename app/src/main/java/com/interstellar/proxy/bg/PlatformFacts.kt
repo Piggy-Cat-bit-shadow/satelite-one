@@ -27,6 +27,9 @@ import kotlinx.coroutines.launch
  * threshold, no timer, no RSS polling, no reconnect, and no pause. The one rule it
  * upholds is: *Android reports facts, the core decides actions.*
  *
+ * (The RSS the home page shows comes from the core's own StatusMessage, not from
+ * anything here — and it is the process RSS from /proc/self/statm, not Go's heap.)
+ *
  * ## Ownership
  *
  * Every [attach] creates a [Session] token. A delivery may only touch the bridge it

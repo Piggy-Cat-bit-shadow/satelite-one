@@ -405,6 +405,8 @@ fun DashboardPage(
             ) {
                 // 运行状态: 直接复用 StatusMessage 的 memory / goroutines。
                 // 没有新增 CommandClient, 没有轮询; 内核未运行时显示 "—" 而不是假的 0。
+                // memory 是内核从 /proc/self/statm 读到的**整个进程 RSS**(非 PSS,
+                // 也不是 Go heap), goroutines 是 sing-box 内的 Go 协程数。
                 InstrumentCard(
                     caption = stringResource(R.string.dash_caption_runtime),
                     modifier = Modifier.weight(1f),

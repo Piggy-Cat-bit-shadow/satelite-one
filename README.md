@@ -54,11 +54,20 @@ UI 采用「航空航天玻璃 + 任务控制台」设计语言：深空底色�
 
 - **VPN / TUN**：`VpnService` + libbox `openTun`，节点服务器 IP 自动排除出路由防止回环
 - **分应用代理**：白名单 / 黑名单，经 `OverrideOptions` 热应用
-- **doze pause / wake**：`ACTION_DEVICE_IDLE_MODE_CHANGED` 驱动内核 pause/wake，
-  熄屏进 Doze 的低功耗逻辑不被绕开
+- **平台事实桥（`PlatformFacts`）**：App 只上报原始 Android 事实 —— `onTrimMemory`
+  的原始 level、App 前后台、屏幕开关、`USER_PRESENT` —— 交给内核的共享移动策略决定
+  动作。App 侧不做 level 映射、不做阈值、不 trim、不 reconnect、不 pause：
+  熄屏/Doze/内存压力下的行为由内核决定，Android 只负责如实报告。
+  旧的 `ACTION_DEVICE_IDLE_MODE_CHANGED → core.pause()/wake()` 驱动已退休
+  （两套状态机写同一个 device 状态会互相打架）。
 - **网络切换**：`DefaultNetworkMonitor` 跟踪物理网络，Wi-Fi ↔ 蜂窝切换后内核自动重连
 - **通知与快捷磁贴**：常驻通知显示实时上下行，磁贴一键连接/断开
 - **实时流量**：`CommandClient` 的 `Status`（1s 间隔）提供上下行速率与本次内核生命周期累计值
+- **流量统计的可用性边界**：统计来自内核的 `trafficcontrol.Manager`。自动生成的配置
+  用一个**空的** `experimental.clash_api: {}` enabled 它 —— 空对象不会监听任何端口
+  （内核只在 `external_controller` 非空时才 `net.Listen`）。用户直接导入的原始
+  sing-box JSON 则**逐字节透传、不做任何注入**，这类配置若未启用统计，App 显示
+  "统计不可用" 而不是伪装成 `0 kB/s`：未知 ≠ 0。
 
 ## 架构
 
@@ -85,7 +94,8 @@ app/src/main/java/com/interstellar/proxy/
 │   ├── CoreGroup.kt       #   UI 用的中性 outbound 分组 DTO
 │   └── AppLog.kt
 ├── bg/                    # 服务层（移植自 sing-box-for-android 最小集）
-│   ├── BoxService.kt      #   启停编排、通知、Doze pause/wake
+│   ├── BoxService.kt      #   启停编排、通知、统一的幂等 core 释放
+│   ├── PlatformFacts.kt   #   Android 事实 → 内核（会话令牌 + 串行投递 + drain）
 │   ├── VPNService.kt      #   VpnService，把 tun fd 交给 libbox
 │   ├── ProxyService.kt    #   无 TUN 的 headless 内核（断连测速用）
 │   ├── PlatformInterfaceWrapper.kt
@@ -95,7 +105,7 @@ app/src/main/java/com/interstellar/proxy/
 ├── data/
 │   ├── ConfigStore.kt / Settings.kt / UpdateWorker.kt
 │   ├── SubscriptionRepository.kt
-│   ├── config/ConfigBuilder.kt        # sing-box JSON 生成
+│   ├── config/MinimalConfigBuilder.kt # 最小 sing-box JSON 生成
 │   ├── subscription/                  # Clash YAML / 分享链接 / sing-box JSON 解析
 │   └── net/                           # 订阅抓取、更新检查
 └── ui/                    # Compose 页面、组件、主题

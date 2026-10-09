@@ -82,10 +82,24 @@ fun bytesOrUnknown(
 /**
  * Kernel runtime footprint, taken verbatim from the existing Status stream.
  *
- * `memory` is the Go heap the kernel reports and `goroutines` is
- * `runtime.NumGoroutine()` inside sing-box — NOT a Kotlin coroutine count. Both
- * arrive on the StatusMessage we already subscribe to, so the home page needs no
- * extra command client, no polling and no /proc reading.
+ * Definitions, verified against the pinned core rather than assumed
+ * (`daemon/started_service.go` `readStatus`):
+ *
+ *  - `memory` = `memory.Total()`. On Android that is `common/memory`'s
+ *    `totalNative()`, which reads **`/proc/self/statm`** and returns the resident
+ *    field × page size. It is therefore the **resident set size of this whole
+ *    process** — libbox is linked in-process, so that includes the Kotlin/Java heap
+ *    and every native allocation, not just Go's. It is **RSS, not PSS**: shared
+ *    pages count in full, so it does not sum across processes and is not
+ *    comparable to `dumpsys meminfo`'s TOTAL PSS.
+ *  - `goroutines` = `runtime.NumGoroutine()` inside sing-box — Go goroutines, NOT a
+ *    Kotlin coroutine count.
+ *
+ * Both arrive on the StatusMessage we already subscribe to, so the home page needs
+ * no extra command client, no polling and no /proc reading of its own.
+ *
+ * One sample is a snapshot, not a trend: it must not be quoted as evidence of a
+ * leak, of a fix, or as a memory budget.
  */
 data class RuntimeState(
     val memoryBytes: Long = 0,
