@@ -49,9 +49,14 @@ fun LogsPage(viewModel: LogsViewModel) {
             last == null || last.index >= info.totalItemsCount - 2
         }
     }
-    // Auto-follow only while they are at the bottom: scrolling up to read history
-    // must never be yanked back down by the next arriving line. scrollToItem (not
-    // animate) because a per-batch animation piles up under a log burst.
+    // A log viewer opens at the END, not the start: the retained history is there
+    // to scroll back through, but the first thing shown must be the newest line.
+    LaunchedEffect(Unit) {
+        if (logs.isNotEmpty()) listState.scrollToItem(logs.size - 1)
+    }
+    // After that, auto-follow only while the user is at the bottom: scrolling up to
+    // read history must never be yanked back down by the next arriving line.
+    // scrollToItem (not animate) because a per-batch animation piles up under a burst.
     LaunchedEffect(logs.size) {
         if (logs.isNotEmpty() && atBottom) listState.scrollToItem(logs.size - 1)
     }
