@@ -95,6 +95,7 @@
     <string name="dash_runtime_memory">Memory</string>
     <string name="dash_runtime_goroutines">Go goroutines</string>
     <string name="dash_traffic_summary">Σ %1$s</string>
+    <string name="dash_traffic_unavailable">Stats unavailable</string>
     <string name="dash_mix_subs">Mix · %1$d subs</string>
     <string name="dash_subs_none">None</string>
     <string name="dash_caption_subs">Subscription</string>

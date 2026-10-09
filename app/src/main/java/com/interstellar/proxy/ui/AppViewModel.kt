@@ -39,7 +39,45 @@ data class SpeedState(
     val downlinkPerSecond: Long = 0,
     val uplinkTotal: Long = 0,
     val downlinkTotal: Long = 0,
+    /**
+     * Whether the running config actually has the kernel's traffic manager.
+     *
+     * Auto-generated configs enable it (see MinimalConfigBuilder's empty
+     * `clash_api`). A user-supplied raw sing-box JSON is handed to the kernel
+     * byte-for-byte and may never enable it — in that case there are NO statistics,
+     * which is a different statement from "measured zero".
+     */
+    val trafficAvailable: Boolean = false,
 )
+
+/**
+ * How byte counters should present themselves.
+ *
+ * Pure so all three states can be unit-tested without a kernel. [Unavailable] is
+ * kept distinct from a zero reading on purpose: rendering `0 kB/s` for a config
+ * that has no traffic manager at all would claim a measurement that never
+ * happened.
+ */
+enum class TrafficDisplay { Idle, Unavailable, Live }
+
+/** [running] is the core status; [trafficAvailable] is StatusMessage.trafficAvailable. */
+fun trafficDisplay(running: Boolean, trafficAvailable: Boolean): TrafficDisplay = when {
+    !running -> TrafficDisplay.Idle
+    trafficAvailable -> TrafficDisplay.Live
+    else -> TrafficDisplay.Unavailable
+}
+
+/**
+ * Byte counter for the UI: never disguises "no statistics" as a measured zero.
+ *
+ * [format] is injectable so this policy is unit-testable without libbox (the real
+ * formatter is a native call).
+ */
+fun bytesOrUnknown(
+    value: Long,
+    trafficAvailable: Boolean,
+    format: (Long) -> String = { io.nekohasekai.libbox.Libbox.formatBytes(it) },
+): String = if (trafficAvailable) format(value) else "—"
 
 /**
  * Kernel runtime footprint, taken verbatim from the existing Status stream.
@@ -288,6 +326,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     downlinkPerSecond = status.downlink,
                     uplinkTotal = status.uplinkTotal,
                     downlinkTotal = status.downlinkTotal,
+                    // A kernel without the traffic manager reports 0 here AND sets
+                    // this false — the two must be carried together or the UI cannot
+                    // tell "idle" from "not measured".
+                    trafficAvailable = status.trafficAvailable,
                 )
                 _runtime.value = RuntimeState(
                     memoryBytes = status.memory,

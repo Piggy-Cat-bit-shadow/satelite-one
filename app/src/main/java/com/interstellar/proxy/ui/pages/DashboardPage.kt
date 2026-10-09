@@ -60,6 +60,8 @@ import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.data.SubscriptionRepository
 import com.interstellar.proxy.data.config.MinimalConfigBuilder
 import com.interstellar.proxy.ui.AppViewModel
+import com.interstellar.proxy.ui.TrafficDisplay
+import com.interstellar.proxy.ui.trafficDisplay
 import com.interstellar.proxy.ui.components.FaceMark
 import com.interstellar.proxy.ui.components.GlassButton
 import com.interstellar.proxy.ui.components.GlassButtonStyle
@@ -300,9 +302,14 @@ fun DashboardPage(
             Spacer(Modifier.height(12.dp))
 
             // ── 仪表网格：会话 / 流量 / 运行状态 / 订阅
-            val down = Libbox.formatBytes(speed.downlinkPerSecond)
-            val up = Libbox.formatBytes(speed.uplinkPerSecond)
-            val total = Libbox.formatBytes(speed.uplinkTotal + speed.downlinkTotal)
+            // Byte counters are only meaningful while the kernel reports statistics.
+            // No statistics (raw config without a traffic manager) must not be shown
+            // as a measured zero.
+            val traffic = trafficDisplay(running, speed.trafficAvailable)
+            val live = traffic == TrafficDisplay.Live
+            val down = if (live) Libbox.formatBytes(speed.downlinkPerSecond) else "—"
+            val up = if (live) Libbox.formatBytes(speed.uplinkPerSecond) else "—"
+            val total = if (live) Libbox.formatBytes(speed.uplinkTotal + speed.downlinkTotal) else "—"
 
             Row(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -353,7 +360,11 @@ fun DashboardPage(
                     modifier = Modifier.weight(1f),
                     secondary = {
                         Text(
-                            stringResource(R.string.dash_traffic_summary, total),
+                            when (traffic) {
+                                TrafficDisplay.Unavailable ->
+                                    stringResource(R.string.dash_traffic_unavailable)
+                                else -> stringResource(R.string.dash_traffic_summary, total)
+                            },
                             color = colors.textTertiary,
                             fontSize = 11.sp,
                             fontFamily = FontFamily.Monospace,

@@ -40,6 +40,7 @@ import com.interstellar.proxy.R
 import com.interstellar.proxy.constant.Status
 import com.interstellar.proxy.ui.ActiveConnection
 import com.interstellar.proxy.ui.AppViewModel
+import com.interstellar.proxy.ui.bytesOrUnknown
 import com.interstellar.proxy.ui.ConnectionsViewModel
 import com.interstellar.proxy.ui.components.GlassCard
 import com.interstellar.proxy.ui.components.pressableClick
@@ -53,6 +54,10 @@ fun ConnectionsPage(viewModel: ConnectionsViewModel, appViewModel: AppViewModel)
     val connections by viewModel.connections.collectAsState()
     val connected by viewModel.connected.collectAsState()
     val status by appViewModel.status.collectAsState()
+    val speed by appViewModel.speed.collectAsState()
+    // Per-connection byte counters come from the same kernel traffic manager the
+    // Status stream reports on: when it is absent they are not zero, they are unknown.
+    val trafficAvailable = speed.trafficAvailable
     var search by rememberSaveable { mutableStateOf("") }
     var detailId by rememberSaveable { mutableStateOf<String?>(null) }
     val kernelUp = connected || status == Status.Started || status == Status.Starting
@@ -77,7 +82,7 @@ fun ConnectionsPage(viewModel: ConnectionsViewModel, appViewModel: AppViewModel)
                     fontWeight = FontWeight.Bold,
                 )
                 Text(
-                    "↑ ${Libbox.formatBytes(totalUp)}  ↓ ${Libbox.formatBytes(totalDown)}",
+                    "↑ ${bytesOrUnknown(totalUp, trafficAvailable)}  ↓ ${bytesOrUnknown(totalDown, trafficAvailable)}",
                     color = colors.textTertiary,
                     fontSize = 12.sp,
                 )
@@ -125,7 +130,11 @@ fun ConnectionsPage(viewModel: ConnectionsViewModel, appViewModel: AppViewModel)
                 }
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     items(filtered, key = { it.id }) { conn ->
-                        ConnectionRow(conn, onOpen = { detailId = conn.id }) { viewModel.closeConnection(conn.id) }
+                        ConnectionRow(
+                            conn,
+                            trafficAvailable = trafficAvailable,
+                            onOpen = { detailId = conn.id },
+                        ) { viewModel.closeConnection(conn.id) }
                     }
                     item { Spacer(Modifier.height(12.dp)) }
                 }
@@ -136,7 +145,11 @@ fun ConnectionsPage(viewModel: ConnectionsViewModel, appViewModel: AppViewModel)
         // 连接被清理(断开移除)时自动关闭
         detailId?.let { id ->
             connections.find { it.id == id }?.let { conn ->
-                ConnectionDetailSheet(conn = conn, onDismiss = { detailId = null }) {
+                ConnectionDetailSheet(
+                    conn = conn,
+                    trafficAvailable = trafficAvailable,
+                    onDismiss = { detailId = null },
+                ) {
                     viewModel.closeConnection(conn.id)
                     detailId = null
                 }
@@ -146,7 +159,12 @@ fun ConnectionsPage(viewModel: ConnectionsViewModel, appViewModel: AppViewModel)
 }
 
 @Composable
-private fun ConnectionRow(conn: ActiveConnection, onOpen: () -> Unit, onClose: () -> Unit) {
+private fun ConnectionRow(
+    conn: ActiveConnection,
+    trafficAvailable: Boolean,
+    onOpen: () -> Unit,
+    onClose: () -> Unit,
+) {
     val colors = LocalInterstellarColors.current
     GlassCard(
         modifier = Modifier
@@ -191,12 +209,12 @@ private fun ConnectionRow(conn: ActiveConnection, onOpen: () -> Unit, onClose: (
             }
             Column(horizontalAlignment = Alignment.End) {
                 Text(
-                    "↑${Libbox.formatBytes(conn.uplink)}",
+                    "↑${bytesOrUnknown(conn.uplink, trafficAvailable)}",
                     color = colors.textSecondary,
                     fontSize = 10.sp,
                 )
                 Text(
-                    "↓${Libbox.formatBytes(conn.downlink)}",
+                    "↓${bytesOrUnknown(conn.downlink, trafficAvailable)}",
                     color = colors.primary,
                     fontSize = 10.sp,
                 )
@@ -220,6 +238,7 @@ private fun ConnectionRow(conn: ActiveConnection, onOpen: () -> Unit, onClose: (
 @Composable
 private fun ConnectionDetailSheet(
     conn: ActiveConnection,
+    trafficAvailable: Boolean,
     onDismiss: () -> Unit,
     onCloseConnection: () -> Unit,
 ) {
@@ -291,7 +310,7 @@ private fun ConnectionDetailSheet(
             )
             DetailText(
                 stringResource(R.string.conn_field_traffic),
-                "↑ ${Libbox.formatBytes(conn.uplink)}   ↓ ${Libbox.formatBytes(conn.downlink)}",
+                "↑ ${bytesOrUnknown(conn.uplink, trafficAvailable)}   ↓ ${bytesOrUnknown(conn.downlink, trafficAvailable)}",
             )
             DetailText(
                 stringResource(R.string.conn_field_started),

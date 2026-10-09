@@ -95,6 +95,7 @@
     <string name="dash_runtime_memory">内存</string>
     <string name="dash_runtime_goroutines">Go 协程</string>
     <string name="dash_traffic_summary">Σ %1$s</string>
+    <string name="dash_traffic_unavailable">统计不可用</string>
     <string name="dash_mix_subs">Mix · %1$d 订阅</string>
     <string name="dash_subs_none">未添加</string>
     <string name="dash_caption_subs">订阅</string>

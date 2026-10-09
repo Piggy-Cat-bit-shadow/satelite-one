@@ -132,8 +132,12 @@ class MinimalConfigBuilderTest {
         val text = MinimalConfigBuilder.build(nodes, MinimalConfigBuilder.BuildOptions())
         for (forbidden in listOf(
             "rule_set", "geosite", "geoip", "category-ads-all", "geolocation",
-            "clash_api", "smart", "adblock", "dns-hosts", "block",
+            "smart", "adblock", "dns-hosts", "block",
             "gvisor", "stack", "outbound_mode", "bypass_cn", "overseas",
+            // the statistics switch below is explicitly empty; any of these would
+            // turn it into a real control surface or inject mode/DNS policy
+            "external_controller", "secret", "default_mode", "store_selected",
+            "store_fakeip", "external_ui",
         )) {
             check(!text.contains(forbidden)) { "generated config must not contain '$forbidden'" }
         }
@@ -144,9 +148,33 @@ class MinimalConfigBuilderTest {
     }
 
     @Test
-    fun `experimental carries only the cache file - the command channel is libbox's own`() {
+    fun `experimental carries the cache file plus an empty clash-api statistics switch`() {
         val experimental = config()["experimental"]!!.jsonObject
-        check(experimental.keys == setOf("cache_file")) { "unexpected experimental keys: ${experimental.keys}" }
+        check(experimental.keys == setOf("cache_file", "clash_api")) {
+            "unexpected experimental keys: ${experimental.keys}"
+        }
+        check(experimental["cache_file"]!!.jsonObject["enabled"]!!.jsonPrimitive.content == "true") {
+            "cache_file must stay enabled"
+        }
+        // The whole point: an EMPTY object. It only exists because the kernel
+        // creates its shared traffic manager when experimental.clash_api != nil,
+        // which is what makes StatusMessage.TrafficAvailable real.
+        val clashApi = experimental["clash_api"]!!.jsonObject
+        check(clashApi.isEmpty()) { "clash_api must stay empty, was $clashApi" }
+    }
+
+    @Test
+    fun `the statistics switch opens no listener`() {
+        val experimental = config()["experimental"]!!.jsonObject
+        val clashApi = experimental["clash_api"]!!.jsonObject
+        // clashapi's Server.Start() only calls net.Listen when external_controller
+        // is non-empty, so an empty object means zero new TCP control ports.
+        check("external_controller" !in clashApi) { "no controller address may be configured" }
+        check("external_ui" !in clashApi) { "no external UI may be configured" }
+        val text = MinimalConfigBuilder.build(nodes, MinimalConfigBuilder.BuildOptions())
+        check(!text.contains("external_controller")) { "no controller address anywhere" }
+        check(!text.contains("19090")) { "the old clash-api port must not come back" }
+        check(!text.contains("external_ui")) { "no external UI anywhere" }
     }
 
     @Test

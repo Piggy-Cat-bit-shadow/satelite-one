@@ -100,8 +100,18 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
             }
     }
 
+    /** Last static title/text from [show]; restored when statistics are unavailable. */
+    private var staticTitle: String? = null
+    private var staticText: String? = null
+
+    /** True while the notification currently carries a live traffic line. */
+    private var showingTraffic = false
+
     fun show(profileName: String, @StringRes contentTextId: Int) {
         released = false
+        staticTitle = profileName.takeIf { it.isNotBlank() } ?: service.getString(R.string.app_name)
+        staticText = service.getString(contentTextId)
+        showingTraffic = false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             // re-creating with the same id updates the stored channel name on
             // language switches
@@ -158,12 +168,37 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
     }
 
     override fun updateStatus(status: StatusMessage) {
+        if (!status.trafficAvailable) {
+            // No kernel traffic manager for this config (a raw JSON that never
+            // enables one). Reposting "0 B/s ↑ 0 B/s ↓" every second would advertise
+            // a measurement that does not exist, so fall back to the static line.
+            restoreStaticContent()
+            return
+        }
         updateTraffic(status.uplink, status.downlink)
     }
 
-    /** Engine-agnostic traffic line (mihomo poller calls this directly). */
+    /**
+     * A kernel without a traffic manager has no rates at all; reposting "0 B/s ↑
+     * 0 B/s ↓" every second would advertise a measurement that does not exist.
+     * Falls back to the static line exactly once per transition.
+     */
+    private fun restoreStaticContent() {
+        if (!showingTraffic) return
+        showingTraffic = false
+        if (released || !Settings.dynamicNotification || !checkPermission()) return
+        val title = staticTitle ?: return
+        val text = staticText ?: return
+        InterstellarApplication.notificationManager.notify(
+            notificationId,
+            notificationBuilder.setContentTitle(title).setContentText(text).build(),
+        )
+    }
+
+    /** Engine-agnostic traffic line. */
     fun updateTraffic(upPerSecond: Long, downPerSecond: Long) {
         if (released || !Settings.dynamicNotification || !checkPermission()) return
+        showingTraffic = true
         val content =
             Libbox.formatBytes(upPerSecond) + "/s ↑\t" + Libbox.formatBytes(downPerSecond) + "/s ↓"
         InterstellarApplication.notificationManager.notify(
