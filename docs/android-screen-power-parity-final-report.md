@@ -328,6 +328,35 @@ gradlew.bat --no-daemon --max-workers=2 --console=plain :app:testDebugUnitTest :
 | 删除 `ScreenFactState` 的版本守卫 | `A01` **变红**（断言原文：`the stale isInteractive seed overwrote the newer SCREEN_OFF fact`）；恢复后全绿 |
 | 上一轮本地拼装 AAR 上机 | **变红**：`kotlin.NotImplementedError: stub at Libbox.setup` → 证明该 AAR 不可用，也正是本轮改用 CI 真实 APK 的理由 |
 
+### E-5b 候选 APK 的身份链（Gate 4-B 的"改后"包）
+
+| 项 | 值 |
+|---|---|
+| 构建 run | **`37994573941`** on **`1efaa8fe10bad07e020b2a5af6be85d3b0417c28`**（`core_ref=c35faabf…`，success） |
+| artifact | `satelite-one-debug-1efaa8fe…`，id `11646637497`，`104 734 396` B |
+| **artifact zip sha256** | `73224c9de554e7604541388432b4606ef190a4a9595421e8a7be469c65eea8b9` |
+| API 报告 digest | 同上，**逐字相同** |
+| x86_64 APK sha256 | `1826d385978655be4dd91a6272760450a4a4053a86ba6d5b4b4b8f8bbb463269` |
+| artifact 内 `SHA256SUMS.txt` | `1826d385…  ./satelite-one-x86_64-debug.apk` → **一致** |
+
+**两个 APK、一个 core —— 可直接逐字对比**：
+
+| | Baseline（改前） | Candidate（改后） |
+|---|---|---|
+| App SHA | `58b83094…` | `1efaa8fe…` |
+| run | `37985013617` | `37994573941` |
+| x86_64 APK sha256 | `53bcc399…` | `1826d385…` |
+| `libbox.so` sha256 | `f0ae9c726f8a2088a1f2e4f11ebc2ffd2947be66a0e2dda84b1d9136a7cf94c6` | **`f0ae9c726f8a2088a1f2e4f11ebc2ffd2947be66a0e2dda84b1d9136a7cf94c6`** |
+| `libbox.so` 大小 | 84 472 616 B | **84 472 616 B** |
+| 含 pin | 1 处 | **1 处** |
+
+**这是"同一 core、不同时期客户端"的字面证明**：两个包里的内核共享库**逐字节相同**，
+所以任何行为差异都只能归因于 App 代码，而不是内核。APK 本身当然不同（App 代码变了）。
+
+**候选 APK 的 App SHA 与最终 HEAD 的关系（身份精确性说明）**：候选构建落在 `1efaa8f`；
+此后 HEAD 前进到 `cae13dd`，但两者之间 `app/src/main` 的**改动文件数为 0**（只有 `docs/`
+下的报告在变）。所以候选二进制**就是**当前产品代码的产物 —— 没有改名、没有贴新 SHA。
+
 ### E-6 CI
 
 | 项 | 值 |
