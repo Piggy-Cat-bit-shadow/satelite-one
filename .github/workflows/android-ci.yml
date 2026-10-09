@@ -4,17 +4,26 @@
 # mihomo / Xray / hev 的 sidecar 构建、下载或缓存。
 name: Android CI
 
+# 触发方式: **只有手动** `workflow_dispatch`。
+#
+# 为什么不再跟随 push: 这台仓库的 Actions 分钟数由所有者自付, 而每一次 push 都去解析
+# 并(在缓存未命中时)构建内核, 代价很大 —— 尤其当 upstream `testing` 自身坏死时, 结果
+# 还是"核心构建失败 + 其余步骤 skipped", 既花了额度又什么都没验。
+#
+# 需要 app 结论时这样触发:
+#   gh workflow run android-ci.yml -f core_ref=c35faabf402a4da93b8c31cdfad941b8b1528ffc
+# 或在 Actions 页面点 "Run workflow"。留空 `core_ref` 则跟随下面的 CORE_BRANCH HEAD。
+#
+# 回退方式: 恢复下面的 `push:` / `pull_request:` 两行即可; 其余行为(内核来源、缓存 key、
+# provenance 门禁、单测、APK 组装)一律未改。
 on:
-  push:
-    branches: ['**']
-  pull_request:
   workflow_dispatch:
     inputs:
       # 手动指定要跟随的内核 revision。留空 = 跟随 CORE_BRANCH 的 HEAD。
       #
-      # 为什么需要它: 开发 CI 刻意跟随 `testing` HEAD, 所以 upstream 的 `testing` 一旦
-      # 自己坏掉, 本仓库的**每一次** push 都会在核心构建那一步失败, 而 app 自己的
-      # 单元测试与 APK 组装会被 skip —— 一个与内核无关的改动也因此拿不到 CI 结论。
+      # 为什么需要它: 开发 CI 默认跟随 `testing` HEAD, 所以 upstream 的 `testing` 一旦
+      # 自己坏掉, 本仓库的构建就会在核心构建那一步失败, 而 app 自己的单元测试与 APK
+      # 组装会被 skip —— 一个与内核无关的改动也因此拿不到 CI 结论。
       # 实测: build_libbox 写出了 libbox.provenance 却没产出 libbox.aar, 随后
       # `cp libbox.aar` 以 "No such file or directory" 失败 (2026-10-09T20:00–20:07,
       # 三个不同 SHA 上完全一致)。
@@ -23,8 +32,8 @@ on:
       # 就能在 upstream 修复期间指定一个已知良好的 revision (例如 version.properties
       # 里那个 pin) 继续取得 app 侧的完整 CI 证据。
       #
-      # 它**不**改变默认行为, 也**不**改变 pin: release-apk.yml 仍然只从
-      # version.properties 的 coreCommit 构建, 并显式比对那个 SHA。
+      # 它**不**改变 pin: release-apk.yml 仍然只从 version.properties 的 coreCommit
+      # 构建, 并显式比对那个 SHA。
       core_ref:
         description: 'sing-box revision to follow (blank = CORE_BRANCH HEAD)'
         required: false
@@ -158,7 +167,8 @@ jobs:
         run: python3 .github/scripts/test_check_core_provenance.py
 
       # 发布门禁(签名测量 + publish job 的 APK 路径)只有在 v* tag 才会真正运行,
-      # 所以它的回归必须在一个**每次 push 都跑**的地方被证明。这一条就是那个地方:
+      # 所以它的回归必须在一个**每次开发 CI 运行都跑**的地方被证明。这一条就是那个地方
+      # (本 workflow 现在是手动触发, 所以"每次运行"= 每次有人显式请求 app 结论):
       # 它读 release-apk.yml 与 measure_apk_signature.sh 本身, 检查"下载到哪里"与
       # "去哪里找"是否一致、空列表是否必然失败、以及 unsigned / debug-signed /
       # signed-by-user 的判定表是否 fail-closed。
