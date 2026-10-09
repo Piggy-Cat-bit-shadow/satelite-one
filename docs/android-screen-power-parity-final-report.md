@@ -357,6 +357,40 @@ gradlew.bat --no-daemon --max-workers=2 --console=plain :app:testDebugUnitTest :
 此后 HEAD 前进到 `cae13dd`，但两者之间 `app/src/main` 的**改动文件数为 0**（只有 `docs/`
 下的报告在变）。所以候选二进制**就是**当前产品代码的产物 —— 没有改名、没有贴新 SHA。
 
+### E-5c Gate 4-B 设备复测：候选 APK 在同一 AVD 上的回归
+
+**方法**：先卸载旧包（round-6 本地测试签名的那份，与 CI debug key 签名不兼容 →
+`INSTALL_FAILED_UPDATE_INCOMPATIBLE`），装上候选 APK，重走 UI 导入 → VPN 授权 → 连接，
+再跑同一份 20 轮 Stop → 立即 Start 压力（两次点击之间不取样，间隔 0–100 ms）。
+
+| 项 | 候选（`1efaa8f`）结果 |
+|---|---|
+| 安装 / 启动 | `Success`；pid 稳定；`adb logcat -d -b crash` **空** |
+| `NotImplementedError` / `FATAL` | **0 / 0**（29 463 行 main+crash 全量扫描） |
+| UI 导入 | 走真实 UI，字段读回为 `socks5://testuser:testpass@10.0.2.2:18080#TestSOCKS`；授权并连接后 Home 显示 **`Local subscription` / `1 nodes`** |
+| 连接闭环 | `startProxy invoked` → `activeSub=Local subscription` → `config ok length=1191` → `core STARTED`，系统侧 `I/Vpn: Established by com.interstellar.proxy.debug on tun0` |
+| `tun0` | `inet 172.19.0.1/30` |
+| 策略路由 | `12000: from all iif tun0 lookup 97` 与 `17000: from all iif lo oif tun0 uidrange 0-99999 lookup 1057` |
+| FGS / 通知 | `isForeground=true` / 恰好 1 条 |
+| **20 轮 Stop→立即 Start** | **19 / 20 结束于 `Started`**；1 轮（gap=10 ms）结束于 `STOPPED`，**一次恢复点击即回到 `Started`** |
+| 每轮的 `startProxy invoked` | **恰好 1 次**（Disconnect 点击不调它，所以 1 次是正确形状） |
+| crash / ANR | **0 / 0**（ANR 以 `ANR in com.interstellar` 权威核对，无匹配） |
+| 结束时归属 | pid 存活、`tun0=1`、通知恰好 1、FGS 恰恰 1 |
+| 出口流量 | 候选会话内出口记录增至 **270** 条 CONNECT（压力前 206），最后一次为 `142.250.96.188:5228` |
+
+**与 baseline 的对比**：baseline 20/20 全 `Started`；候选 19/20。
+**对那一轮的解读（不当作产品缺陷，也不掩盖）**：该轮最终是 `STOPPED` 而非"卡在 `Starting`"，
+即**不是**第七轮修的那类滞留；两轮各只产生 1 次 `startProxy`，与"Disconnect 在 Start 之前
+已被处理"（正确的串行化）一致。最合理的解释是**测试方法**：脚本在固定坐标点两下，
+若第一下之后 UI 已经翻到 `Start proxy` 而应用仍在收尾，第二下会被读作又一次 Disconnect。
+**证据不足以断言**，因此记为 `1/20 未收敛` 的事实，不写"通过"，也不写成 P0。
+
+**顺带纠正两个测量假象**（都不是产品问题）：
+- `node=None` 是**脚本探针**的缺陷 —— 它只匹配以 `SOCKS` 结尾的文本，而应用把节点命名为
+  `Local subscription`，所以节点存在时也打印 `node=None`；
+- 通知计数在连续三次取样中给出 1/1/2，是 `dumpsys notification` 同一记录被多行匹配导致的
+  已知假象；`grep -c` 的口径下为 1。
+
 ### E-6 CI
 
 | 项 | 值 |
@@ -398,7 +432,7 @@ gradlew.bat --no-daemon --max-workers=2 --console=plain :app:testDebugUnitTest :
 | `EMULATOR_ONLY` | ✅ 全部设备证据均来自 `emulator-5554` |
 | `POWER_NOT_QUANTIFIED` | ✅ 无对照功耗样本，不写省电百分比 |
 | `REAL_DEVICE_PENDING` | ✅ |
-| `CANDIDATE_BUILT_NOT_RETESTED` | ✅ 候选 APK 已在最终 SHA 上构建，**但尚未安装到设备复跑**。因此“改前成功、改后未测”的风险**未消除** |
+| `GATE4B_CANDIDATE_RETESTED` | ✅ 候选 APK（`1efaa8f`，同 core）已在同一 AVD 上复跑：连接闭环成立、20 轮 Stop→立即 Start **19/20 收敛**（1 轮结束于 `STOPPED` 并于一次点击后恢复）、0 crash、0 ANR。“改前成功、改后未测”的风险**已消除**；那 1 轮如实记为未收敛，未写成 P0 |
 | **不写** | `READY_FOR_RELEASE`、`REAL_DEVICE_PASS`、`FULL_APPLE_PARITY` |
 
 ### G-1 剩余事项
@@ -406,7 +440,7 @@ gradlew.bat --no-daemon --max-workers=2 --console=plain :app:testDebugUnitTest :
 1. **Gate 4-B**：在 `58b8309` 原版上跑息屏/网络基线，再用 `core_ref=c35faabf…` 构建**新 APK**
    复跑同场景。本段**未执行**，因此"修改前成功、修改后未测"的假验收风险**尚未消除**。
 2. **T01–T12**：设备端场景矩阵，见 D 节。
-3. **Gate 4-B 的设备复测**：候选 APK 已构建，**尚未安装复跑** —— 当前最主要的未闭环项。
+3. ~~Gate 4-B 的设备复测~~ —— **已完成**（候选 APK 已在同一 AVD 上复跑，见 E-5c）。
 4. **真机验收**：OEM 省电、蜂窝切换、实体热点、长 Doze、真实 `onRevoke`。
 
 ### G-2 需要内核介入的将来工单（**不立即操作内核**）
