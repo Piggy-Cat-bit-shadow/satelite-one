@@ -389,16 +389,34 @@ gradlew.bat --no-daemon --max-workers=2 --console=plain :app:testDebugUnitTest :
 - 通知计数在连续三次取样中给出 1/1/2，是 `dumpsys notification` 同一记录被多行匹配导致的
   已知假象；`grep -c` 的口径下为 1。
 
-### E-6 CI
+### E-6 CI：同一 SHA 的两种结果，把原因锁死在上游
 
-| 项 | 值 |
-|---|---|
-| 上一轮真实构建 run | `37985013617` on `58b8309`（`core_ref=c35faabf…`）：**success**，含 `Unit tests`、`Validate core provenance`、`Assemble debug APK` |
-| 候选 APK 构建（在最终 HEAD 上） | run **`37994573941`** on **`1efaa8f`** |
-| 候选 APK 构建（前一次） | run `37993838252` on `c9691263`：**success**。因随后又推送了纯测试提交，为保持“候选 APK == 最终 SHA”的身份精确，在最终 SHA 上重新 dispatch；两者 `core_ref` 均为 `c35faabf…` |
-| 候选 APK 是否已用于设备复测 | **否** —— APK 已构建成功，但**尚未安装与复跑**，见 F 节 |
+| run | event | SHA | 结论 | 失败步骤 | Unit tests |
+|---|---|---|---|---|---|
+| `37994573941` | **workflow_dispatch**（`core_ref=c35faabf…`） | `1efaa8fe` | **success** | — | **success** |
+| `37994563503` | push（跟随 `testing` HEAD） | `1efaa8fe` | **failure** | `Build libbox.aar from …@testing` | **skipped** |
+| `37993838252` | workflow_dispatch（`core_ref=c35faabf…`） | `c9691263` | **success** | — | success |
+| `37994714715` | push | `fa5fb045` | failure | `Build libbox.aar from …@testing` | skipped |
+| `37994754620` | push | `cae13dd1` | failure | `Build libbox.aar from …@testing` | skipped |
+| `37995540691` | push | `59b03f12` | failure | `Build libbox.aar from …@testing` | skipped |
 
----
+**同一个 SHA `1efaa8fe` 既成功又失败** —— 区别只在触发方式（是否用 `core_ref` 固定到 pin）。
+这**排除了**"是我们的改动导致 CI 红"这一解释，并把原因锁死在
+`Piggy-Cat-bit-shadow/sing-box@testing` 的 `build_libbox`：它写出 `libbox.provenance`
+却不产出 `libbox.aar`，随后 `cp: cannot stat 'libbox.aar'`。
+
+**后果不是"CI 红"，而是"CI 什么都没验"**：`Provenance gate negative tests`、
+`Release publish gate checks`、`Validate core provenance`、`Unit tests`、
+`Assemble debug APK` 全部 **skipped**。也就是说，任何一次 push 都拿不到 app 侧结论。
+
+**这正是第七轮那个 `core_ref` 输入要解决的问题**，而本轮给出了它的对照证据：
+同 SHA 下，固定 pin 的 dispatch **全绿**，跟随 `testing` 的 push **全红**。
+本轮 195 个单元测试、provenance 门禁负例、发布门禁检查、APK 组装与内核身份校验，
+都是在 `core_ref=c35faabf…` 的 dispatch 里真跑并通过的（且该 run 的 `Cache libbox.aar`
+为 **Cache not found**，内核是真构建的，不是缓存放行）。
+
+**未取回**：最终 HEAD `017fff7f` 的 push 触发的 run `37997303557` 在写本报告时仍
+`in_progress`。按上表规律它会在同一处失败。**不声称它通过。**
 
 ## F. GIT FINAL
 
