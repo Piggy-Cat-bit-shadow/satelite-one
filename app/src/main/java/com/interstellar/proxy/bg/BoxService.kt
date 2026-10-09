@@ -131,7 +131,7 @@ class BoxService(private val service: Service, private val platformInterface: Pl
         // A destroyed instance refuses to build a core at all (P0-A). Returning here
         // means no CommandServer, no fact bridge and no socket ever come into being.
         val attempt = lifecycle.beginStart()
-            ?: return CoreStartResult.SUPERSEDED.also {
+            ?: return CoreStartResult.Superseded.also {
                 com.interstellar.proxy.core.AppLog.log("service", "service destroyed; refused to start a core")
             }
         com.interstellar.proxy.core.AppLog.log("service", "启动内核 sing-box (attempt $attempt)")
@@ -146,7 +146,15 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             runCatching { created.closePlatformEvents() }
             runCatching { created.shutdown() }
             lifecycle.abandon(attempt)
-            throw e
+            // The failure is only OURS to report while this attempt still owns the
+            // service. A start that a stop (or a newer start) already superseded must
+            // stay silent: reporting it would let a dead generation stop a live one.
+            return if (lifecycle.isCurrent(attempt)) {
+                CoreStartResult.Failed(e)
+            } else {
+                android.util.Log.i("InterstellarUI", "superseded start failed; not reporting it")
+                CoreStartResult.Superseded
+            }
         }
         // Publishing is the linearization point: a teardown that ran while startup()
         // was in flight has already bumped the generation, so this publish is refused
@@ -161,9 +169,9 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             android.util.Log.i("InterstellarUI", "core start superseded by a stop; disposing the new core")
             runCatching { created.closePlatformEvents() }
             runCatching { created.shutdown() }
-            return CoreStartResult.SUPERSEDED
+            return CoreStartResult.Superseded
         }
-        return CoreStartResult.PUBLISHED
+        return CoreStartResult.Published
     }
 
     /**
@@ -199,9 +207,20 @@ class BoxService(private val service: Service, private val platformInterface: Pl
         // 1) Facts stop, and any native call already running for THIS session drains.
         // The token is non-null and identifies our own session, so a newer session
         // attached by someone else can never be unbound here.
-        val drained = session == null || runCatching { PlatformFacts.detachAndDrain(session) }
+        var drained = session == null || runCatching { PlatformFacts.detachAndDrain(session) }
             .onFailure { android.util.Log.w("InterstellarUI", "fact bridge drain failed", it) }
             .getOrDefault(false)
+        if (!drained && session != null) {
+            // A 5s wait bound is a bound, NOT a proof of safety: an undrained lane means a
+            // fact call may still be executing on that session's PlatformEvents. Retry
+            // once before making the risky call below - a lane that was merely slow (a
+            // long GC pause, a device under memory pressure) usually drains on the second
+            // attempt, and both retries are cheap compared with the alternatives.
+            android.util.Log.w("InterstellarUI", "fact drain unproven; retrying before release")
+            drained = runCatching { PlatformFacts.detachAndDrain(session) }
+                .onFailure { android.util.Log.w("InterstellarUI", "fact bridge drain retry failed", it) }
+                .getOrDefault(false)
+        }
 
         // 2) Only close the native bridge once the drain is proven. Unproven means a
         // fact call may still be executing on that object; leaving one unreachable Go
@@ -210,9 +229,21 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             if (drained) {
                 runCatching { running.closePlatformEvents() }
             } else {
+                // Deliberate tradeoff, and only after two bounded waits failed:
+                //
+                //  * the PlatformEvents object is NOT closed, because a fact call may
+                //    still be executing *on it* - that is a use-after-close;
+                //  * the CommandServer IS still shut down below. Leaving it running would
+                //    keep the tunnel, the command socket and the Go goroutines alive with
+                //    no owner left to stop them, i.e. a VPN the user cannot turn off while
+                //    the UI reports "disconnected". That is the worse failure, so the
+                //    server teardown proceeds and this line records exactly what was
+                //    sacrificed (one unreachable Go bridge object) and why.
                 android.util.Log.e(
                     "InterstellarUI",
-                    "fact drain unproven; leaving the platform-events bridge open",
+                    "fact drain unproven after two bounded waits; leaving the platform-events " +
+                        "bridge open and still shutting the server down (an unstoppable tunnel " +
+                        "is worse than one leaked bridge object)",
                 )
             }
         }
@@ -436,16 +467,22 @@ class BoxService(private val service: Service, private val platformInterface: Pl
         }
 
         GlobalScope.launch(Dispatchers.IO) {
-            val started = try {
-                startCore()
-            } catch (e: Exception) {
-                stopAndAlert(Alert.StartCommandServer, e.message)
-                return@launch
+            // startCore() no longer throws for a startup failure: it reports one only
+            // while the attempt still owns the service (see CoreStartResult.Failed), so a
+            // superseded attempt cannot stop a newer generation.
+            when (val started = startCore()) {
+                is CoreStartResult.Failed -> {
+                    stopAndAlert(Alert.StartCommandServer, started.cause.message)
+                    return@launch
+                }
+
+                // A superseded start is terminal. Continuing would apply a config to a
+                // core that was never published, show "Started" for a service that is
+                // going away, and re-post a notification from a dead generation.
+                CoreStartResult.Superseded -> return@launch
+
+                CoreStartResult.Published -> Unit
             }
-            // P0-D: a superseded start is terminal. Continuing would apply a config to a
-            // core that was never published, show "Started" for a service that is going
-            // away, and re-post a notification from a dead generation.
-            if (started != CoreStartResult.PUBLISHED) return@launch
             // A stop that landed while startCore() was in flight must win. The check
             // below is not enough on its own: startCore() has already assigned `core`
             // and attached the fact bridge by now, so simply returning here would
@@ -539,12 +576,22 @@ class BoxService(private val service: Service, private val platformInterface: Pl
 }
 
 /** Outcome of one core start attempt. See `BoxService.startCore`. */
-internal enum class CoreStartResult {
+internal sealed interface CoreStartResult {
     /** The core was published and the caller may proceed to `startService()`. */
-    PUBLISHED,
+    object Published : CoreStartResult
 
-    /** A stop or destroy won the race; nothing was published and the caller must stop. */
-    SUPERSEDED,
+    /**
+     * A stop or destroy won the race, **or** this attempt failed after it had already
+     * been superseded. Either way the caller must stop: it owns nothing to report.
+     */
+    object Superseded : CoreStartResult
+
+    /**
+     * This attempt failed while it still owned the service. Only then may the caller
+     * turn the failure into a user-visible stop - a superseded attempt that throws must
+     * not write "Stopped" over a newer, healthy generation.
+     */
+    data class Failed(val cause: Throwable) : CoreStartResult
 }
 
 /**
@@ -580,7 +627,13 @@ internal class CoreLifecycle {
     }
 
     /** Invalidate in-flight attempts without closing: a normal stop may still restart. */
-    fun invalidate() = synchronized(lock) { ++generation }
+    fun invalidate() = synchronized(lock) {
+        ++generation
+        // A stop releases the published core, so "is anything published" must stop being
+        // true here. Leaving it set made isPublished claim a live core after the core had
+        // already been shut down - an assertion that tests then trusted.
+        published = null
+    }
 
     /**
      * Terminal. A destroyed Service instance must never start, restart, re-attach or
@@ -595,10 +648,20 @@ internal class CoreLifecycle {
         // Removing either one re-opens a distinct hole, so neither is decoration.
         closed = true
         ++generation
+        published = null
     }
 
     /** True once [close] ran. Distinct from [isPublished]: both can be true at once. */
     val isClosed: Boolean get() = synchronized(lock) { closed }
+
+    /**
+     * True while [attempt] is still the live generation of an open owner.
+     *
+     * Used to decide whether a failure is still ours to report: once a stop or a newer
+     * start has moved the generation on, this attempt must stay silent rather than
+     * drive the service to Stopped.
+     */
+    fun isCurrent(attempt: Long): Boolean = synchronized(lock) { !closed && attempt == generation }
 
     /**
      * Run [block] only if [attempt] is still the youngest generation.

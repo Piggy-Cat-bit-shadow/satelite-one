@@ -170,4 +170,29 @@ class SessionGateTest {
             }
         }
     }
+
+    @Test
+    fun `a callback arriving during the client disconnect cannot survive the stop`() {
+        // stopSession() disconnects the native client BEFORE gate.stop(). A handler that
+        // runs re-entrantly from that disconnect - or a late native ConnectionEvents
+        // delivery - therefore commits while the gate is still open, and it must still not
+        // outlive the stop.
+        val r = Recorder()
+        val g = r.gate.start()
+        r.gate.commitConnected(g, true)
+        // ... client.disconnect() runs here and its handler re-enters ...
+        r.gate.commit(g, listOf("late"))
+        r.gate.commitConnected(g, false)
+        // ... then the session is closed for good.
+        r.gate.stop()
+        check(r.published.last().isEmpty()) {
+            "a disconnect-window commit survived the stop: ${r.published}"
+        }
+        check(r.connected.last() == false) { "the session must end disconnected: ${r.connected}" }
+        // And nothing from that generation may write afterwards.
+        r.gate.commit(g, listOf("after"))
+        r.gate.commitConnected(g, true)
+        check(r.published.last().isEmpty()) { "a post-stop commit republished a list: ${r.published}" }
+        check(r.connected.last() == false) { "a post-stop commit revived the session: ${r.connected}" }
+    }
 }

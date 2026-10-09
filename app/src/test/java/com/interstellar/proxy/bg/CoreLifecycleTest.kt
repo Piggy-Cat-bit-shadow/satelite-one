@@ -287,4 +287,62 @@ class CoreLifecycleTest {
             }
         }
     }
+
+    // ---- P0-D: whose failure is it to report? ----
+
+    @Test
+    fun `a failure is only reportable while the attempt still owns the service`() {
+        val lifecycle = CoreLifecycle()
+        val attempt = lifecycle.beginStart() ?: error("expected a token")
+        check(lifecycle.isCurrent(attempt)) { "a fresh attempt owns the service" }
+
+        // A stop moved the generation on: this attempt's failure is no longer its to
+        // report, and reporting it would write Stopped over whatever came next.
+        lifecycle.invalidate()
+        check(!lifecycle.isCurrent(attempt)) { "a stopped attempt must not report a failure" }
+    }
+
+    @Test
+    fun `a newer start makes the previous attempt non-current`() {
+        val lifecycle = CoreLifecycle()
+        val first = lifecycle.beginStart() ?: error("expected a token")
+        val second = lifecycle.beginStart() ?: error("expected a token")
+        check(!lifecycle.isCurrent(first)) { "a superseded attempt must not report a failure" }
+        check(lifecycle.isCurrent(second)) { "the newest attempt owns the service" }
+    }
+
+    @Test
+    fun `a destroy makes every attempt non-current`() {
+        val lifecycle = CoreLifecycle()
+        val attempt = lifecycle.beginStart() ?: error("expected a token")
+        lifecycle.close()
+        check(!lifecycle.isCurrent(attempt)) { "no attempt survives the destroy" }
+    }
+
+    // ---- Debug round: is isPublished ever a lie? ----
+
+    @Test
+    fun `a released core is no longer reported as published`() {
+        // Found by the adversarial pass over this round's own work: `published` was only
+        // ever assigned in publish(), so after a stop it still claimed a live core - and
+        // the assertions in this file trusted it.
+        val lifecycle = CoreLifecycle()
+        val attempt = lifecycle.beginStart() ?: error("expected a token")
+        check(lifecycle.publish(attempt) {})
+        check(lifecycle.isPublished) { "a published core must be reported as published" }
+
+        lifecycle.invalidate()   // stopService() -> releaseCore()
+        check(!lifecycle.isPublished) {
+            "a released core must not still be reported as published"
+        }
+    }
+
+    @Test
+    fun `a destroyed owner reports nothing published`() {
+        val lifecycle = CoreLifecycle()
+        val attempt = lifecycle.beginStart() ?: error("expected a token")
+        check(lifecycle.publish(attempt) {})
+        lifecycle.close()
+        check(!lifecycle.isPublished) { "a destroyed owner must not report a published core" }
+    }
 }
