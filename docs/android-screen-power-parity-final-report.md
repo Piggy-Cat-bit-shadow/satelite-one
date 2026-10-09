@@ -229,24 +229,22 @@ CommandServer  : close, closeService, pause, wake
 
 ### D-1 T01–T12
 
-| 场景 | 操作 | 判定 |
-|---|---|---|
-| T01 | 亮屏使用 10 分钟 | **NOT_RUN** |
-| T02 | 关屏 3 秒再亮屏 | **PARTIAL** —— 屏幕事实序列已证明正确（D-0）；**未测**不额外重连的延迟指标 |
-| T03 | 关屏 5 秒再亮屏 | **PARTIAL** —— 同上 |
-| T04 | 关屏 15 秒再解锁 | **NOT_RUN**（未测解锁沿 `USER_PRESENT`） |
-| T05 | 关屏 2 / 15 / 30 分钟 | **BLOCKED** —— 见下 |
-| T06 | 锁屏通知亮屏不解锁 ×10 | **NOT_RUN** |
-| T07 | 息屏时通话 / 下载 / 热点 | **BLOCKED** —— 模拟器无蜂窝、无热点、无真实通话 |
-| T08 | 屏幕开着但 App 在后台，其他 App 走 VPN | **NOT_RUN** |
-| T09 | 关屏过程中 Wi-Fi↔蜂窝切换 | **BLOCKED** —— 模拟器无蜂窝 |
-| T10 | 屏幕关闭期间 Stop/Start/Start/Stop | **NOT_RUN** |
-| T11 | 应用被系统结束后重启 | **NOT_RUN** |
-| T12 | UI 旋转多次后后台/亮屏/解锁 | **NOT_RUN**（转屏计数逻辑有 JVM 覆盖，设备侧未跑） |
+本段在候选 APK（`1efaa8f`，同 core）上又补跑了几项。逐项如实标注。
 
-**T05 为何 `BLOCKED`（实测依据）**：本 AVD `dumpsys deviceidle` 报告 **`mCharging=true`**，
-而 Doze 在充电时**不会进入**。所以这台模拟器**无法**验证 Doze 进出、Deep Idle 或长息屏省电。
-这不是"没时间跑"，是平台条件不具备。
+| 场景 | 操作 | 判定 | 依据 |
+|---|---|---|---|
+| T01 | 亮屏使用 10 分钟 | **NOT_RUN** | 未做长时基线 |
+| T02 | 关屏 3 秒再亮屏 | **PARTIAL** | D-0 已证明屏幕事实序列正确、无额外重连；**未测**首包延迟等延迟指标 |
+| T03 | 关屏 5 秒再亮屏 | **PARTIAL** | 同上 |
+| T04 | 关屏 15 秒再解锁 | **BLOCKED** | 实测 `isKeyguardShowing=false` 且 `mDreamingLockscreen=false`，本 AVD **不显示锁屏**，`ACTION_USER_PRESENT` 不会发出 —— 解锁沿无从产生 |
+| T05 | 关屏 2 / 15 / 30 分钟 | **BLOCKED** | `dumpsys deviceidle` 报 `mCharging=true`，Doze 在充电时不进入 |
+| T06 | 锁屏通知亮屏不解锁 ×10 | **BLOCKED** | 同 T04：无锁屏可亮 |
+| T07 | 息屏时通话 / 下载 / 热点 | **BLOCKED** | 模拟器无蜂窝、无热点、无真实通话 |
+| T08 | 屏幕开着但 App 在后台，其他 App 走 VPN | **PARTIAL** | App 退后台（HOME，**屏幕保持点亮**）后事实链正确：`platform fact: foreground=false`，`screen` **未**变化（仍为 true）—— 两个事实确实独立；隧道全程存活（`tun0=1`、FGS 1、pid 不变）、**0 次重连**。**但**该 45 s 窗口内出口 0 条新连接，所以"其他 App 的流量继续被转发"这条**未取得流量证据** |
+| T09 | 关屏过程中 Wi-Fi↔蜂窝切换 | **BLOCKED** | 模拟器无蜂窝 |
+| T10 | 屏幕关闭期间 Stop/Start/Start/Stop | **NOT_RUN（方法不可行）** | 实测把屏幕关掉后注入的点击**根本不到达应用**：6 轮盲点之后 `startProxy invoked` 计数为 **0**，即那 6 轮**没有发生**。显示屏关闭时注入触摸由显示控制器丢弃，因此"息屏期间用 UI 触发 Stop/Start"在本手段下不可行。旁证：`screen=false`/`foreground=false` 两条事实被正确采集，隧道全程未断、0 次重连 —— 但这**不能**替代本场景 |
+| T11 | 应用被系统结束后重启 | **PASS** | `am kill` 被**拒绝**（应用持有前台服务，实测 pid 不变）；改用 `am force-stop`：pid 消失、`tun0=0`、通知 0（资源全部释放），重新拉起 pid 变化，启动时事实正确上报 `screen-seed=true` 与 `foreground=true`，`attached=false`（内核确实尚未启动）。0 crash |
+| T12 | UI 旋转多次后后台/亮屏/解锁 | **N/A（不可旋转）** | `AndroidManifest.xml` 中 `MainActivity` 为 `android:screenOrientation="portrait"`，`requestedOrientation=SCREEN_ORIENTATION_PORTRAIT`；驱动 6 次 `user_rotation` 后**没有**产生任何配置变更或前后台事实，因为该 Activity 不参与旋转。转屏计数的逻辑由 `ActivityForegroundTracker` 的 JVM 测试覆盖（计数平衡、"先减再判"）。**该项在本构建上不适用**，不是未测 |
 
 **功耗**：`POWER_NOT_QUANTIFIED`。无对照功耗样本，不写"省电 X%"，不伪造电量。
 
