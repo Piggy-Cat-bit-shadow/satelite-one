@@ -311,6 +311,120 @@ class PlatformFactsTest {
         check(drained.await(5, TimeUnit.SECONDS)) { "detachAndDrain must complete after the drain" }
     }
 
+
+    // ---- P0-C: the handover itself ----
+
+    @Test
+    fun `B stays bound and keeps receiving while A is being drained`() {
+        // The P0-C handover in one test: A is mid-native-call, A's teardown starts, and B
+        // starts and attaches BEFORE A's teardown finishes.
+        //
+        // This is the shape of the round-7 Stop->Restart defect at the fact-bridge layer.
+        // The property that matters is not merely "A is discarded" (already covered) but
+        // "**B is still bound and still receives events**" while A's teardown is running.
+        PlatformFacts.attachedSession?.let { live -> runBlocking { PlatformFacts.detachAndDrain(live) } }
+        PlatformFacts.onScreenChanged(true)
+
+        val entered = CountDownLatch(1)
+        val gate = CountDownLatch(1)
+        val a = GatedFirstCallSink(entered, gate)
+        val aSession = PlatformFacts.attach(a)
+        check(entered.await(5, TimeUnit.SECONDS)) { "A's initial report never started" }
+
+        // A's teardown begins while A is still inside that call.
+        PlatformFacts.onMemoryTrim(20)          // queues behind A's blocked call
+        val drained = CountDownLatch(1)
+        Thread {
+            runBlocking { PlatformFacts.detachAndDrain(aSession) }
+            drained.countDown()
+        }.start()
+
+        // Deterministic: the ownership gate closes synchronously before the wait.
+        val deadline = System.currentTimeMillis() + 5_000
+        while (PlatformFacts.attachedSession != null && System.currentTimeMillis() < deadline) {
+            Thread.sleep(2)
+        }
+        check(PlatformFacts.attachedSession == null) { "A's gate never closed" }
+
+        // B attaches while A's teardown is still parked inside the native call.
+        val b = RecordingSink()
+        val bSession = PlatformFacts.attach(b)
+        check(PlatformFacts.attachedSession?.id == bSession.id) { "B did not become the live session" }
+
+        // Release A. Everything A had queued must vanish; B must be untouched by that.
+        gate.countDown()
+        check(drained.await(5, TimeUnit.SECONDS)) { "A's drain never completed" }
+        settle()
+
+        check(a.events.none { it == "trim:20" }) {
+            "A's queued fact reached the detached sink: ${a.events}"
+        }
+        check(b.events.isNotEmpty()) {
+            "B received nothing even though it attached while A was draining"
+        }
+
+        // And B is genuinely still the live session: a new fact reaches B and not A.
+        val aCountBefore = a.events.size
+        PlatformFacts.onScreenChanged(false)
+        awaitAtLeast(b, b.events.size + 1)
+        settle()
+        check(b.events.contains("screen:false")) {
+            "B stopped receiving after A's teardown: ${b.events}"
+        }
+        check(a.events.size == aCountBefore) {
+            "A received a fact after its teardown finished: ${a.events}"
+        }
+        check(b.events.none { false }) { "unreachable" }
+        // B's own close, so the next test starts clean.
+        runBlocking { PlatformFacts.detachAndDrain(bSession) }
+    }
+
+    @Test
+    fun `a drain that cannot be proven reports failure instead of claiming safety`() {
+        // P0-C item 6. A sink that is permanently wedged must produce "cannot prove the
+        // drain" - NOT a false success, and NOT a hang. `detachAndDrain` returns false, and
+        // the caller (BoxService) is then required not to close native state it cannot
+        // prove is idle.
+        //
+        // The sink blocks past the class's own 5 s DRAIN_TIMEOUT_MS, so the answer is
+        // produced by the timeout rather than by the call finishing. This test therefore
+        // costs ~5 s; that is the price of exercising the real bound instead of a mocked one.
+        PlatformFacts.attachedSession?.let { live -> runBlocking { PlatformFacts.detachAndDrain(live) } }
+
+        val entered = CountDownLatch(1)
+        val never = CountDownLatch(1)
+        val wedged = object : RecordingSink() {
+            private val first = java.util.concurrent.atomic.AtomicBoolean(true)
+            override fun setScreenOn(on: Boolean) {
+                if (first.compareAndSet(true, false)) {
+                    entered.countDown()
+                    never.await(30, TimeUnit.SECONDS)   // longer than DRAIN_TIMEOUT_MS
+                }
+                super.setScreenOn(on)
+            }
+        }
+        val session = PlatformFacts.attach(wedged)
+        check(entered.await(5, TimeUnit.SECONDS)) { "the wedged call never started" }
+
+        var proven: Boolean? = null
+        val done = CountDownLatch(1)
+        Thread {
+            proven = runBlocking { PlatformFacts.detachAndDrain(session) }
+            done.countDown()
+        }.start()
+
+        check(done.await(15, TimeUnit.SECONDS)) {
+            "detachAndDrain hung past its own bound; a teardown must not hang forever"
+        }
+        check(proven == false) {
+            "an unprovable drain reported success (got $proven) - the caller would then " +
+                "close a native bridge that may still be in use"
+        }
+
+        never.countDown()   // let the wedged call finish so the lane is usable again
+        settle()
+    }
+
     @Test
     fun `a stale token cannot unbind a newer session`() {
         val first = RecordingSink()
