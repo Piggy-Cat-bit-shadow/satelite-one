@@ -37,14 +37,19 @@ Pure stdlib + no third-party dependencies, so it runs anywhere `python3` does â€
 including the normal CI job, which is what makes it real evidence rather than a
 local claim.
 """
+import hashlib
+import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 WORKFLOW = os.path.join(REPO, ".github", "workflows", "release-apk.yml")
 MEASURE = os.path.join(REPO, ".github", "scripts", "measure_apk_signature.sh")
+VERIFY_BUNDLE = os.path.join(REPO, ".github", "scripts", "verify_release_bundle.py")
 
 failures = []
 
@@ -78,45 +83,54 @@ def job_block(workflow, job_name):
 
 
 # ---------------------------------------------------------------------------
-# 1. the publish job finds the APKs where the artifact actually puts them
+# 1. the publish job verifies, and uploads, the same flat bundle
 # ---------------------------------------------------------------------------
 
-def test_publish_job_can_see_the_artifact():
+def test_publish_job_verifies_and_uploads_one_bundle():
     workflow = read(WORKFLOW)
     publish = job_block(workflow, "publish")
-    if not check(publish is not None, "release-apk.yml has no publish job"):
+    build = job_block(workflow, "build")
+    if not check(publish is not None and build is not None, "release-apk.yml is missing a job"):
         return
 
+    # The artifact must be downloaded into ONE isolated directory, and that directory is
+    # the only thing anything downstream is allowed to look at.
     check(
-        "path: ." in publish,
-        "publish job no longer downloads the artifact into the working directory; "
-        "re-check where the APKs land before trusting the verification step",
+        "path: release-bundle" in publish,
+        "publish job does not download the artifact into an isolated release-bundle/",
     )
-    # The broken shape: a fixed build-output path plus a glob that silently expands
-    # to nothing. `nullglob` is only safe once a count check exists.
-    broken = re.search(r"APKS=\(app/build/outputs/apk/release/\*\.apk\)", publish)
+    # The round-5 broken shape: a glob against the build-output layout, which the artifact
+    # download does not populate. Kept as an explicit tripwire because it is the exact
+    # regression this file exists for.
     check(
-        broken is None,
+        re.search(r"APKS=\(app/build/outputs/apk/release/\*\.apk\)", publish) is None,
         "publish job is back to globbing app/build/outputs/apk/release/*.apk, which the "
         "artifact download does not populate â€” the loop body never runs and the step "
         "passes without verifying anything",
     )
+    # The verified set and the uploaded set must be the same expression space: the release
+    # step may only reference the bundle directory.
+    release_files = re.search(r"files: \|\n((?:\s+\S+\n)+)", publish)
+    if check(release_files is not None, "could not find the release `files:` list"):
+        listed = release_files.group(1).strip().splitlines()
+        outside = [line.strip() for line in listed if not line.strip().startswith("release-bundle/")]
+        check(
+            not outside,
+            f"the release uploads files outside the verified bundle: {outside}",
+        )
     check(
-        "find ." in publish,
-        "publish job does not discover the APKs by searching the artifact's real location",
+        "verify_release_bundle.py" in publish,
+        "publish job does not run the bundle preflight verifier",
     )
-    # Fail-closed: "found nothing" must be an error, and the count must be asserted.
+    # The build side has to produce that bundle, flatly, and self-check it.
     check(
-        re.search(r'\[ "\$\{#APKS\[@\]\}" -eq 0 \]', publish) is not None,
-        "publish job does not reject an empty APK list",
+        "release-bundle" in build,
+        "build job does not assemble a release-bundle",
     )
     check(
-        re.search(r'\[ "\$\{#APKS\[@\]\}" -ne 2 \]', publish) is not None,
-        "publish job does not assert the expected per-ABI APK count",
-    )
-    check(
-        "measure_apk_signature.sh" in publish,
-        "publish job does not use the shared signature measurement script",
+        "sha256sum --check SHA256SUMS.txt" in build,
+        "build job does not verify its own bundle checksums; the release job must never "
+        "be the first place a bundle is checked",
     )
 
 
@@ -301,11 +315,247 @@ def test_measurement_fails_closed():
     )
 
 
+# ---------------------------------------------------------------------------
+# 5. the bundle preflight, exercised against real bundle fixtures
+#
+# Structural checks can only show that the workflow *calls* the verifier. These build
+# actual bundle directories on disk and run the real script against them, so the
+# decisions are measured rather than described. Every rejection case below is a way an
+# artifact could reach users if the gate were merely "find some APKs and hope".
+# ---------------------------------------------------------------------------
+
+def run_bundle_preflight(bundle_dir, expect_signature="signed", extra_args=()):
+    """Run verify_release_bundle.py; return (exit_code, stdout, stderr)."""
+    cmd = [
+        sys.executable,
+        VERIFY_BUNDLE,
+        str(bundle_dir),
+        "--expect-signature",
+        expect_signature,
+        *extra_args,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+BUNDLE_VERSION = "0.5.10"
+APP_COMMIT = "a" * 40
+CORE_COMMIT = "c35faabf402a4da93b8c31cdfad941b8b1528ffc"
+
+
+def write_bundle(root, *, abis=("arm64-v8a", "x86_64"), signature_state="signed-by-user",
+                 extra_apk=None, tamper=None, omit=None, sums_override=None,
+                 info_override=None, nested=False, apk_version=BUNDLE_VERSION,
+                 app_commit=APP_COMMIT, core_commit=CORE_COMMIT, core_ref="pinned",
+                 kind=None):
+    """Materialise a release bundle. Every knob is a documented attack on the gate."""
+    os.makedirs(root, exist_ok=True)
+    kind = kind if kind is not None else signature_state
+    names = [f"satelite-one-{apk_version}-{abi}-{kind}.apk" for abi in abis]
+    if extra_apk:
+        names.append(extra_apk)
+    if omit:
+        names = [n for n in names if n != omit]
+
+    target_dir = os.path.join(root, "nested") if nested else root
+    os.makedirs(target_dir, exist_ok=True)
+
+    digests = {}
+    for name in names:
+        path = os.path.join(target_dir, name)
+        with open(path, "wb") as handle:
+            handle.write(b"PK\x03\x04 fake apk payload " + name.encode())
+        digests[name] = digest_of(path)
+    if tamper:
+        # Flip one byte AFTER the manifest was computed: this is R04.
+        with open(os.path.join(target_dir, tamper), "r+b") as handle:
+            handle.seek(4)
+            handle.write(b"\xff")
+
+    sums = sums_override if sums_override is not None else digests
+    with open(os.path.join(root, "SHA256SUMS.txt"), "w", encoding="utf-8") as handle:
+        for name, digest in sums.items():
+            handle.write(f"{digest}  {name}\n")
+
+    info = {
+        "app_repository": "Piggy-Cat-bit-shadow/satelite-one",
+        "app_version": BUNDLE_VERSION,
+        "app_version_code": 16,
+        "app_commit": app_commit,
+        "app_commit_full": app_commit,
+        "app_ref": "v0.5.10",
+        "core_repository": "Piggy-Cat-bit-shadow/sing-box",
+        "core_commit": core_commit,
+        "core_ref": core_ref,
+        "core_branch_hint": "testing",
+        "core_aar_sha256": "b" * 64,
+        "core_aar_size": 123,
+        "signature_state": signature_state,
+        "signature_state_measured_by": "apksigner verify --verbose --print-certs",
+        "apk_arm64_v8a_sha256": digests.get(f"satelite-one-{apk_version}-arm64-v8a-{kind}.apk", ""),
+        "apk_x86_64_sha256": digests.get(f"satelite-one-{apk_version}-x86_64-{kind}.apk", ""),
+        "build_time": "2026-10-10T00:00:00Z",
+        "run_id": "1",
+    }
+    if info_override:
+        info.update(info_override)
+    with open(os.path.join(root, "build-info.json"), "w", encoding="utf-8") as handle:
+        json.dump(info, handle, indent=2)
+    with open(os.path.join(root, "apksigner-verify.txt"), "w", encoding="utf-8") as handle:
+        handle.write("fake apksigner output\n")
+    return root
+
+
+def digest_of(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        digest.update(handle.read())
+    return digest.hexdigest()
+
+
+def test_bundle_preflight_positive_and_negative():
+    with tempfile.TemporaryDirectory() as tmp:
+        # R11 (positive): a well-formed, non-debug-signed, both-ABI bundle is accepted,
+        # and the file list it prints is exactly what the release step would upload.
+        good = write_bundle(os.path.join(tmp, "good"))
+        code, out, err = run_bundle_preflight(good)
+        check(code == 0, f"R11: a correct bundle must pass the preflight; stderr={err.strip()[:200]}")
+        listed = [os.path.basename(line.strip()) for line in out.splitlines() if line.strip()]
+        check(
+            sorted(listed) == sorted([
+                f"satelite-one-{BUNDLE_VERSION}-arm64-v8a-signed-by-user.apk",
+                f"satelite-one-{BUNDLE_VERSION}-x86_64-signed-by-user.apk",
+                "SHA256SUMS.txt",
+                "build-info.json",
+                "apksigner-verify.txt",
+            ]),
+            f"R11: the preflight must list exactly the publishable files, got {listed}",
+        )
+
+        # R01: nothing to publish.
+        empty = os.path.join(tmp, "r01")
+        os.makedirs(empty)
+        write_bundle(empty, abis=())
+        code, _, err = run_bundle_preflight(empty)
+        check(code != 0 and "no APK" in err, f"R01 (no APK) must FAIL, got exit={code}")
+
+        # R02: a missing ABI.
+        code, _, err = run_bundle_preflight(
+            write_bundle(os.path.join(tmp, "r02"), abis=("arm64-v8a",))
+        )
+        check(code != 0 and "missing an APK" in err, f"R02 (missing x86_64) must FAIL, got {err.strip()[:120]}")
+
+        # R03a: an extra, non-release APK.
+        code, _, err = run_bundle_preflight(
+            write_bundle(os.path.join(tmp, "r03a"), extra_apk="app-debug.apk")
+        )
+        check(code != 0 and "does not match" in err, f"R03a (extra APK) must FAIL, got {err.strip()[:120]}")
+
+        # R03b: two APKs claiming the same ABI.
+        code, _, err = run_bundle_preflight(
+            write_bundle(
+                os.path.join(tmp, "r03b"),
+                extra_apk=f"satelite-one-{BUNDLE_VERSION}-arm64-v8a-signed-by-user-2.apk",
+            )
+        )
+        check(code != 0 and "claim ABI" in err, f"R03b (duplicate ABI) must FAIL, got {err.strip()[:120]}")
+
+        # R04: one byte changed after the manifest was written.
+        code, _, err = run_bundle_preflight(
+            write_bundle(
+                os.path.join(tmp, "r04"),
+                tamper=f"satelite-one-{BUNDLE_VERSION}-x86_64-signed-by-user.apk",
+            )
+        )
+        check(code != 0 and "does not match SHA256SUMS" in err, f"R04 (tampered APK) must FAIL, got {err.strip()[:120]}")
+
+        # R05: a manifest that disagrees with the metadata hashes.
+        wrong = {
+            f"satelite-one-{BUNDLE_VERSION}-arm64-v8a-signed-by-user.apk": "0" * 64,
+            f"satelite-one-{BUNDLE_VERSION}-x86_64-signed-by-user.apk": "1" * 64,
+        }
+        code, _, err = run_bundle_preflight(
+            write_bundle(os.path.join(tmp, "r05"), sums_override=wrong)
+        )
+        check(code != 0, f"R05 (wrong SHA in manifest) must FAIL, got exit={code}")
+
+        # R05b: a manifest listing a file that is not present. The real digests are kept
+        # so this exercises ONLY the "manifest names a ghost" rule, not the hash rule.
+        ghost_root = write_bundle(os.path.join(tmp, "r05b"))
+        real_sums = {}
+        with open(os.path.join(ghost_root, "SHA256SUMS.txt"), encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    dig, name = line.split(None, 1)
+                    real_sums[name.strip()] = dig
+        real_sums["ghost.apk"] = "2" * 64
+        write_bundle(ghost_root, sums_override=real_sums)
+        code, _, err = run_bundle_preflight(ghost_root)
+        check(code != 0 and "not in the bundle" in err, f"R05b (ghost manifest entry) must FAIL, got {err.strip()[:140]}")
+
+        # R06a/b: wrong app or core revision.
+        code, _, err = run_bundle_preflight(
+            write_bundle(os.path.join(tmp, "r06a"), app_commit="d" * 40),
+            extra_args=("--expect-app-commit", APP_COMMIT),
+        )
+        check(code != 0 and "app_commit" in err, f"R06a (wrong app commit) must FAIL, got {err.strip()[:120]}")
+        code, _, err = run_bundle_preflight(
+            write_bundle(os.path.join(tmp, "r06b"), core_commit="e" * 40),
+            extra_args=("--expect-core-commit", CORE_COMMIT),
+        )
+        check(code != 0 and "core_commit" in err, f"R06b (wrong core pin) must FAIL, got {err.strip()[:120]}")
+
+        # R06c: the core revision is not a full pinned SHA.
+        code, _, err = run_bundle_preflight(
+            write_bundle(os.path.join(tmp, "r06c"), core_commit="testing")
+        )
+        check(code != 0 and "40-char" in err, f"R06c (unpinned core) must FAIL, got {err.strip()[:120]}")
+
+        # R06d: the core was not resolved from the pin at all.
+        code, _, err = run_bundle_preflight(
+            write_bundle(os.path.join(tmp, "r06d"), core_ref="testing")
+        )
+        check(code != 0 and "pinned" in err, f"R06d (core_ref != pinned) must FAIL, got {err.strip()[:120]}")
+
+        # R07: an unsigned artifact on the signed release path.
+        code, _, err = run_bundle_preflight(
+            write_bundle(os.path.join(tmp, "r07"), signature_state="unsigned"),
+        )
+        check(code != 0 and "unsigned" in err, f"R07 (unsigned as signed) must FAIL, got {err.strip()[:120]}")
+
+        # R08: the public Android debug keystore standing in for a real signature.
+        code, _, err = run_bundle_preflight(
+            write_bundle(os.path.join(tmp, "r08"), signature_state="debug-signed"),
+        )
+        check(code != 0 and "debug" in err, f"R08 (debug-signed) must FAIL, got {err.strip()[:120]}")
+
+        # R10: on the unsigned dry-run path, unsigned must PASS - the happy path the
+        # shell `case` ordering in measure_apk_signature.sh also protects.
+        code, out, err = run_bundle_preflight(
+            write_bundle(os.path.join(tmp, "r10"), signature_state="unsigned"),
+            expect_signature="unsigned",
+        )
+        check(code == 0, f"R10 (unsigned happy path) must PASS, got {err.strip()[:200]}")
+
+        # Nested layout: the shape the round-5 bug exploited. Must be refused outright.
+        code, _, err = run_bundle_preflight(
+            write_bundle(os.path.join(tmp, "nested"), nested=True)
+        )
+        check(code != 0 and "flat" in err, f"a nested bundle must FAIL, got {err.strip()[:120]}")
+
+        # The version in the filename must agree with the metadata.
+        code, _, err = run_bundle_preflight(
+            write_bundle(os.path.join(tmp, "ver"), apk_version="9.9.9"),
+        )
+        check(code != 0, f"a version mismatch must FAIL, got exit={code}")
+
+
 def main():
-    test_publish_job_can_see_the_artifact()
+    test_publish_job_verifies_and_uploads_one_bundle()
     test_both_jobs_share_one_measurement()
     test_decision_table()
     test_measurement_fails_closed()
+    test_bundle_preflight_positive_and_negative()
 
     if failures:
         print(f"\n{len(failures)} release-gate check(s) failed")

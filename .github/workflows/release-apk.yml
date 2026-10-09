@@ -431,17 +431,60 @@ jobs:
           python3 -c "import json,sys; json.load(open('build-info.json')); print('build-info.json is valid JSON')"
           cat build-info.json
 
-      - name: Upload APK artifacts
+      # 把"要被验证的东西"和"要被上传的东西"变成同一个**扁平**目录。
+      #
+      # 第五轮修的是 publish job 去错路径找 APK 导致验签空转; 但它留下的缺口是:
+      # 验签用 `find .`, 而 action-gh-release 的 files: 仍写另一个构建目录布局 ——
+      # 被验证的字节与被上传的字节由两个不同的路径表达式描述, 没有任何东西保证它们
+      # 一致。这里把产物规整成一个扁平的 release-bundle/, 于是两者只能是同一批文件。
+      #
+      # 扁平是刻意的: 嵌套目录正是旧 bug 藏身之处(同一个字节有两个都说得通的路径),
+      # verify_release_bundle.py 会把任何子目录直接判为失败。
+      - name: Assemble the flat release bundle
+        env:
+          SIG_STATE: ${{ steps.sig.outputs.state }}
+        run: |
+          set -euo pipefail
+          rm -rf release-bundle
+          mkdir -p release-bundle
+          cd app/build/outputs/apk/release
+          shopt -s nullglob
+          BUNDLED=0
+          for f in ./*.apk; do
+            cp "$f" "${GITHUB_WORKSPACE}/release-bundle/"
+            BUNDLED=$((BUNDLED + 1))
+          done
+          shopt -u nullglob
+          if [ "$BUNDLED" -eq 0 ]; then
+            echo "::error::no release APKs to bundle"
+            exit 1
+          fi
+          cp SHA256SUMS.txt apksigner-verify.txt "${GITHUB_WORKSPACE}/release-bundle/"
+          cp "${GITHUB_WORKSPACE}/build-info.json" "${GITHUB_WORKSPACE}/release-bundle/"
+          cd "${GITHUB_WORKSPACE}/release-bundle"
+          echo "=== release-bundle ($BUNDLED APK) ==="
+          ls -la
+          # SHA256SUMS.txt must stay valid in the flat layout (sha256sum records the path
+          # it was given; in the build directory the APKs had no directory prefix, so the
+          # entries are already bare filenames - assert that instead of assuming it).
+          while read -r _ name; do
+            case "$name" in
+              */*) echo "::error::SHA256SUMS.txt entry is not a flat filename: $name"; exit 1 ;;
+            esac
+          done < SHA256SUMS.txt
+          # And prove it right here, so a mismatch fails the build job rather than the
+          # release job - the release job must never be the first place a bundle is checked.
+          sha256sum --check SHA256SUMS.txt
+
+      - name: Upload the release bundle
         uses: actions/upload-artifact@v4
         with:
           # 名字里带版本与实测签名状态: artifact 列表本身就能区分
           # "未签名的 dry run" 和 "签过名的正式包"。
           name: ${{ steps.naming.outputs.artifact_name }}
-          path: |
-            app/build/outputs/apk/release/*.apk
-            app/build/outputs/apk/release/SHA256SUMS.txt
-            app/build/outputs/apk/release/apksigner-verify.txt
-            build-info.json
+          # 单一扁平目录: artifact 里就是这些文件本身, 没有多余的目录层级可以让
+          # 下载端和上传端对"文件在哪"产生分歧。
+          path: release-bundle/
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
@@ -464,58 +507,56 @@ jobs:
           # full history + tags: the release-notes step diffs against the previous tag
           fetch-depth: 0
 
-      - name: Download APK artifacts
+      - name: Download the release bundle
         uses: actions/download-artifact@v4
         with:
           name: ${{ needs.build.outputs.artifact_name }}
-          path: .
+          path: release-bundle
 
       # 发布前的最后一道工具化检查: 这一步失败就没有 Release。
       #
-      # 这里曾经找错路径: download-artifact 把 artifact 的内容摊在当前目录
-      # (APK 与 build-info.json 都在仓库根), 但这一步去 app/build/outputs/apk/release/
-      # 里找。那正是 build job 里真实存在的目录, 而 publish job 只做 fetch-depth: 0 的
-      # checkout —— 它并不重建 APK, 所以那是另一个目录。配合 `shopt -s nullglob`,
-      # 通配符展开为空数组, for 循环体一次都不执行, 于是脚本会打印
-      # "all 0 APKs verify as signed with a non-debug certificate" 并成功退出,
+      # 这里曾经找错路径: download-artifact 把 artifact 的内容摊在一个目录里, 而这一步
+      # 去 app/build/outputs/apk/release/ 找 —— 那是 build job 里真实存在的目录, 而
+      # publish job 只做 checkout, 并不重建 APK。配合 `nullglob`, 通配符展开为空数组,
+      # 循环体一次都不执行, 于是脚本会打印 "all 0 APKs verify as signed" 并成功退出,
       # 把一个**从未被验证过**的 artifact 直接送进 Release。
       #
-      # 现在的形式让"什么都没找到"必然是失败: 先按 artifact 实际落点枚举, 再要求
-      # 数量正好是每个 ABI 一个, 最后才交给与 build job 同一个测量脚本。
-      - name: Verify the APKs are signed before publishing
+      # 现在由 verify_release_bundle.py 一次做完: 要求 bundle 是扁平的、恰好两个 ABI、
+      # 每个文件都对得上 SHA256SUMS.txt、build-info.json 描述的就是这批字节、core 是
+      # 40 位固定 pin、签名状态符合本次运行的要求。它把**可发布文件清单**写到
+      # BUNDLE_FILES, 下一步上传的就是这个清单 —— 被验证的字节和被上传的字节因此是
+      # 同一批文件, 而不是两个"应该一致"的路径表达式。
+      - name: Verify the release bundle before publishing
+        id: preflight
         run: |
           set -euo pipefail
-          # artifact 的落点就是当前目录; 递归找是为了不依赖 ABI 目录结构。
-          mapfile -t APKS < <(find . -type f -name '*.apk' | sort)
-          if [ "${#APKS[@]}" -eq 0 ]; then
-            echo "::error::no APKs anywhere in the downloaded artifact"
-            find . -maxdepth 3 | sort
+          ls -la release-bundle
+          python3 .github/scripts/verify_release_bundle.py release-bundle \
+            --expect-signature signed \
+            --expect-version "$(grep '^versionName=' version.properties | cut -d= -f2 | tr -d ' \r')" \
+            | tee bundle-files.txt
+          if [ ! -s bundle-files.txt ]; then
+            echo "::error::the preflight produced no publishable file list"
             exit 1
           fi
-          # split ABI 每个一个: 数量不对说明 artifact 与 naming 步骤的约定漂了,
-          # 这时宁可失败也不要发布一个形状不明的包。
-          if [ "${#APKS[@]}" -ne 2 ]; then
-            echo "::error::expected 2 per-ABI release APKs (arm64-v8a + x86_64), found ${#APKS[@]}"
-            printf '%s\n' "${APKS[@]}"
-            exit 1
-          fi
-          printf 'found %d APK(s):\n' "${#APKS[@]}"
-          printf '  %s\n' "${APKS[@]}"
-          # 与 build job 同一个测量脚本, 所以两处的判定不可能各自漂移。
+          echo "=== files that will be uploaded (the verified set) ==="
+          cat bundle-files.txt
+          # 与 build job 同一个测量脚本, 对**同一批实际文件**再测一次签名。
+          mapfile -t APKS < <(grep '\.apk$' bundle-files.txt)
           bash .github/scripts/measure_apk_signature.sh signed "${APKS[@]}"
           echo "all ${#APKS[@]} APKs verify as signed with a non-debug certificate"
 
       # 更新摘要 = "版本提交"(范围内最后改 version.properties 的那个)的完整
       # message(标题+正文), 再附自上一 tag 以来的其余提交。按 version.properties
       # 定位而不是 tag 落点 —— tag 可能落在版本提交之后的杂项提交上(如 v0.5.3)。
-      # 内核/构建元数据取自 artifact 里的 build-info.json, 因为构建 job 的环境变量
-      # 不会跨 job 传递。
+      # 内核/构建元数据取自 artifact 里的 build-info.json —— 现在是 release-bundle/
+      # 里那一份, 也就是 preflight 刚刚校验过的那一份, 而不是可能存在的另一份拷贝。
       - name: Generate release notes
         run: |
           set -euo pipefail
           python3 - <<'PY' > core_meta.txt
           import json
-          d = json.load(open("build-info.json"))
+          d = json.load(open("release-bundle/build-info.json"))
           for key in ("core_repository", "core_branch_hint", "core_commit", "build_time", "signature_state"):
               print(d[key])
           PY
@@ -558,10 +599,19 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          # 只上传 preflight 实际验证过的那些路径(bundle-files.txt)。
+          #
+          # 这里曾经写 `app/build/outputs/apk/release/*.apk` 等四个构建目录路径, 与验签
+          # 步骤的落点无关 —— 也就是说"被验证的文件"和"被发布的文件"由两个独立的路径
+          # 表达式描述, 只有约定保证它们指同一批字节。现在两者是同一个清单:
+          # verify_release_bundle.py 输出什么, 这里就上传什么。
+          #
+          # 用清单而不是 release-bundle/* 通配, 是为了让"多余文件混进 Release"不可能
+          # 发生: bundle 里若出现第三个 APK, preflight 已经因为 ABI 数量不符而失败。
           files: |
-            app/build/outputs/apk/release/*.apk
-            app/build/outputs/apk/release/SHA256SUMS.txt
-            app/build/outputs/apk/release/apksigner-verify.txt
-            build-info.json
+            release-bundle/*.apk
+            release-bundle/SHA256SUMS.txt
+            release-bundle/apksigner-verify.txt
+            release-bundle/build-info.json
           body_path: release_notes.md
           fail_on_unmatched_files: true
