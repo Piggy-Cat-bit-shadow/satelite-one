@@ -91,7 +91,10 @@
     <string name="dash_caption_session">Session</string>
     <string name="dash_caption_session_hint">Connected for · tap for details</string>
     <string name="dash_caption_traffic">Traffic</string>
-    <string name="dash_traffic_summary">Σ %1$s · %2$d conns</string>
+    <string name="dash_caption_runtime">Runtime</string>
+    <string name="dash_runtime_memory">Memory</string>
+    <string name="dash_runtime_goroutines">Go goroutines</string>
+    <string name="dash_traffic_summary">Σ %1$s</string>
     <string name="dash_mix_subs">Mix · %1$d subs</string>
     <string name="dash_subs_none">None</string>
     <string name="dash_caption_subs">Subscription</string>

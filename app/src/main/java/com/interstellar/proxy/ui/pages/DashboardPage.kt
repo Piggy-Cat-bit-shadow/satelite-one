@@ -60,7 +60,6 @@ import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.data.SubscriptionRepository
 import com.interstellar.proxy.data.config.MinimalConfigBuilder
 import com.interstellar.proxy.ui.AppViewModel
-import com.interstellar.proxy.ui.ConnectionsViewModel
 import com.interstellar.proxy.ui.components.FaceMark
 import com.interstellar.proxy.ui.components.GlassButton
 import com.interstellar.proxy.ui.components.GlassButtonStyle
@@ -83,7 +82,6 @@ import com.interstellar.proxy.core.CoreGroup
 @Composable
 fun DashboardPage(
     viewModel: AppViewModel,
-    connectionsViewModel: ConnectionsViewModel,
     onStart: () -> Unit = { viewModel.startProxy() },
     onOpenSubPage: (SettingsSubPage) -> Unit = {},
     onOpenTab: (MainTab) -> Unit = {},
@@ -101,11 +99,10 @@ fun DashboardPage(
     val mixEnabled by viewModel.mixEnabled.collectAsState()
     val mixSubscriptionIds by viewModel.mixSubscriptionIds.collectAsState()
     val connectedAt by viewModel.connectedAt.collectAsState()
-    val connections by connectionsViewModel.connections.collectAsState()
     val history by viewModel.history.collectAsState()
     val proxyScope by viewModel.proxyScope.collectAsState()
     val running = status == Status.Started
-    val activeConnectionCount = connections.count { !it.closed }
+    val runtime by viewModel.runtime.collectAsState()
     // raw configs may not name any group "proxy" — fall back to the first selector
     val mainGroup = groups.find { it.tag == MinimalConfigBuilder.GROUP_TAG }
         ?: groups.firstOrNull { it.type.equals("selector", ignoreCase = true) }
@@ -302,7 +299,7 @@ fun DashboardPage(
 
             Spacer(Modifier.height(12.dp))
 
-            // ── 仪表网格：核心 / 流量曲线 / 网络探测 / 订阅
+            // ── 仪表网格：会话 / 流量 / 运行状态 / 订阅
             val down = Libbox.formatBytes(speed.downlinkPerSecond)
             val up = Libbox.formatBytes(speed.uplinkPerSecond)
             val total = Libbox.formatBytes(speed.uplinkTotal + speed.downlinkTotal)
@@ -350,14 +347,13 @@ fun DashboardPage(
                         )
                     }
                 }
-                val connectionCount = activeConnectionCount
                 InstrumentCard(
                     caption = stringResource(R.string.dash_caption_traffic),
                     onClick = { onOpenSubPage(SettingsSubPage.Connections) },
                     modifier = Modifier.weight(1f),
                     secondary = {
                         Text(
-                            stringResource(R.string.dash_traffic_summary, total, connectionCount),
+                            stringResource(R.string.dash_traffic_summary, total),
                             color = colors.textTertiary,
                             fontSize = 11.sp,
                             fontFamily = FontFamily.Monospace,
@@ -396,6 +392,22 @@ fun DashboardPage(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                 modifier = Modifier.fillMaxWidth(),
             ) {
+                // 运行状态: 直接复用 StatusMessage 的 memory / goroutines。
+                // 没有新增 CommandClient, 没有轮询; 内核未运行时显示 "—" 而不是假的 0。
+                InstrumentCard(
+                    caption = stringResource(R.string.dash_caption_runtime),
+                    modifier = Modifier.weight(1f),
+                ) {
+                    val memoryText =
+                        if (running) Libbox.formatBytes(runtime.memoryBytes) else "—"
+                    val goroutineText =
+                        if (running) runtime.goroutines.toString() else "—"
+                    Column {
+                        RuntimeRow(stringResource(R.string.dash_runtime_memory), memoryText)
+                        Spacer(Modifier.height(2.dp))
+                        RuntimeRow(stringResource(R.string.dash_runtime_goroutines), goroutineText)
+                    }
+                }
                 val activeSub = subscriptions.find { it.id == activeSubscriptionId }
                 val quotaSubs = if (mixEnabled) {
                     subscriptions.filter { it.id in mixSubscriptionIds }
@@ -572,6 +584,33 @@ private fun InstrumentCard(
             content()
         }
         secondary()
+    }
+}
+
+/** One `label  value` line inside the runtime card. */
+@Composable
+private fun RuntimeRow(label: String, value: String) {
+    val colors = LocalInterstellarColors.current
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Text(
+            label,
+            color = colors.textTertiary,
+            fontSize = 11.sp,
+            maxLines = 1,
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            value,
+            color = colors.text,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            fontFamily = FontFamily.Monospace,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 

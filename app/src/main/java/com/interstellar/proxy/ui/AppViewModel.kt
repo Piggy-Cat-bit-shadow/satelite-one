@@ -42,6 +42,19 @@ data class SpeedState(
 )
 
 /**
+ * Kernel runtime footprint, taken verbatim from the existing Status stream.
+ *
+ * `memory` is the Go heap the kernel reports and `goroutines` is
+ * `runtime.NumGoroutine()` inside sing-box — NOT a Kotlin coroutine count. Both
+ * arrive on the StatusMessage we already subscribe to, so the home page needs no
+ * extra command client, no polling and no /proc reading.
+ */
+data class RuntimeState(
+    val memoryBytes: Long = 0,
+    val goroutines: Int = 0,
+)
+
+/**
  * Resolve which group a manual url-test should target.
  *
  * urltest groups (auto) are testable directly, so the requested tag
@@ -82,6 +95,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _speed = MutableStateFlow(SpeedState())
     val speed: StateFlow<SpeedState> = _speed
+
+    private val _runtime = MutableStateFlow(RuntimeState())
+    val runtime: StateFlow<RuntimeState> = _runtime
 
     /** Per-second (down, up) samples for the live chart, newest last. */
     private val _history = MutableStateFlow<List<Pair<Long, Long>>>(emptyList())
@@ -273,6 +289,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     uplinkTotal = status.uplinkTotal,
                     downlinkTotal = status.downlinkTotal,
                 )
+                _runtime.value = RuntimeState(
+                    memoryBytes = status.memory,
+                    goroutines = status.goroutines,
+                )
                 val sample = status.downlink to status.uplink
                 _history.value = (_history.value + sample).takeLast(60)
             }
@@ -404,6 +424,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             _status.value = Status.Stopped
         }
         _connectedAt.value = 0L
+        _runtime.value = RuntimeState()
         Settings.tileActive = false
     }
 

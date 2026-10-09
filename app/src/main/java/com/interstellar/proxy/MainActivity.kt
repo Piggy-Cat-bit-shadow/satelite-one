@@ -50,6 +50,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -186,14 +187,16 @@ fun AppRoot(
     val logsViewModel: LogsViewModel = viewModel()
     val connectionsViewModel: ConnectionsViewModel = viewModel()
 
+    // App-wide streams. Logs are deliberately always-on: they are after-the-fact
+    // debug evidence, so capture must never depend on a page being open.
+    // Connections is the opposite — a pure presentation stream — and is driven by
+    // page visibility below instead of being started here.
     DisposableEffect(Unit) {
         appViewModel.connect()
         logsViewModel.connect()
-        connectionsViewModel.connect()
         onDispose {
             appViewModel.disconnect()
             logsViewModel.disconnect()
-            connectionsViewModel.disconnect()
         }
     }
 
@@ -241,6 +244,12 @@ fun AppRoot(
                 ) { pages ->
                     val current = pages.lastOrNull()
                     if (current != null) {
+                        // Pushed pages cover the tab roots, so the root pager's
+                        // Logs page (if any) counts as UI-inactive here.
+                        LaunchedEffect(current) {
+                            connectionsViewModel.setActive(current == SettingsSubPage.Connections)
+                            logsViewModel.setUiVisible(current == SettingsSubPage.Logs)
+                        }
                         SubPageContainer(
                             title = com.interstellar.proxy.ui.pages.settingsSubPageTitle(current),
                             onBack = { pop() },
@@ -265,6 +274,16 @@ fun AppRoot(
                             initialPage = nav.tab.ordinal,
                         ) { tabs.size }
                         val scope = androidx.compose.runtime.rememberCoroutineScope()
+                        // A finger swipe moves the pager without writing nav.tab, so
+                        // visibility must follow pagerState.currentPage, never nav.tab.
+                        // The connections session stays closed on the tab roots.
+                        LaunchedEffect(pagerState.currentPage) {
+                            connectionsViewModel.setActive(false)
+                            logsViewModel.setUiVisible(
+                                tabs.getOrNull(pagerState.currentPage) ==
+                                    com.interstellar.proxy.ui.pages.MainTab.Logs,
+                            )
+                        }
                         fun jumpTo(tab: com.interstellar.proxy.ui.pages.MainTab) {
                             if (nav.tab != tab) onNavChange(nav.copy(tab = tab, pages = emptyList()))
                             // direct switch, iOS TabBar style — no carousel ride
@@ -284,7 +303,6 @@ fun AppRoot(
                                 when (tabs[page]) {
                                     com.interstellar.proxy.ui.pages.MainTab.Home -> DashboardPage(
                                         viewModel = appViewModel,
-                                        connectionsViewModel = connectionsViewModel,
                                         onStart = { requestVpnThenStart { appViewModel.startProxy() } },
                                         onOpenSubPage = { sub -> push(sub) },
                                         onOpenTab = { t -> jumpTo(t) },
