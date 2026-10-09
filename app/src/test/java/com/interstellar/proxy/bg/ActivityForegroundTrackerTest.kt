@@ -109,4 +109,38 @@ class ActivityForegroundTrackerTest {
         }
         check(tracker.startedCount == 0)
     }
+
+    @Test
+    fun `a configuration change whose replacement never starts keeps the last known fact`() {
+        // DOCUMENTED PLATFORM LIMITATION, pinned so it stays deliberate.
+        //
+        // The sequence is: the old Activity stops for a configuration change, and the
+        // replacement then fails to reach onStart (crash, failed creation). Android
+        // gives us no callback that says "the replacement is never coming", so the only
+        // alternatives are to fabricate a background edge on every rotation (wrong, and
+        // that was the bug this class already fixed) or to keep reporting the last known
+        // value. We keep the last known value and say so.
+        val (tracker, events) = tracker()
+        tracker.onActivityStarted()
+        tracker.onActivityStopped(isChangingConfigurations = true)
+        check(tracker.startedCount == 0) { "the counter must still be balanced" }
+        check(events.toList() == listOf(true)) {
+            "no background edge may be fabricated for a configuration change: $events"
+        }
+        // Only a later, unambiguous event moves the reported fact.
+        tracker.onActivityStopped(isChangingConfigurations = false)
+        check(events.last() == false) { "a real stop must still report background: $events" }
+    }
+
+    @Test
+    fun `ten consecutive rotations never fabricate a background edge`() {
+        val (tracker, events) = tracker()
+        tracker.onActivityStarted()
+        repeat(10) {
+            tracker.onActivityStopped(isChangingConfigurations = true)
+            tracker.onActivityStarted()
+        }
+        check(tracker.startedCount == 1) { "count drifted to ${tracker.startedCount}" }
+        check(events.none { !it }) { "a rotation fabricated a background edge: $events" }
+    }
 }

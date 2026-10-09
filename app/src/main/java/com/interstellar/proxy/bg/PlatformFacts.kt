@@ -220,16 +220,32 @@ object PlatformFacts {
 
     fun onScreenChanged(on: Boolean) = synchronized(lock) {
         screenOn = on
+        debugFact("screen", on)
         current?.let { live -> enqueue(live) { sink -> sink.setScreenOn(on) } }
     }
 
     fun onForegroundChanged(foreground: Boolean) = synchronized(lock) {
         appForeground = foreground
+        debugFact("foreground", foreground)
         current?.let { live -> enqueue(live) { sink -> sink.setAppForeground(foreground) } }
     }
 
     fun onUserPresent() = synchronized(lock) {
         current?.let { live -> enqueue(live) { sink -> sink.reportDeviceWake() } }
+    }
+
+    /**
+     * Debug-build observation of the two booleans this class reports.
+     *
+     * A fact whose value cannot be seen is a fact nobody can check on a device, and the
+     * foreground value has no other external surface. This is a log line — no control
+     * port, no API, no stored state — and it is compiled out of release builds because
+     * `BuildConfig.DEBUG` is a constant there, so it adds nothing to a shipped APK.
+     */
+    private fun debugFact(name: String, value: Boolean) {
+        if (com.interstellar.proxy.BuildConfig.DEBUG) {
+            android.util.Log.d("InterstellarUI", "platform fact: $name=$value attached=${current != null}")
+        }
     }
 
     // ---- registration ----
@@ -318,7 +334,14 @@ internal class ActivityForegroundTracker(
         if (started > 0) return@synchronized
         // A configuration change stops the old Activity and immediately starts its
         // replacement, so reporting background here would be a fabricated edge.
-        // (If the process really is going away, its next onStop reports it.)
+        //
+        // DOCUMENTED PLATFORM LIMITATION: if the replacement Activity never reaches
+        // onStart (it crashed, or its creation failed), this process keeps reporting the
+        // last known foreground until some later lifecycle event arrives. There is no
+        // platform callback that distinguishes "a rotation is in progress" from "the
+        // replacement never came" without a timer, and a timer here would be exactly the
+        // polling this design avoids. Android makes no statement we could forward, so we
+        // forward none rather than guessing. See the test that pins this behaviour.
         if (isChangingConfigurations) return@synchronized
         onForegroundChanged(false)
     }
