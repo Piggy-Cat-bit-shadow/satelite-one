@@ -329,13 +329,14 @@ gradlew.bat --no-daemon --max-workers=2 --console=plain :app:testDebugUnitTest :
 
 | 标签 | 判定 |
 |---|---|
-| `GATE4_EMULATOR_PASS` | ✅ **（部分）** 新代码 + 真实固定 pin 内核在 API36 x86_64 AVD 完成 导入 → 连接 → 真实业务流 → 20 轮 Stop/立即 Start → 干净归属 的闭环。未覆盖：通知栏 Stop 后立即 Start、Start 失败穿插 Stop、`onRevoke` |
-| `ANDROID_SCREEN_FACTS_VERIFIED` | ✅ **（部分）** 屏幕事实的**顺序与所有权**已由 JVM 确定性测试证明（192 例），P0-A 修复带旧红→新绿与破坏性对照。**但设备端的息屏场景（T01–T12）本段未跑** |
-| `ANDROID_CLIENT_CORRECT + BLOCKED_BY_CORE_ABI` | ✅ 适用于 P1-C：客户端桥接正常，独立 Resume Edge 所需的接口**不在**固定 AAR 的公开 API 中 |
+| `GATE4_EMULATOR_PASS` | ✅ **（部分）** 新代码 + 真实固定 pin 内核在 API36 x86_64 AVD 完成 导入 → 连接 → 真实业务流 → 20 轮 Stop/立即 Start（0–100 ms）→ 干净归属 的闭环。未覆盖：通知栏 Stop 后立即 Start、Start 失败穿插 Stop、`onRevoke`（`BLOCKED`） |
+| `ANDROID_SCREEN_FACTS_VERIFIED` | ✅ **（部分）** 屏幕事实的**顺序与所有权**由 JVM 确定性测试证明（192 例），且已取得**设备侧对照**：SCREEN_OFF/ON 各产生一对事实、顺序正确、无重复（`unchanged` 标记未出现）、息屏 43 s 后隧道与归属完好、屏幕事件期间 **0 次** `startProxy`/`core STARTED`。**未覆盖**：息屏期间活跃业务流连续性（`NOT_RUN`）、解锁沿（`USER_PRESENT`）、T01–T12 其余项 |
+| `ANDROID_CLIENT_CORRECT + BLOCKED_BY_CORE_ABI` | ✅ 适用于 P1-C：客户端桥接正常，独立 Resume Edge 所需的接口**不在**固定 AAR 的公开 API 中（从产物常量池取证） |
 | `DEVICE_NOT_TESTED` | ✅ 真机项全部未测 |
-| `POWER_NOT_QUANTIFIED` | ✅ 无对照功耗样本 |
+| `EMULATOR_ONLY` | ✅ 全部设备证据均来自 `emulator-5554` |
+| `POWER_NOT_QUANTIFIED` | ✅ 无对照功耗样本，不写省电百分比 |
 | `REAL_DEVICE_PENDING` | ✅ |
-| `CI_NOT_RUN`（本轮最终 SHA） | ✅ |
+| `CI_NOT_RUN`（本轮最终 SHA） | ✅ 本轮 5 个 commit 推送后未取回 Actions 结论 |
 | **不写** | `READY_FOR_RELEASE`、`REAL_DEVICE_PASS`、`FULL_APPLE_PARITY` |
 
 ### G-1 剩余事项
