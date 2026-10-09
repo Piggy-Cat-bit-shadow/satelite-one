@@ -279,17 +279,39 @@ def main():
     publishable = sorted(apks) + [name for name in REQUIRED_FILES] + [
         name for name in OPTIONAL_FILES if name in entries
     ]
+
+    # ---- 7. the bundle must contain NOTHING ELSE --------------------------------
+    # Verified-set == uploaded-set has to hold by construction, not by two enumerations
+    # agreeing. The publish step uploads exactly the names written by `--list-to`, and
+    # `action-gh-release` resolves those against its `working-directory`; the only way a
+    # file can reach a release is by appearing in that list. Refusing to verify a bundle
+    # that holds anything extra is what keeps the list complete: without it, a stray file
+    # would be silently *not* published (a difference nobody would notice until someone
+    # looked for it), and the build job's own bundle could drift from what it claims.
+    unexpected_files = sorted(set(entries) - set(publishable))
+    if unexpected_files:
+        fail(
+            f"bundle contains files the verifier does not know about: {unexpected_files}; "
+            f"the publishable set is {publishable}. Either the naming step produced "
+            "something new (declare it) or a stray file reached the bundle (remove it)"
+        )
+
     print(
         f"bundle OK: {len(apks)} APK(s), signature_state={state}, "
         f"version={info.get('app_version')}, core={core_commit[:12]}",
         file=sys.stderr,
     )
-    lines = [os.path.join(bundle, name) for name in publishable]
+    # stdout keeps the full paths, for a human reading the log and for any caller that
+    # wants to address the files in place.
+    for name in publishable:
+        print(os.path.join(bundle, name))
     if args.list_to:
+        # The file gets BARE NAMES, deliberately. It is a `files:` input for
+        # `action-gh-release` with `working-directory: <bundle>`, so bare names are what
+        # that action needs; and a list that cannot express "somewhere else" cannot be
+        # misread as pointing at a different copy of the bytes.
         with open(args.list_to, "w", encoding="utf-8") as handle:
-            handle.write("\n".join(lines) + "\n")
-    for line in lines:
-        print(line)
+            handle.write("\n".join(publishable) + "\n")
 
 
 if __name__ == "__main__":

@@ -566,6 +566,34 @@ jobs:
       # 定位而不是 tag 落点 —— tag 可能落在版本提交之后的杂项提交上(如 v0.5.3)。
       # 内核/构建元数据取自 artifact 里的 build-info.json —— 现在是 release-bundle/
       # 里那一份, 也就是 preflight 刚刚校验过的那一份, 而不是可能存在的另一份拷贝。
+      #
+      # 本步骤把 bundle-files.txt 读成 `files:` 需要的多行字符串, 并再拦一道:
+      # preflight 已经把"清单之外没有别的文件"变成硬失败, 这里独立复核一次 ——
+      # 清单条数必须等于目录里的文件条数。两个都过了, 拟上传集合与已校验集合才
+      # 真正是同一批文件。
+      - name: Read the verified publishable set
+        id: verified
+        run: |
+          set -euo pipefail
+          if [ ! -s bundle-files.txt ]; then
+            echo "::error::bundle-files.txt is missing or empty"
+            exit 1
+          fi
+          ls -1 release-bundle | sort > on-disk.txt
+          sort bundle-files.txt > verified.txt
+          if ! diff -u on-disk.txt verified.txt > diff.txt 2>&1; then
+            echo "::error::the verified list and the bundle directory disagree"
+            cat diff.txt
+            exit 1
+          fi
+          echo "verified set == bundle contents ($(wc -l < verified.txt) files)"
+          cat verified.txt
+          {
+            echo 'files<<__BUNDLE_FILES_EOF__'
+            cat verified.txt
+            echo '__BUNDLE_FILES_EOF__'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Generate release notes
         run: |
           set -euo pipefail
@@ -614,19 +642,21 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          # 只上传 preflight 实际验证过的那些路径(bundle-files.txt)。
+          # 上传的就是 preflight 写出的那份清单本身 —— 值由上一个步骤从
+          # bundle-files.txt 读进 step output, 这里不再重新枚举一次。
           #
           # 这里曾经写 `app/build/outputs/apk/release/*.apk` 等四个构建目录路径, 与验签
           # 步骤的落点无关 —— 也就是说"被验证的文件"和"被发布的文件"由两个独立的路径
-          # 表达式描述, 只有约定保证它们指同一批字节。现在两者是同一个清单:
-          # verify_release_bundle.py 输出什么, 这里就上传什么。
+          # 表达式描述, 只有约定保证它们指同一批字节。
           #
-          # 用清单而不是 release-bundle/* 通配, 是为了让"多余文件混进 Release"不可能
-          # 发生: bundle 里若出现第三个 APK, preflight 已经因为 ABI 数量不符而失败。
-          files: |
-            release-bundle/*.apk
-            release-bundle/SHA256SUMS.txt
-            release-bundle/apksigner-verify.txt
-            release-bundle/build-info.json
+          # 上一版改成了枚举 `release-bundle/*.apk` + 三个固定文件名。那仍然**是第二次
+          # 枚举**: 它与 verifier 内部的 publishable 集合一致只是"应该一致", 而 verifier
+          # 当时也允许 bundle 里存在它不认识的多余文件 —— 那些文件会被静默地不发布,
+          # 谁也不会发现。现在两处都收口: verifier 拒绝任何它不认识的文件 (拟上传集合
+          # 因此完整), 这里则一个字都不重新枚举 (被校验集合因此就是被上传集合)。
+          #
+          # working-directory 让清单里的裸文件名解析到 release-bundle/ 内的那一份字节。
+          files: ${{ steps.verified.outputs.files }}
+          working-directory: release-bundle
           body_path: release_notes.md
           fail_on_unmatched_files: true

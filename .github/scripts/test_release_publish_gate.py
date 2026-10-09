@@ -108,16 +108,55 @@ def test_publish_job_verifies_and_uploads_one_bundle():
         "artifact download does not populate — the loop body never runs and the step "
         "passes without verifying anything",
     )
-    # The verified set and the uploaded set must be the same expression space: the release
-    # step may only reference the bundle directory.
-    release_files = re.search(r"files: \|\n((?:\s+\S+\n)+)", publish)
-    if check(release_files is not None, "could not find the release `files:` list"):
-        listed = release_files.group(1).strip().splitlines()
-        outside = [line.strip() for line in listed if not line.strip().startswith("release-bundle/")]
-        check(
-            not outside,
-            f"the release uploads files outside the verified bundle: {outside}",
-        )
+    # ---- the uploaded set IS the verified set, by construction ------------------
+    #
+    # Round 6 satisfied this with a literal `files: |` list of `release-bundle/...`
+    # entries, and this test asserted that every line started with `release-bundle/`.
+    # That was still a SECOND enumeration: the verifier built its own publishable list
+    # internally, and the two agreed only because someone kept them in step. Worse, the
+    # verifier tolerated files it did not recognise, so a stray file would be silently
+    # *omitted* from the release and nobody would notice.
+    #
+    # Now the upload value is read out of the verifier's own list, so the property is
+    # structural rather than conventional. Three things have to hold.
+    literal_files = re.search(r"files: \|\n((?:\s+\S+\n)+)", publish)
+    check(
+        literal_files is None,
+        "the release re-enumerates its upload list literally again; it must upload the "
+        "list the verifier produced, so that 'verified' and 'uploaded' cannot drift",
+    )
+    check(
+        re.search(r"files: \$\{\{\s*steps\.verified\.outputs\.files\s*\}\}", publish) is not None,
+        "the release does not upload the verified step's file list",
+    )
+    check(
+        "working-directory: release-bundle" in publish,
+        "the release does not resolve the verified list inside the bundle directory; the "
+        "bare names in that list would then be looked up against the wrong copy of the bytes",
+    )
+    # The step that produces that list must itself refuse to run on a disagreement.
+    check(
+        re.search(r"diff -u on-disk\.txt verified\.txt", publish) is not None,
+        "the publish job does not cross-check the verified list against the bundle "
+        "directory's actual contents",
+    )
+    check(
+        re.search(r"bundle-files\.txt", publish) is not None,
+        "the publish job never reads the verified file list",
+    )
+    # And the verifier has to make the list complete, which it only can by refusing
+    # bundles that contain anything it does not know about.
+    verifier = read(VERIFY_BUNDLE)
+    check(
+        "unexpected_files" in verifier,
+        "verify_release_bundle.py no longer rejects files it does not recognise; a stray "
+        "file in the bundle would then be silently left out of the release",
+    )
+    check(
+        re.search(r"handle\.write\(\"\\n\"\.join\(publishable\)", verifier) is not None,
+        "the verified list is not written as bare file names; it is consumed as an "
+        "action-gh-release `files:` input resolved against the bundle directory",
+    )
     check(
         "verify_release_bundle.py" in publish,
         "publish job does not run the bundle preflight verifier",
@@ -347,7 +386,7 @@ def write_bundle(root, *, abis=("arm64-v8a", "x86_64"), signature_state="signed-
                  extra_apk=None, tamper=None, omit=None, sums_override=None,
                  info_override=None, nested=False, apk_version=BUNDLE_VERSION,
                  app_commit=APP_COMMIT, core_commit=CORE_COMMIT, core_ref="pinned",
-                 kind=None):
+                 kind=None, stray=None):
     """Materialise a release bundle. Every knob is a documented attack on the gate."""
     os.makedirs(root, exist_ok=True)
     kind = kind if kind is not None else signature_state
@@ -405,6 +444,14 @@ def write_bundle(root, *, abis=("arm64-v8a", "x86_64"), signature_state="signed-
         json.dump(info, handle, indent=2)
     with open(os.path.join(root, "apksigner-verify.txt"), "w", encoding="utf-8") as handle:
         handle.write("fake apksigner output\n")
+    # C13-C16: files the verifier has no rule for. Written last, so every check above is
+    # exercised on a bundle that is otherwise perfect - the only defect under test is the
+    # presence of the stray file.
+    for name in stray or ():
+        path = os.path.join(target_dir, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(b"stray payload " + name.encode())
     return root
 
 
@@ -553,6 +600,67 @@ def test_bundle_preflight_positive_and_negative():
             extra_args=("--expect-version", BUNDLE_VERSION),
         )
         check(code != 0 and "carries version" in err, f"a version mismatch must FAIL, got exit={code}: {err.strip()[:160]}")
+
+        # ------------------------------------------------------------------
+        # C13-C16: files the verifier does not recognise.
+        #
+        # These close the round-6 hole in "verified set == uploaded set". The publish job
+        # uploads exactly what the verifier lists, so the list has to be COMPLETE - and it
+        # can only be complete if a bundle containing anything else is refused. Before this
+        # rule, each of these files would have been silently left out of the release:
+        # `fail_on_unmatched_files` only fires for listed-but-missing, never for
+        # present-but-unlisted, so nothing anywhere would have complained.
+        # ------------------------------------------------------------------
+
+        # C13: a library or config left behind by a build step.
+        code, _, err = run_bundle_preflight(
+            write_bundle(os.path.join(tmp, "c13"), stray=("libbox.so",))
+        )
+        check(
+            code != 0 and "does not know about" in err,
+            f"C13 (stray .so in bundle) must FAIL, got exit={code}: {err.strip()[:160]}",
+        )
+
+        # C14: a keystore or a signing log - the shape that would matter most.
+        code, _, err = run_bundle_preflight(
+            write_bundle(os.path.join(tmp, "c14"), stray=("release.keystore",))
+        )
+        check(
+            code != 0 and "does not know about" in err,
+            f"C14 (stray keystore in bundle) must FAIL, got exit={code}: {err.strip()[:160]}",
+        )
+
+        # C15: a second manifest under a different name. Both "extra file" and "two
+        # sources of truth about the bytes".
+        code, _, err = run_bundle_preflight(
+            write_bundle(os.path.join(tmp, "c15"), stray=("SHA256SUMS.txt.bak",))
+        )
+        check(
+            code != 0 and "does not know about" in err,
+            f"C15 (stray second manifest) must FAIL, got exit={code}: {err.strip()[:160]}",
+        )
+
+        # C16: a nested directory anywhere. Already refused by the flatness rule; kept
+        # separately so that removing flatness cannot quietly re-open this.
+        code, _, err = run_bundle_preflight(
+            write_bundle(os.path.join(tmp, "c16"), stray=("payload/extra.bin",))
+        )
+        check(code != 0, f"C16 (nested stray dir) must FAIL, got exit={code}")
+
+        # C17: the positive control. The SAME fixture WITHOUT the stray file must pass, so
+        # C13-C16 prove the stray file is the cause rather than a broken fixture.
+        ok = write_bundle(os.path.join(tmp, "c17"))
+        code, out, err = run_bundle_preflight(ok)
+        check(code == 0, f"C17 (control, no stray) must PASS, got {err.strip()[:200]}")
+        if code == 0:
+            # ... and the printed list is exactly the directory's contents, which is the
+            # invariant the publish job's `diff` step re-checks in CI.
+            on_disk = sorted(os.listdir(ok))
+            listed = sorted(os.path.basename(l.strip()) for l in out.splitlines() if l.strip())
+            check(
+                on_disk == listed,
+                f"C17: the publishable list must be the whole bundle, got {listed} vs {on_disk}",
+            )
 
 
 def test_dot_slash_manifest_is_rejected():
