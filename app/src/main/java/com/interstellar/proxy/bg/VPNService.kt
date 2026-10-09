@@ -15,9 +15,6 @@ import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.ktx.toIpPrefix
 import com.interstellar.proxy.ktx.toList
 import com.interstellar.proxy.ktx.wrapAppLocale
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
 
 class VPNService :
     VpnService(),
@@ -47,11 +44,15 @@ class VPNService :
     }
 
     override fun onRevoke() {
-        runBlocking {
-            withContext(Dispatchers.Main) {
-                service.onRevoke()
-            }
-        }
+        // `VpnService.onRevoke()` is delivered on the main thread. The previous
+        // implementation wrapped the call in `runBlocking { withContext(Dispatchers.Main) }`,
+        // which blocks the main looper and then asks that same looper to run the work it
+        // is waiting for - a self-deadlock (ANR) as soon as the dispatch is needed.
+        //
+        // No hop and no blocking is required: BoxService.onRevoke() only moves the
+        // service to Stopping and hands the actual teardown to its own IO coroutine, so
+        // it returns immediately on whatever thread called it.
+        service.onRevoke()
     }
 
     override fun autoDetectInterfaceControl(fd: Int) {
