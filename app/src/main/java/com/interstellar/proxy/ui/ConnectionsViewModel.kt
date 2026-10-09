@@ -57,8 +57,11 @@ class ConnectionsViewModel(application: Application) : AndroidViewModel(applicat
     val connected: StateFlow<Boolean> = _connected
 
     /** Bumped on every session start/stop; late callbacks from an old session see a stale value. */
-    /** Session generation + the serialized snapshot commit (see [SessionGate]). */
-    private val gate = SessionGate<ActiveConnection> { _connections.value = it }
+    /** Session generation + the serialized commits (see [SessionGate]). */
+    private val gate = SessionGate<ActiveConnection>(
+        publish = { _connections.value = it },
+        publishConnected = { _connected.value = it },
+    )
 
     @Volatile
     private var store: Connections? = null
@@ -89,15 +92,18 @@ class ConnectionsViewModel(application: Application) : AndroidViewModel(applicat
             CommandClient.ConnectionType.Connections,
             object : CommandClient.Handler {
                 override fun onConnected() {
-                    if (isCurrent(generation)) _connected.value = true
+                    // Through the same generation gate as the list. `if (isCurrent) write`
+                    // was two steps, so a stop landing in between let an old callback
+                    // publish a stale "connected" over a torn-down session.
+                    gate.commitConnected(generation, true)
                 }
 
                 override fun onDisconnected() {
-                    if (isCurrent(generation)) _connected.value = false
+                    gate.commitConnected(generation, false)
                 }
 
                 override fun onConnectionError(kind: CommandClient.ConnectionErrorKind, message: String) {
-                    if (isCurrent(generation)) _connected.value = false
+                    gate.commitConnected(generation, false)
                 }
 
                 override fun writeConnectionEvents(events: ConnectionEvents) {
@@ -130,7 +136,8 @@ class ConnectionsViewModel(application: Application) : AndroidViewModel(applicat
         client?.disconnect()
         client = null
         store = null
-        _connected.value = false
+        // `_connected` is cleared inside gate.stop() below, together with the list, so
+        // an in-flight callback cannot squeeze a stale value in between the two.
         // Then invalidate and drop the snapshot as ONE step. The generation bump and
         // the clear must be atomic with respect to a commit that already passed its
         // own check: otherwise that commit could write a stale list back *after* this
@@ -208,7 +215,10 @@ class ConnectionsViewModel(application: Application) : AndroidViewModel(applicat
  *     first and the clear wipes it, or the clear lands first and the check inside the
  *     lock rejects the commit: both orders end empty.
  */
-internal class SessionGate<T>(private val publish: (List<T>) -> Unit) {
+internal class SessionGate<T>(
+    private val publish: (List<T>) -> Unit,
+    private val publishConnected: (Boolean) -> Unit,
+) {
 
     @Volatile
     private var generation = 0
@@ -229,11 +239,33 @@ internal class SessionGate<T>(private val publish: (List<T>) -> Unit) {
         }
     }
 
-    /** Close the session and clear what it published, as one atomic step. */
+    /**
+     * Publish the connection flag under the same gate as the list.
+     *
+     * The previous `if (isCurrent(generation)) _connected.value = …` was a check and a
+     * write as two steps, and `MutableStateFlow` being thread-safe proves nothing about
+     * the pair: a `stop()` landing between them let an old callback mark a dead session
+     * connected again.
+     */
+    fun commitConnected(candidate: Int, connected: Boolean) {
+        synchronized(lock) {
+            if (candidate != generation) return
+            publishConnected(connected)
+        }
+    }
+
+    /**
+     * Close the session and clear everything it published, as one atomic step.
+     *
+     * The flag is cleared here rather than by the caller precisely so that it cannot be
+     * interleaved with a late commit: once `stop()` returns, the session is both empty
+     * and disconnected.
+     */
     fun stop() {
         synchronized(lock) {
             generation++
             publish(emptyList())
+            publishConnected(false)
         }
     }
 }

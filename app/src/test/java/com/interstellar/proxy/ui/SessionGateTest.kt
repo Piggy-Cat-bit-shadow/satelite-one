@@ -19,7 +19,11 @@ class SessionGateTest {
 
     private class Recorder {
         val published = CopyOnWriteArrayList<List<String>>()
-        val gate = SessionGate<String> { published += it }
+        val connected = CopyOnWriteArrayList<Boolean>()
+        val gate = SessionGate<String>(
+            publish = { published += it },
+            publishConnected = { connected += it },
+        )
     }
 
     @Test
@@ -42,12 +46,16 @@ class SessionGateTest {
     }
 
     @Test
-    fun `stop clears what the session published`() {
+    fun `stop clears what the session published and marks it disconnected`() {
         val r = Recorder()
         val g = r.gate.start()
         r.gate.commit(g, listOf("a", "b"))
+        r.gate.commitConnected(g, true)
         r.gate.stop()
         check(r.published.last().isEmpty()) { "stop must leave the list empty: ${r.published}" }
+        check(r.connected.last() == false) {
+            "stop must leave the session disconnected, got ${r.connected}"
+        }
     }
 
     @Test
@@ -108,5 +116,58 @@ class SessionGateTest {
         val t = Thread { seen = r.gate.generationValue }
         t.start(); t.join(5_000)
         check(seen == g) { "another thread saw generation $seen, expected $g" }
+    }
+
+    // ---- the connection flag is committed through the same gate ----
+
+    @Test
+    fun `a stale connected callback cannot revive a stopped session`() {
+        val r = Recorder()
+        val g = r.gate.start()
+        r.gate.stop()
+        // The old shape was `if (isCurrent(g)) _connected.value = true`: the check and
+        // the write were two steps, so this write landed after the stop and left a dead
+        // page showing "connected".
+        r.gate.commitConnected(g, true)
+        check(r.connected.last() == false) {
+            "a stale onConnected() revived a stopped session: ${r.connected}"
+        }
+    }
+
+    @Test
+    fun `a delayed disconnect from the old session does not knock the new one offline`() {
+        val r = Recorder()
+        val old = r.gate.start()
+        r.gate.commitConnected(old, true)
+        r.gate.stop()
+        val fresh = r.gate.start()
+        r.gate.commitConnected(fresh, true)
+        // The previous generation's client finally reports its disconnect.
+        r.gate.commitConnected(old, false)
+        check(r.connected.last() == true) {
+            "an old disconnect took the live session offline: ${r.connected}"
+        }
+    }
+
+    @Test
+    fun `list and connection flag never cross generations under contention`() {
+        repeat(200) {
+            val r = Recorder()
+            val old = r.gate.start()
+            val fresh = r.gate.start()
+            val go = CountDownLatch(1)
+            val threads = listOf(
+                Thread { go.await(5, TimeUnit.SECONDS); r.gate.commitConnected(old, true) },
+                Thread { go.await(5, TimeUnit.SECONDS); r.gate.commit(old, listOf("stale")) },
+                Thread { go.await(5, TimeUnit.SECONDS); r.gate.stop() },
+                Thread { go.await(5, TimeUnit.SECONDS); r.gate.commitConnected(fresh, true) },
+            )
+            threads.forEach { it.start() }
+            go.countDown()
+            threads.forEach { it.join(5_000) }
+            check(r.published.none { it == listOf("stale") }) {
+                "a stale list was published: ${r.published}"
+            }
+        }
     }
 }
