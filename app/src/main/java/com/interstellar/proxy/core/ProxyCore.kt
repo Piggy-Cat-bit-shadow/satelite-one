@@ -4,18 +4,47 @@ import com.interstellar.proxy.InterstellarApplication
 import io.nekohasekai.libbox.PlatformInterface
 
 /**
+ * Raw Android platform facts, forwarded to the core.
+ *
+ * Facts only — which trim level trims or releases memory, whether a wake resets
+ * transports, whether screen-off pauses anything — all of that lives in sing-box's
+ * shared mobile policy. No implementation of this interface may reinterpret a
+ * level, map it to an action, or trigger a reconnect.
+ */
+interface PlatformFactSink {
+    /** The raw Android `onTrimMemory` level, forwarded unchanged. */
+    fun memoryTrim(level: Int)
+
+    /** Jiejiebox's own UI process is in the foreground. Says nothing about the VPN. */
+    fun setAppForeground(foreground: Boolean)
+
+    fun setScreenOn(on: Boolean)
+
+    /** The user actually unlocked / came back to the device — stronger than SCREEN_ON. */
+    fun reportDeviceWake()
+}
+
+/**
  * Engine-agnostic operations the service layer (BoxService) invokes on the
  * core. There is exactly one implementation — [SingBoxCore] — because this
  * client ships one core only: Piggy-Cat-bit-shadow/sing-box via libbox.
  */
-interface ProxyCore {
+interface ProxyCore : PlatformFactSink {
     /** Create and start the engine itself (CommandServer). */
     suspend fun startup()
 
     /** Apply (first start or hot-reload) a generated config. */
     suspend fun applyConfig(config: String, overrides: CoreOverrides)
 
-    /** Doze pause / resume. */
+    /**
+     * Doze pause / resume.
+     *
+     * Kept as an interface, but the Android device axis no longer drives it: the
+     * old `ACTION_DEVICE_IDLE_MODE_CHANGED → pause()/wake()` path was retired when
+     * the shared screen/device policy took over, because two writers of the same
+     * device state fight each other (a Doze exit would wake a core whose screen is
+     * still off).
+     */
     fun pause()
 
     fun wake()

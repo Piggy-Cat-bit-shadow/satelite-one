@@ -62,6 +62,24 @@ class InterstellarApplication : Application() {
 
         // subscription auto-update schedule
         scheduleAutoUpdate()
+
+        // Android platform facts (screen / user-present / app foreground) are
+        // collected for the whole process; they are only *delivered* while a core
+        // session is attached. See PlatformFacts: facts here, policy in the core.
+        runCatching { com.interstellar.proxy.bg.PlatformFacts.install(this) }
+    }
+
+    /**
+     * Raw Android memory-pressure level, forwarded to the running core unchanged.
+     *
+     * No Kotlin policy: the level is not remapped, not compared against a
+     * threshold, and `TRIM_MEMORY_UI_HIDDEN` is treated as exactly what it is — a
+     * UI-visibility hint, not memory pressure. Delivery hops off the main thread
+     * inside PlatformFacts; when no core is attached this is a no-op.
+     */
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        com.interstellar.proxy.bg.PlatformFacts.onMemoryTrim(level)
     }
 
     private fun scheduleAutoUpdate() {

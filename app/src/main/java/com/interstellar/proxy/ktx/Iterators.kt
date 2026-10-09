@@ -32,4 +32,4 @@ fun LogIterator.toList(): List<LogEntry> = mutableListOf<LogEntry>().apply {
 }
 
 @RequiresApi(Build.VERSION_CODES.TIRAMISU)
-fun RoutePrefix.toIpPrefix() = IpPrefix(InetAddress.getByName(address()), prefix())
+fun RoutePrefix.toIpPrefix() = IpPrefix(InetAddress.getByName(address().value), prefix())

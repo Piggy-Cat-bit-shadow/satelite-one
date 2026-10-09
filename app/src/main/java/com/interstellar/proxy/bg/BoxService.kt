@@ -12,9 +12,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
-import android.os.PowerManager
 import android.util.Log
-import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.MutableLiveData
@@ -99,11 +97,6 @@ class BoxService(private val service: Service, private val platformInterface: Pl
                         stopService()
                     }
 
-                    PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED -> {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                            serviceUpdateIdleMode()
-                        }
-                    }
                 }
             }
         }
@@ -119,7 +112,12 @@ class BoxService(private val service: Service, private val platformInterface: Pl
 
     private suspend fun startCore() {
         com.interstellar.proxy.core.AppLog.log("service", "启动内核 sing-box")
-        core = CoreEngines.create(platformInterface, this).also { it.startup() }
+        val started = CoreEngines.create(platformInterface, this).also { it.startup() }
+        core = started
+        // Bind the Android fact bridge. attach() also reports the current screen and
+        // foreground state immediately, so a core started while the screen is off or
+        // the app is already backgrounded is not left guessing until the next event.
+        PlatformFacts.attach(started)
     }
 
     private suspend fun startService() {
@@ -237,15 +235,6 @@ class BoxService(private val service: Service, private val platformInterface: Pl
         }
     }
 
-    @RequiresApi(Build.VERSION_CODES.M)
-    private fun serviceUpdateIdleMode() {
-        if (InterstellarApplication.powerManager.isDeviceIdleMode) {
-            core?.pause()
-        } else {
-            core?.wake()
-        }
-    }
-
     @OptIn(DelicateCoroutinesApi::class)
     private fun stopService() {
         val current = status.value
@@ -257,6 +246,9 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             receiverRegistered = false
         }
         notification.close()
+        // Facts stop flowing to the core before its teardown starts; the Android
+        // sources themselves are process-scoped and stay installed.
+        PlatformFacts.detach()
         GlobalScope.launch(Dispatchers.IO) {
             val pfd = fileDescriptor
             if (pfd != null) {
@@ -325,10 +317,11 @@ class BoxService(private val service: Service, private val platformInterface: Pl
                 service,
                 receiver,
                 IntentFilter().apply {
+                    // Only service control lives here. The device axis (screen /
+                    // user-present / trim) is reported through PlatformFacts to the
+                    // core's shared policy — keeping a second Doze-driven
+                    // pause()/wake() writer here would fight that policy.
                     addAction(Action.SERVICE_CLOSE)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                        addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
-                    }
                 },
                 ContextCompat.RECEIVER_NOT_EXPORTED,
             )
