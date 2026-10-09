@@ -127,8 +127,23 @@ CommandServer  : close, closeService, pause, wake
 |---|---|---|
 | **P1-B 无双写** | 全仓搜索 `ACTION_DEVICE_IDLE_MODE_CHANGED` / `isDeviceIdleMode` / 对 core 的 `.pause()` / `.wake()` **调用**：**零**。`SingBoxCore.pause()/wake()` 存在但**从未被调用** | 已退役的 Doze `pause/wake` 路径没有与 `PlatformEvents` 并行写同一状态。**不改**，但加了自动断言（见 C-4） |
 | **P1-D 原值透传** | `onMemoryTrim(level)` 直接转发；生产路径中 `if (level` / `when (level` / `TRIM_` / 比较 / `coerce` **计数全为 0**；全仓无 `ReleaseMemory` / `with_low_memory` / 50 MiB 阈值 | 没有把 `20`(UI_HIDDEN) 误认作严重压力，也没有照搬 Apple 的 50 MiB 预算。**不改** |
+| **P1-E 网络与唤醒隔离** | 见下 | 网络路径与唤醒事实**互不可达**。**不改** |
 | **P0-B 保序** | 所有事实经同一把锁 + 单消费者 FIFO channel；`onUserPresent()` 不改任何本地状态，与任何缓存的屏幕状态**不可能**交错 | 保序由构造保证。新增 `A05`/`A06`（100 次交替）与既有的「initial report 不覆盖更新的 screen fact」共同锁定 |
 | **转屏计数** | `ActivityForegroundTracker` 在任何早退**之前**先减计数（注释明确记录：早期的 `isChangingConfigurations` 早退会永久虚增） | 已有测试覆盖 |
+
+#### C-2b P1-E 的实测依据汇总
+
+| 检查 | 结果 |
+|---|---|
+| 网络路径四个文件（`DefaultNetworkMonitor` / `DefaultNetworkListener` / `PlatformInterfaceWrapper` / `InterfaceResolutionEpoch`）中出现 `reportDeviceWake` / `setScreenOn` / `ACTION_SCREEN` / `USER_PRESENT` / `onUserPresent` | **0 处** |
+| `reportDeviceWake` 的**产生点**数量 | **恰好 1**，且位于 `onUserPresent()` |
+| 屏幕处理文件中的 `ResetNetwork` / `restartService` / `closeService(` / `rebuildVpn` / `forceReconnect` | **0 处** |
+| 第七轮的取消/归属能力是否仍在 | `isVpn` 排除自身 ✅、每次事件（含丢网）都领 epoch ✅、播报前重校验 ✅、解析不在调用者线程 ✅、无 `Thread.sleep` ✅ |
+
+**它挡住的那个诱人错法**：把网络交接当作"用户回来了"来唤醒内核。交接不是用户回来，
+`USER_PRESENT` 才是。`E02` 已做破坏性对照：加一个 `onNetworkChanged()` 转发
+`reportDeviceWake` → 变红；移除 → 全绿。
+
 
 ### C-3 `BLOCKED_BY_CORE_ABI` — P1-C 独立 Resume Edge
 
@@ -193,7 +208,24 @@ CommandServer  : close, closeService, pause, wake
 
 **未能取得的证据（因此不写 PASS）**：息屏期间**活跃业务流是否连续**。
 原因：该窗口内**出口记录 0 条连接**，即根本没有流量尝试穿过隧道，所以"流被保住"无从证明。
-这是模拟器空闲（GMS 未发起连接）造成的，**不是**客户端行为。**该子项 = `NOT_RUN`。**
+**该子项 = `NOT_RUN`。**
+
+### D-0b 为什么"息屏中的活跃流"在这台 AVD 上测不出来（已尝试并记录）
+
+不是没试，是三条路都不通，逐条记下以免下次重复：
+
+1. **`adb shell` 的流量不走 VPN。** `adb shell ping`/`curl` 以 shell UID 运行；第七轮的
+   策略路由显示隧道只覆盖非 shell 的 UID 范围。实测 `adb shell ping 1.1.1.1` 成功，但本地
+   出口**一条记录都没有** —— 证实 shell 流量绕过了隧道，因此它**不能**用来证明隧道保活。
+2. **没有可脚本化的业务流量源。** 本 AVD 的 Chrome 停在 `FirstRunActivity`，用
+   `am start -a VIEW -d https://…` 触发下载**不产生任何出口连接**（实测 0/0，两次）。
+   GMS 是唯一自发产生隧道路径流量的进程，但它**只在屏幕点亮时**活动，无法用来测息屏窗口。
+3. **充电态屏蔽了 Doze。** `dumpsys deviceidle` 报 `mCharging=true`，Doze 在充电时不进入，
+   所以也无法用"强制 Doze 后观察"这条替代路径。
+
+**结论**：这一项需要**真机 + 真实前台业务流（下载/通话/热点）**才能测，属
+`REAL_DEVICE_PENDING`，在模拟器上标 `NOT_RUN` 是准确的，不该用间接证据冒充。
+
 
 ### D-1 T01–T12
 
@@ -286,7 +318,7 @@ gradlew.bat --no-daemon --max-workers=2 --console=plain :app:testDebugUnitTest :
 
 | 类 | 变化 |
 |---|---|
-| `ScreenFactOrderingTest` | **新增 12 例**：A01 陈旧快照必须被拒 / A02 正常顺序 / A03 启动即息屏 / A04 幂等 / A04b 只有真实跳变才递增版本 / A05 完整事件流 / A06 100 次交替 / A07 旧形状破坏性对照 / B01 屏幕处理文件不得调用 wake/pause / B02 不得含重连与定时原语 / A08+A09 install 闩（含 8 线程×200 轮） |
+| `ScreenFactOrderingTest` | **新增 12 例**：A01 陈旧快照必须被拒 / A02 正常顺序 / A03 启动即息屏 / A04 幂等 / A04b 只有真实跳变才递增版本 / A05 完整事件流 / A06 100 次交替 / A07 旧形状破坏性对照 / B01 屏幕处理文件不得调用 wake/pause / B02 不得含重连与定时原语 / A08+A09 install 闩（含 8 线程×200 轮）/ **E01** 网络路径不得触及唤醒事实 / **E02** reportDeviceWake 唯一产生点且必须是 USER_PRESENT / **E03** 屏幕处理文件不得重建隧道 |
 | `PlatformFactsTest` | **+4 例**：B 在 A 被 drain 期间保持绑定并继续收事件 / 不可证明的 drain 必须返回 false 且不挂死（真实 5 s 超时路径）/ 全部 trim 级别原样按序到达 / detach 后不再收到 trim |
 
 ### E-5 破坏性对照汇总
@@ -302,7 +334,7 @@ gradlew.bat --no-daemon --max-workers=2 --console=plain :app:testDebugUnitTest :
 |---|---|
 | 上一轮真实构建 run | `37985013617` on `58b8309`（`core_ref=c35faabf…`）：**success**，含 `Unit tests`、`Validate core provenance`、`Assemble debug APK` |
 | 本轮最终 SHA 的 CI | **`CI_NOT_RUN`** —— 本轮 3 个 commit（`7275c0f` / `32cc6cc` / `a5a6783`）推送后**未取回 Actions 结论**，故不声称其通过 |
-| 复测所需的新 APK | **未构建**（Gate 4-B 依赖它，见 F 节） |
+| 候选 APK 是否已用于设备复测 | **否** —— APK 已构建成功，但**尚未安装与复跑**，见 F 节 |
 
 ---
 
