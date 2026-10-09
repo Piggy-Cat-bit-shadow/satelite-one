@@ -5,9 +5,23 @@ import android.net.NetworkCapabilities
 import android.os.Build
 import io.nekohasekai.libbox.InterfaceUpdateListener
 import com.interstellar.proxy.InterstellarApplication
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.net.NetworkInterface
 
 object DefaultNetworkMonitor {
+
+    /**
+     * Owns interface lookups and their retries.
+     *
+     * `SupervisorJob` so one failed resolution cannot cancel the monitor for the process
+     * lifetime, and never `Dispatchers.Main`: the work runs on [resolveDispatcher].
+     */
+    private val monitorScope = CoroutineScope(SupervisorJob())
 
     var defaultNetwork: Network? = null
         private set
@@ -22,14 +36,23 @@ object DefaultNetworkMonitor {
     private val listeners = InterfaceListenerRegistry<InterfaceUpdateListener>()
 
     /**
-     * Monotonic id of the newest network change we were told about.
-     *
-     * A retry loop started for an older network must stop as soon as a newer event
-     * arrives: otherwise a stale loop keeps re-announcing an interface the device has
-     * already left, after the newer one was announced.
+     * Monotonic id of the newest network event, and the authority on which resolve loop
+     * may still publish. See [InterfaceResolutionEpoch] for the two defects this replaces.
      */
-    @Volatile
-    private var epoch: Long = 0
+    private val resolution = InterfaceResolutionEpoch()
+
+    /**
+     * Where an interface lookup runs.
+     *
+     * **This must not be the main thread.** `DefaultNetworkListener` registers its
+     * connectivity callbacks with `mainHandler`, so the whole resolve path — including up
+     * to nine 100 ms retry pauses — used to execute on the main looper. A review measured
+     * the budget at ~1 s of blocked main thread per unresolvable interface, which is an
+     * ANR-shaped cost paid by the UI for a background bookkeeping task. It is a field so a
+     * test can substitute a deterministic dispatcher.
+     */
+    @JvmField
+    internal var resolveDispatcher: CoroutineDispatcher = Dispatchers.IO
 
     /**
      * The tracked network must always be the PHYSICAL one. Best-matching /
@@ -121,61 +144,77 @@ object DefaultNetworkMonitor {
     /**
      * Tell every registered listener which interface the default network is on.
      *
+     * ## Never blocks the caller, and never writes from a loser
+     *
+     * The lookup and its retries run on [resolveDispatcher]; this only takes a snapshot of
+     * the listeners, claims an epoch, and launches. That makes the whole path safe to call
+     * from the connectivity callback (which is on the main looper) and from
+     * `start()`/`addListener`.
+     *
+     * ## A lost network also claims an epoch
+     *
+     * The "nothing to resolve" branch claims an epoch **before** announcing `""`/`-1`.
+     * Round 6 announced the loss without doing so, which left a loop still running for the
+     * previous network free to re-announce an interface the device had already left, after
+     * the loss had been reported.
+     *
      * ## Success exits the loop
      *
-     * The loop used to run a fixed ten iterations and call
-     * `updateDefaultInterface` on **every** one that got past the two guards, so a
-     * perfectly healthy network was announced up to ten times per event — ten JNI
-     * crossings and ten writes into the core's interface state for a single change. It
-     * now reports once and returns; only a failed lookup retries.
-     *
-     * ## Bounded retry, cancellable by a newer event
-     *
-     * `getLinkProperties` returns null and `NetworkInterface.getByName` throws while the
-     * interface is still coming up, which is the real reason a retry exists at all. The
-     * retry stays bounded and gives up, and a newer network event supersedes an older
-     * loop instead of letting both write.
-     *
-     * ## The sleep is bounded and small, and it is not on the main thread in practice
-     *
-     * This runs from the connectivity callback (`DefaultNetworkListener` registers with
-     * `mainHandler`) and from `start()`/`addListener` on the service's IO coroutine. One
-     * 100 ms pause after a failed lookup, at most nine times, only while the interface is
-     * genuinely unavailable - the previous shape paid the same sleeps in the *success*
-     * path too.
+     * The loop used to run a fixed ten iterations and call `updateDefaultInterface` on
+     * **every** one that got past the two guards, so a perfectly healthy network was
+     * announced up to ten times per event — ten JNI crossings and ten writes into the
+     * core's interface state for a single change. It now reports once and returns; only a
+     * failed lookup retries.
      */
-    private fun checkDefaultInterfaceUpdate(newNetwork: Network?) {
+    internal fun checkDefaultInterfaceUpdate(newNetwork: Network?) {
         val targets = listeners.snapshot()
         if (targets.isEmpty()) return
 
+        // Claimed for EVERY event, including the lost-network one. Everything older is now
+        // a loser and must drop its result silently.
+        val token = resolution.beginAttempt()
+
         if (newNetwork == null) {
-            targets.forEach { it.updateDefaultInterface("", -1, false, false) }
+            // No lookup to do, and no waiting: report the loss immediately, but only if
+            // this event is still the newest one by the time the listeners are told.
+            if (resolution.isWinner(token)) {
+                targets.forEach { it.updateDefaultInterface("", -1, false, false) }
+            }
             return
         }
 
-        val epochAtEntry = ++epoch
-        var attempt = 0
-        while (attempt < MAX_INTERFACE_LOOKUP_ATTEMPTS) {
-            attempt++
-            // A newer network event owns the truth now; this loop must not overwrite it.
-            if (epochAtEntry != epoch) return
+        monitorScope.launch(resolveDispatcher) {
+            var attempt = 0
+            while (attempt < MAX_INTERFACE_LOOKUP_ATTEMPTS) {
+                attempt++
+                // Checked before every attempt AND before the publish below: a newer event
+                // owns the truth now, and a loser's answer is not merely late, it is wrong.
+                if (!resolution.isWinner(token)) return@launch
 
-            val resolved = resolveInterface(newNetwork)
-            if (resolved != null) {
-                targets.forEach {
-                    it.updateDefaultInterface(resolved.name, resolved.index, false, false)
+                val resolved = resolveInterface(newNetwork)
+                if (resolved != null) {
+                    // Re-checked after the lookup: the lookup itself takes time, and the
+                    // device may have moved on while it ran. This is the ordering that
+                    // round 6's self-captured epoch could not guarantee.
+                    if (!resolution.isWinner(token)) return@launch
+                    targets.forEach {
+                        it.updateDefaultInterface(resolved.name, resolved.index, false, false)
+                    }
+                    return@launch
                 }
-                return
+                // An interface that is not up yet is the only reason to pause; giving up is
+                // correct rather than harmful, because the next connectivity event re-runs
+                // this. The pause is on `resolveDispatcher`, never on the caller's thread.
+                if (attempt < MAX_INTERFACE_LOOKUP_ATTEMPTS) {
+                    delay(INTERFACE_LOOKUP_RETRY_MS)
+                }
             }
-            // An interface that is not up yet is the only reason to pause; giving up is
-            // correct rather than harmful, because the next connectivity event re-runs this.
-            if (attempt < MAX_INTERFACE_LOOKUP_ATTEMPTS) Thread.sleep(INTERFACE_LOOKUP_RETRY_MS)
+            android.util.Log.w(
+                "InterstellarUI",
+                "default interface for $newNetwork not resolvable after " +
+                    "$MAX_INTERFACE_LOOKUP_ATTEMPTS attempts; waiting for the next connectivity event",
+            )
         }
-        android.util.Log.w(
-            "InterstellarUI",
-            "default interface for $newNetwork not resolvable after $MAX_INTERFACE_LOOKUP_ATTEMPTS attempts; " +
-                "waiting for the next connectivity event",
-        )
     }
 
     private class ResolvedInterface(val name: String, val index: Int)
