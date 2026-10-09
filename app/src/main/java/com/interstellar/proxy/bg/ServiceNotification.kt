@@ -60,6 +60,9 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
         CommandClient(scope, CommandClient.ConnectionType.Status, this, localOnly = true)
     private var receiverRegistered = false
 
+    /** Serializes [registerReceiver] against [unregisterReceiverIfNeeded]. */
+    private val receiverLock = Any()
+
     /**
      * Set by close(): the service notification is gone. A late traffic
      * callback (a race with core shutdown — the traffic job is cancelled
@@ -156,7 +159,19 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
         }
     }
 
-    private fun registerReceiver() {
+    /**
+     * Registration and unregistration share one lock.
+     *
+     * `start()` hops to the main thread to register while `close()` may already be
+     * running; checking `released` alone is not enough, because the check and the
+     * `registerReceiver` call are two separate steps and a `close()` landing between
+     * them would leave a receiver installed that nothing ever unregisters — it would
+     * then keep waking this object on every screen change for the life of the
+     * process. Holding the lock across check-and-register (and across
+     * check-and-unregister, with `released` set first) makes either order safe.
+     */
+    private fun registerReceiver() = synchronized(receiverLock) {
+        if (released || receiverRegistered) return
         service.registerReceiver(
             this,
             IntentFilter().apply {
@@ -165,6 +180,12 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
             },
         )
         receiverRegistered = true
+    }
+
+    private fun unregisterReceiverIfNeeded() = synchronized(receiverLock) {
+        if (!receiverRegistered) return
+        service.unregisterReceiver(this)
+        receiverRegistered = false
     }
 
     override fun updateStatus(status: StatusMessage) {
@@ -222,11 +243,10 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
         // a traffic update may have slipped in just before stopForeground ran;
         // cancel it explicitly — it would not be removed by service death
         InterstellarApplication.notificationManager.cancel(notificationId)
-        if (receiverRegistered) {
-            service.unregisterReceiver(this)
-            receiverRegistered = false
-        }
-        // After the teardown above, never before it.
+        unregisterReceiverIfNeeded()
+        // After the teardown above, never before it. CommandClient.disconnect() runs
+        // its native teardown on an independent cleanup scope, so cancelling this one
+        // cannot leave the disconnect half-done.
         scope.cancel()
     }
 }

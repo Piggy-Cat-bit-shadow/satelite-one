@@ -315,6 +315,10 @@ class BoxService(private val service: Service, private val platformInterface: Pl
         // Same shared release as the normal stop — this path used to reach
         // core.shutdown() without unbinding the fact bridge at all.
         releaseCore()
+        // This path is a failure, not a switch: it must not honour (or keep) a start
+        // intent that arrived while tearing down, or a stale flag would trigger an
+        // unwanted restart after some later, unrelated stop.
+        pendingRestart = false
         withContext(Dispatchers.Main) {
             if (receiverRegistered) {
                 service.unregisterReceiver(receiver)
