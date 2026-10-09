@@ -9,6 +9,26 @@ on:
     branches: ['**']
   pull_request:
   workflow_dispatch:
+    inputs:
+      # 手动指定要跟随的内核 revision。留空 = 跟随 CORE_BRANCH 的 HEAD。
+      #
+      # 为什么需要它: 开发 CI 刻意跟随 `testing` HEAD, 所以 upstream 的 `testing` 一旦
+      # 自己坏掉, 本仓库的**每一次** push 都会在核心构建那一步失败, 而 app 自己的
+      # 单元测试与 APK 组装会被 skip —— 一个与内核无关的改动也因此拿不到 CI 结论。
+      # 实测: build_libbox 写出了 libbox.provenance 却没产出 libbox.aar, 随后
+      # `cp libbox.aar` 以 "No such file or directory" 失败 (2026-10-09T20:00–20:07,
+      # 三个不同 SHA 上完全一致)。
+      #
+      # 这不是 app 的问题, 但它让 app 的回归信号消失, 那是不可接受的。有了这个输入,
+      # 就能在 upstream 修复期间指定一个已知良好的 revision (例如 version.properties
+      # 里那个 pin) 继续取得 app 侧的完整 CI 证据。
+      #
+      # 它**不**改变默认行为, 也**不**改变 pin: release-apk.yml 仍然只从
+      # version.properties 的 coreCommit 构建, 并显式比对那个 SHA。
+      core_ref:
+        description: 'sing-box revision to follow (blank = CORE_BRANCH HEAD)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -67,15 +87,26 @@ jobs:
         id: core
         run: |
           set -euo pipefail
-          SHA="$(git ls-remote "https://github.com/${CORE_REPO}.git" "refs/heads/${CORE_BRANCH}" | awk '{print $1}')"
-          if [ -z "$SHA" ]; then
-            echo "::error::could not resolve ${CORE_REPO}@${CORE_BRANCH}"
-            exit 1
+          # dispatch 可以指定一个 revision; 留空则跟随分支 HEAD (默认行为, 未变)。
+          OVERRIDE="${{ github.event.inputs.core_ref || '' }}"
+          if [ -n "$OVERRIDE" ]; then
+            if ! printf '%s' "$OVERRIDE" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::core_ref must be a full 40-char lowercase SHA, got '${OVERRIDE}'"
+              exit 1
+            fi
+            SHA="$OVERRIDE"
+            echo "core_ref override in effect; this run does NOT track ${CORE_BRANCH} HEAD"
+          else
+            SHA="$(git ls-remote "https://github.com/${CORE_REPO}.git" "refs/heads/${CORE_BRANCH}" | awk '{print $1}')"
+            if [ -z "$SHA" ]; then
+              echo "::error::could not resolve ${CORE_REPO}@${CORE_BRANCH}"
+              exit 1
+            fi
           fi
           echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
           echo "CORE_COMMIT=${SHA}" >> "$GITHUB_ENV"
           echo "CORE_COMMIT_FULL=${SHA}" >> "$GITHUB_ENV"
-          echo "resolved ${CORE_REPO}@${CORE_BRANCH} = ${SHA}"
+          echo "resolved core = ${SHA}"
 
       - name: Cache libbox.aar
         id: libbox
@@ -84,6 +115,8 @@ jobs:
           path: |
             app/libs/libbox.aar
             app/libs/libbox.provenance
+          # The resolved SHA is in the key, so overriding `core_ref` gets its own cache
+          # entry instead of colliding with (or silently reusing) the branch-tracking one.
           key: libbox-${{ env.CORE_REPO }}-${{ env.CORE_BRANCH }}-${{ steps.core.outputs.sha }}
 
       # app/libs 只含 gitignore 的 libbox.aar，checkout 不会创建该目录
