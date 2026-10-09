@@ -163,4 +163,61 @@ class LogRingBufferTest {
             check(ring.snapshot().size == ring.size) { "snapshot size must match size" }
         }
     }
+
+    // ---- versioned snapshots (the UI watermark) ----
+
+    @Test
+    fun `version changes on every append and on clear`() {
+        val ring = LogRingBuffer<Int>(3)
+        val v0 = ring.currentVersion
+        ring.add(1)
+        val v1 = ring.currentVersion
+        check(v1 != v0) { "an append must move the version" }
+        ring.add(2)
+        check(ring.currentVersion != v1)
+        val beforeClear = ring.currentVersion
+        ring.clear()
+        check(ring.currentVersion != beforeClear) { "clear must move the version" }
+    }
+
+    @Test
+    fun `version keeps moving once the buffer is saturated`() {
+        // This is the whole reason the Logs page follows a version instead of a size.
+        val ring = LogRingBuffer<Int>(3)
+        repeat(3) { ring.add(it) }
+        val size = ring.size
+        val version = ring.currentVersion
+        ring.add(99)
+        check(ring.size == size) { "size is pinned at capacity" }
+        check(ring.currentVersion != version) { "the version must still report the change" }
+    }
+
+    @Test
+    fun `snapshotWithVersion pairs the data with its own version`() {
+        val ring = LogRingBuffer<Int>(4)
+        ring.add(1); ring.add(2)
+        val (snapshot, version) = ring.snapshotWithVersion()
+        check(snapshot == listOf(1, 2))
+        check(version == ring.currentVersion) { "the version must describe the snapshot taken" }
+
+        // An append after the snapshot must leave the returned version behind.
+        ring.add(3)
+        check(version != ring.currentVersion)
+        check(ring.snapshotWithVersion().first == listOf(1, 2, 3))
+    }
+
+    @Test
+    fun `an empty buffer still reports a version`() {
+        val ring = LogRingBuffer<Int>(2)
+        val (snapshot, version) = ring.snapshotWithVersion()
+        check(snapshot.isEmpty())
+        check(version == ring.currentVersion)
+    }
+
+    @Test
+    fun `snapshot and snapshotWithVersion agree`() {
+        val ring = LogRingBuffer<Int>(3)
+        (1..5).forEach { ring.add(it) }
+        check(ring.snapshot() == ring.snapshotWithVersion().first)
+    }
 }

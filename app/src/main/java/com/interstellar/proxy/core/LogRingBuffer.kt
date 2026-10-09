@@ -30,7 +30,19 @@ class LogRingBuffer<T>(val capacity: Int) {
     private var start = 0
     private var count = 0
 
+    /**
+     * Monotonic change counter, bumped by every mutation.
+     *
+     * This is the only signal that keeps changing once the buffer is full: `size`
+     * stops moving at capacity, so anything that keys off length (as the Logs page
+     * used to) silently stops working exactly when the buffer is saturated.
+     */
+    private var version = 0L
+
     val size: Int get() = synchronized(lock) { count }
+
+    /** Current change version. */
+    val currentVersion: Long get() = synchronized(lock) { version }
 
     /** Append, evicting the oldest element once [capacity] is reached. O(1). */
     fun add(item: T) {
@@ -43,19 +55,31 @@ class LogRingBuffer<T>(val capacity: Int) {
                 slots[start] = item
                 start = (start + 1) % capacity
             }
+            version++
         }
     }
 
     /** Oldest-to-newest copy. Does not modify internal state. */
-    fun snapshot(): List<T> {
+    fun snapshot(): List<T> = snapshotWithVersion().first
+
+    /**
+     * The snapshot **and the version it corresponds to**, read under one lock.
+     *
+     * A caller must publish *this* version as its watermark rather than whatever
+     * the version happens to be afterwards. An append that lands between the
+     * snapshot and the watermark then leaves the buffer ahead of what was shown, so
+     * the next pass still sees a newer version and the line is displayed — instead
+     * of being silently marked as already displayed and lost forever.
+     */
+    fun snapshotWithVersion(): Pair<List<T>, Long> {
         synchronized(lock) {
-            if (count == 0) return emptyList()
+            if (count == 0) return emptyList<T>() to version
             val out = ArrayList<T>(count)
             for (i in 0 until count) {
                 @Suppress("UNCHECKED_CAST")
                 out.add(slots[(start + i) % capacity] as T)
             }
-            return out
+            return out to version
         }
     }
 
@@ -69,6 +93,7 @@ class LogRingBuffer<T>(val capacity: Int) {
             java.util.Arrays.fill(slots, null)
             start = 0
             count = 0
+            version++
         }
     }
 }

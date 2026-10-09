@@ -15,7 +15,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.util.concurrent.atomic.AtomicLong
 
 /** One log line (libbox LogEntry). */
 data class LogLine(val level: Int, val message: String, val timestamp: Long)
@@ -30,33 +29,43 @@ data class LogLine(val level: Int, val message: String, val timestamp: Long)
  */
 internal class LogUiPublishGate(private val minIntervalMs: Long = 75L) {
 
-    // publishedVersion starts equal to version: a buffer with no appends has
-    // nothing new to show, so a fresh gate is quiet rather than "due".
-    private var version = 0L
+    // Version 0 is "nothing published yet", so a fresh gate is quiet rather than
+    // immediately due.
+    //
+    // This object is consulted by the UI ticker while whoever publishes writes it,
+    // and it used to be plain mutable fields touched from both — the exact "pure
+    // single-threaded test object that is multi-threaded in production" shape.
+    private val lock = Any()
     private var publishedVersion = 0L
     private var lastPublishAt = Long.MIN_VALUE
 
-    fun onAppend() {
-        version++
-    }
-
-    /** Ask whether a snapshot should be taken at [nowMs]. Read-only. */
-    fun isDue(nowMs: Long): Boolean {
-        if (publishedVersion == version) return false
+    /** Ask whether version [version] should be rendered at [nowMs]. Read-only. */
+    fun isDue(version: Long, nowMs: Long): Boolean = synchronized(lock) {
+        if (version == publishedVersion) return false
         if (lastPublishAt != Long.MIN_VALUE && nowMs - lastPublishAt < minIntervalMs) return false
-        return true
+        true
     }
 
-    /** Record that a snapshot was taken at [nowMs]. */
-    fun markPublished(nowMs: Long) {
-        publishedVersion = version
-        lastPublishAt = nowMs
+    /**
+     * Record that [version] — the version of the snapshot that was actually taken —
+     * has been shown at [nowMs].
+     *
+     * Passing the snapshot's own version (never "whatever is current now") is what
+     * closes the lost-tail race: an append landing between the snapshot and this call
+     * leaves the buffer ahead, so the next tick is still due.
+     */
+    fun markPublished(version: Long, nowMs: Long) {
+        synchronized(lock) {
+            publishedVersion = version
+            lastPublishAt = nowMs
+        }
     }
 
     fun reset() {
-        version = 0L
-        publishedVersion = 0L
-        lastPublishAt = Long.MIN_VALUE
+        synchronized(lock) {
+            publishedVersion = 0L
+            lastPublishAt = Long.MIN_VALUE
+        }
     }
 }
 
@@ -81,6 +90,15 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
     private val _logs = MutableStateFlow<List<LogLine>>(emptyList())
     val logs: StateFlow<List<LogLine>> = _logs
 
+    /**
+     * The ring version [logs] currently reflects.
+     *
+     * The Logs page follows this instead of `logs.size`: once the 3000-line buffer
+     * saturates, the size stops changing and a size-keyed effect never fires again.
+     */
+    private val _logsVersion = MutableStateFlow(0L)
+    val logsVersion: StateFlow<Long> = _logsVersion
+
     private val _connected = MutableStateFlow(false)
     val connected: StateFlow<Boolean> = _connected
 
@@ -89,9 +107,6 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
      * changes how the buffer is copied, never how much is kept.
      */
     private val ring = LogRingBuffer<LogLine>(CAPACITY)
-
-    /** Bumped by every append; lets the UI know whether anything new happened. */
-    private val appendVersion = AtomicLong(0)
 
     private val uiGate = LogUiPublishGate(UI_REFRESH_MS)
 
@@ -180,21 +195,26 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
     // ---- internals ----
 
     private fun append(line: LogLine) {
+        // Capture only: the ring owns the version, and the UI watermark is advanced
+        // exclusively by publishSnapshot() so the two can never disagree.
         ring.add(line)
-        appendVersion.incrementAndGet()
-        uiGate.onAppend()
     }
 
     private fun clearLocalHistory() {
         ring.clear()
         uiGate.reset()
-        appendVersion.incrementAndGet()
         _logs.value = emptyList()
+        _logsVersion.value = ring.currentVersion
     }
 
     private fun publishSnapshot() {
-        _logs.value = ring.snapshot()
-        uiGate.markPublished(android.os.SystemClock.elapsedRealtime())
+        val (snapshot, version) = ring.snapshotWithVersion()
+        _logs.value = snapshot
+        _logsVersion.value = version
+        // Mark the version we actually published. If an append landed after the
+        // snapshot, the ring is already ahead of it, so the next tick still sees a
+        // newer version and the newest line is never lost.
+        uiGate.markPublished(version, android.os.SystemClock.elapsedRealtime())
     }
 
     private fun startUiTicker() {
@@ -202,7 +222,7 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
         uiTicker = viewModelScope.launch {
             while (isActive && uiVisible) {
                 delay(UI_REFRESH_MS)
-                if (uiGate.isDue(android.os.SystemClock.elapsedRealtime())) {
+                if (uiGate.isDue(ring.currentVersion, android.os.SystemClock.elapsedRealtime())) {
                     publishSnapshot()
                 }
             }

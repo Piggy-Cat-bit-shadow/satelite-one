@@ -37,6 +37,7 @@ import com.interstellar.proxy.ui.LogLine
 fun LogsPage(viewModel: LogsViewModel) {
     val colors = LocalInterstellarColors.current
     val logs by viewModel.logs.collectAsState()
+    val logsVersion by viewModel.logsVersion.collectAsState()
     val connected by viewModel.connected.collectAsState()
     val listState = rememberLazyListState()
 
@@ -57,7 +58,10 @@ fun LogsPage(viewModel: LogsViewModel) {
     // After that, auto-follow only while the user is at the bottom: scrolling up to
     // read history must never be yanked back down by the next arriving line.
     // scrollToItem (not animate) because a per-batch animation piles up under a burst.
-    LaunchedEffect(logs.size) {
+    // Keyed on the ring version, NOT on the list length: once the 3000-line buffer
+    // is full the length stops changing while lines keep arriving, so a size-keyed
+    // effect would silently stop following exactly when following matters most.
+    LaunchedEffect(logsVersion) {
         if (logs.isNotEmpty() && atBottom) listState.scrollToItem(logs.size - 1)
     }
 
