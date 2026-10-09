@@ -45,6 +45,16 @@ class BoxService(private val service: Service, private val platformInterface: Pl
     companion object {
         private const val TAG = "BoxService"
 
+        /**
+         * A refused publish is retried at most this many times.
+         *
+         * Each retry takes a fresh token, so it only helps when the refusal came from a
+         * teardown that has since finished. Three is enough for the realistic case (a
+         * stop's release overlapping the start) while keeping a pathological teardown from
+         * spinning.
+         */
+        private const val MAX_START_SUPERSEDED_RETRIES = 3
+
         fun start() {
             start(VPNService::class.java)
         }
@@ -200,8 +210,17 @@ class BoxService(private val service: Service, private val platformInterface: Pl
      * is how a failed start could close the bridge with facts still queued.
      */
     private suspend fun releaseCore() = releaseMutex.withLock {
-        // Stop authorising any in-flight start attempt first: a start that is still
-        // inside startup() must not publish its core after this point.
+        // The teardown is now in flight. `beginStop`/`endStop` bracket the window in which
+        // `core`/`factSession`/`fileDescriptor` are dirty: a successor may hold a valid
+        // token throughout, but it will not publish into those fields until this ends.
+        //
+        // `invalidate()` still runs, because a start requested *before* the stop must not
+        // publish a core the stop is about to release. What it no longer does is decide the
+        // successor's fate: `endStop` pins `stopStaleUpTo` to everything that was alive
+        // here, so a start accepted after this point keeps its token instead of being
+        // stranded (round-6 R7-P0).
+        lifecycle.beginStop()
+        try {
         lifecycle.invalidate()
 
         val session = factSession
@@ -261,6 +280,11 @@ class BoxService(private val service: Service, private val platformInterface: Pl
         }
         DefaultNetworkMonitor.stop(this)
         runCatching { running?.shutdown() }
+        } finally {
+            // Always released, including when a step above throws: leaving the teardown
+            // marked in-flight would block every future publish for the process lifetime.
+            lifecycle.endStop()
+        }
     }
 
     private suspend fun startService() {
@@ -553,21 +577,39 @@ class BoxService(private val service: Service, private val platformInterface: Pl
         }
 
         GlobalScope.launch(Dispatchers.IO) {
-            // startCore() no longer throws for a startup failure: it reports one only
-            // while the attempt still owns the service (see CoreStartResult.Failed), so a
-            // superseded attempt cannot stop a newer generation.
-            when (val started = startCore(attempt)) {
-                is CoreStartResult.Failed -> {
-                    stopAndAlert(Alert.StartCommandServer, started.cause.message)
-                    return@launch
+            // A start attempt can be refused for two different reasons, and they need
+            // different responses:
+            //
+            //  * it was superseded by a *newer start* - terminal, because that newer
+            //    attempt owns the service and is building its own core;
+            //  * a teardown was in flight when it tried to publish - a *transient*
+            //    refusal. The teardown has since finished, so re-running here is what
+            //    stops the Service from sitting in `Status.Starting` with no core
+            //    (round-6 R7-P0). It is bounded so a pathological teardown cannot loop.
+            var current: Long = attempt
+            var tries = 0
+            while (true) {
+                when (val started = startCore(current)) {
+                    is CoreStartResult.Failed -> {
+                        stopAndAlert(Alert.StartCommandServer, started.cause.message)
+                        return@launch
+                    }
+
+                    CoreStartResult.Published -> break
+
+                    CoreStartResult.Superseded -> {
+                        tries++
+                        if (tries > MAX_START_SUPERSEDED_RETRIES) return@launch
+                        // Only retry a *transient* refusal. If a newer attempt or a stop has
+                        // taken the service, this start is genuinely done - continuing would
+                        // apply a config to a core that was never published, show "Started"
+                        // for a service that is going away, and re-post a notification from a
+                        // dead generation.
+                        val retry = lifecycle.beginStart() ?: return@launch
+                        if (lifecycle.isSupersededByNewerStart(retry)) return@launch
+                        current = retry
+                    }
                 }
-
-                // A superseded start is terminal. Continuing would apply a config to a
-                // core that was never published, show "Started" for a service that is
-                // going away, and re-post a notification from a dead generation.
-                CoreStartResult.Superseded -> return@launch
-
-                CoreStartResult.Published -> Unit
             }
             // A stop that landed while startCore() was in flight must win. The check
             // below is not enough on its own: startCore() has already assigned `core`
@@ -698,26 +740,38 @@ internal class CoreLifecycle {
     private val lock = Any()
 
     /**
-     * Bumped by every ownership move: a new start attempt ([beginStart]), a release
-     * ([invalidate]) or a destroy ([close]). Its only job is to make an *older*
-     * attempt stale for [publish], which is why a release has to bump it too.
-     */
-    private var generation = 0L
-
-    /**
      * The id of the newest start attempt, and the watermark a stop is stamped with.
      *
-     * Separate from [generation] on purpose, and the separation is what closes the
-     * stale-stop hole. [generation] moves on every ownership change — including a
-     * release — because [publish] needs exactly that. A stop path, by contrast, must
-     * be able to tell "my own release" apart from "a newer start took the service":
-     * stamped with [currentStartAttempt] and asked through [startsSince], only
-     * [beginStart] can answer it, and this counter is moved by nothing else.
+     * This is the *only* ownership counter, and it is moved by nothing but [beginStart].
+     * That single-writer property is what makes it answer three separate questions at
+     * once, each of which used to need its own bookkeeping:
+     *
+     *  - "is this the newest start?" — `attempt == startAttempts`;
+     *  - "has a start happened since my stop was accepted?" — [startsSince];
+     *  - "which attempts were alive while this stop's slots were dirty?" — [endStop]
+     *    pins its value at the moment the teardown finishes.
+     *
+     * Round 6 kept a second `generation` counter that also moved on a release, because
+     * [publish] had to refuse an attempt that was inside `startup()` when the stop
+     * released. That worked for the attempt being released and wrongly for a *successor*
+     * as well, which is the round-7 defect; [stopStaleUpTo] covers the first case without
+     * touching the second, so the extra counter is gone.
      */
     private var startAttempts = 0L
 
     private var published: Long? = null
     private var closed = false
+
+    /**
+     * Highest attempt token made stale by a *teardown*; attempts at or below it are refused.
+     *
+     * Pinned by [endStop] to everything alive while the slots were dirty. An attempt
+     * accepted after that keeps its token.
+     */
+    private var stopStaleUpTo = 0L
+
+    /** Count of teardowns in flight; a publish must not run while this is non-zero. */
+    private var teardownsInFlight = 0
 
     /**
      * Begin a start attempt, or **null** when this owner is already closed.
@@ -728,23 +782,75 @@ internal class CoreLifecycle {
      */
     fun beginStart(): Long? = synchronized(lock) {
         if (closed) return null
-        ++generation
-        // The stop watermark moves only here: a *new start* is the one event that may
-        // suppress a stop's convergence, and a release must never look like one.
+        // One counter, one meaning: this number IS the attempt id. It moves only here,
+        // which is what makes `attempt == startAttempts` mean "is the newest start" and
+        // what lets a stop's watermark ([currentStartAttempt]) be compared against it.
+        //
+        // A separate generation counter used to supply the token. It had to move on a
+        // release as well - so that an attempt still inside `startup()` could not publish
+        // into slots the release was clearing - and that is exactly what made a legitimate
+        // successor's token stale too: the round-7 R7-P0 defect. [stopStaleUpTo] now states
+        // that rule precisely, so the second counter earns nothing and is gone.
         ++startAttempts
-        // The attempt id stays the generation: `publish`/`isCurrent` compare against
-        // the value that a release also moves.
-        generation
+        startAttempts
     }
 
-    /** Invalidate in-flight attempts without closing: a normal stop may still restart. */
+    /**
+     * A stop is releasing the published core.
+     *
+     * It does **not** decide any attempt's fate: that is [endStop]'s job, which pins the
+     * stale boundary to everything alive while the slots were dirty. Keeping the two apart
+     * is the whole round-7 fix - a release that also invalidated newer attempts is what
+     * stranded a legitimate successor in `Status.Starting`.
+     */
     fun invalidate() = synchronized(lock) {
-        ++generation
-        // A stop releases the published core, so "is anything published" must stop being
-        // true here. Leaving it set made isPublished claim a live core after the core had
-        // already been shut down - an assertion that tests then trusted.
+        // "is anything published" must stop being true here. Leaving it set made
+        // isPublished claim a live core after the core had already been shut down - an
+        // assertion that tests then trusted.
         published = null
     }
+
+    /**
+     * A teardown begins; the stop accepts responsibility for everything alive right now.
+     *
+     * Paired with [endStop]. Between them, an attempt may still *run*, but it must not
+     * publish into the `core`/`factSession`/`fileDescriptor` slots the teardown is
+     * clearing — see [publish].
+     */
+    fun beginStop() = synchronized(lock) {
+        teardownsInFlight++
+    }
+
+    /**
+     * The teardown finished; everything that was alive while the slots were dirty is stale.
+     *
+     * ## Why the stale boundary is pinned here and not in [beginStop]
+     *
+     * `invalidate()` was unconditional. That closed "a start requested *before* the stop
+     * publishes into slots being released", but it also made a start accepted **after**
+     * the stop stale — the round-6 stranding bug, where the successor's `publish` was
+     * refused by a release that had nothing to do with it and the Service sat in
+     * `Status.Starting` with no core behind it.
+     *
+     * The distinction that matters is not "before or after the stop" but **"before or
+     * after the slots became clean"**:
+     *
+     *  - an attempt alive while the teardown ran is refused, because publishing would put
+     *    two cores in the same fields;
+     *  - an attempt accepted after this point keeps its token, because by then there is
+     *    nothing left to collide with.
+     *
+     * A refusal is *reported* ([publish] returns false), which is what makes it safe: the
+     * Service re-runs its own start path instead of silently evaporating.
+     */
+    fun endStop() = synchronized(lock) {
+        stopStaleUpTo = startAttempts
+        if (teardownsInFlight > 0) teardownsInFlight--
+        (lock as Object).notifyAll()
+    }
+
+    /** True while a teardown is in flight. Exposed so tests can assert the ordering. */
+    internal val isTearingDown: Boolean get() = synchronized(lock) { teardownsInFlight > 0 }
 
     /**
      * The watermark a stop path stamps itself with before it starts releasing.
@@ -758,12 +864,24 @@ internal class CoreLifecycle {
     /**
      * True when a **new start attempt** has been taken since [watermark].
      *
-     * Deliberately not `generation`: a release moves that on, so comparing against it
-     * would make every stop look superseded by itself. Only [beginStart] moves this,
-     * which is what makes the answer mean "someone newer owns the service now".
+     * Only [beginStart] moves this, which is what makes the answer mean "someone newer
+     * owns the service now". A release deliberately does not: if it did, every stop would
+     * look superseded by itself and convergence could never be reached.
      */
     fun startsSince(watermark: Long): Boolean = synchronized(lock) {
         closed || startAttempts != watermark
+    }
+
+    companion object {
+        /**
+         * How long a publish waits for an in-flight teardown before giving up.
+         *
+         * A teardown's own budget is two 5 s fact-drain waits plus the native close, so
+         * 12 s covers a slow but healthy stop. Giving up returns false, and the caller
+         * re-runs its start path — waiting forever would hold a core's `startup()` result
+         * in limbo with no way to report it.
+         */
+        private const val PUBLISH_TEARDOWN_WAIT_MS = 12_000L
     }
 
     /**
@@ -772,13 +890,15 @@ internal class CoreLifecycle {
      * everything that follows.
      */
     fun close() = synchronized(lock) {
-        // Two halves, each load-bearing and each separately tested:
-        //  - the generation bump invalidates every attempt already in flight, so a
-        //    start() that is inside startup() can no longer publish;
-        //  - the closed flag refuses every attempt that has not begun yet.
-        // Removing either one re-opens a distinct hole, so neither is decoration.
+        // One flag covers both halves, and `ownsServiceLocked` consults it first:
+        //  - an attempt already inside startup() is refused at publish, because `closed`
+        //    is checked there too;
+        //  - an attempt that has not begun is refused at beginStart, before any native
+        //    object exists.
+        // The round-6 version also bumped a generation counter here. That was a second
+        // way of saying the same thing, and the flag is the one that also covers the
+        // not-yet-begun case, so it is the one that stayed.
         closed = true
-        ++generation
         published = null
     }
 
@@ -788,30 +908,111 @@ internal class CoreLifecycle {
     /**
      * True while [attempt] is still the live generation of an open owner.
      *
-     * Used to decide whether a failure is still ours to report: once a stop or a newer
-     * start has moved the generation on, this attempt must stay silent rather than
-     * drive the service to Stopped.
+     * Used to decide whether a failure is still ours to report: once a stop's teardown has
+     * covered this attempt, or a newer start has taken the service, it must stay silent
+     * rather than drive the service to Stopped.
      */
-    fun isCurrent(attempt: Long): Boolean = synchronized(lock) { !closed && attempt == generation }
+    fun isCurrent(attempt: Long): Boolean = synchronized(lock) { ownsServiceLocked(attempt) }
 
     /**
-     * Run [block] only if [attempt] is still the youngest generation.
+     * True when [attempt] lost to a **newer start attempt** specifically.
      *
-     * [block] runs inside the critical section on purpose: publishing the core and
-     * attaching its fact bridge must be one indivisible step, so no observer can see
-     * a core without its bridge (or the reverse).
+     * The distinction from [isCurrent] is what makes the successor's retry loop safe
+     * rather than a spin: a refusal caused by a *teardown* is transient and worth
+     * re-running, while a refusal caused by a newer attempt means that attempt owns the
+     * service and this one must stay silent and stop.
      */
-    fun publish(attempt: Long, block: () -> Unit): Boolean = synchronized(lock) {
-        // Only [generation] is consulted here, and that is sufficient by construction:
-        // it moves on every ownership change - a release, a newer start and a destroy -
-        // so any attempt older than the newest one is refused, and [beginStart] refuses
-        // to issue an attempt at all after a destroy. A `closed` test here would be
-        // unreachable code pretending to be the protection.
-        if (attempt != generation) return false
-        block()
-        published = attempt
-        true
+    fun isSupersededByNewerStart(attempt: Long): Boolean = synchronized(lock) {
+        !closed && attempt != startAttempts
     }
+
+    /**
+     * Won by [attempt] only if it still owns the service **and** no teardown is in flight.
+     *
+     * ## Why two conditions and not one
+     *
+     * `published` and the `core`/`factSession`/`fileDescriptor` fields are single slots. Two
+     * things can make an attempt unfit to fill them:
+     *
+     *  1. it is stale — a newer start superseded it, or a stop's teardown has already
+     *     invalidated everything that was alive while the slots were dirty
+     *     ([stopStaleUpTo], plus the newest-start equality in [ownsServiceLocked]);
+     *  2. a teardown is *right now* clearing those slots, in which case publishing would
+     *     leave two cores sharing one set of fields — one of them unreachable and never
+     *     released.
+     *
+     * The round-5/6 shape collapsed these into "did the generation move", which refused a
+     * legitimate successor whenever an unrelated release happened to run — stranding the
+     * Service in `Status.Starting` with no core. Splitting them lets the successor keep its
+     * token and simply **wait** for the teardown to finish.
+     *
+     * ## The wait is condition-based and re-checks staleness
+     *
+     * Waits are bounded and re-validate after every wakeup, so a teardown that ends cannot
+     * let a meanwhile-superseded attempt through. [block] runs inside the critical section
+     * on purpose: publishing the core and attaching its fact bridge must be one indivisible
+     * step, so no observer can see a core without its bridge (or the reverse).
+     *
+     * @return true when [block] ran and the attempt is now the published one.
+     */
+    fun publish(attempt: Long, block: () -> Unit): Boolean {
+        val monitor = lock as Object
+        synchronized(lock) {
+            if (!ownsServiceLocked(attempt)) return false
+            val deadline = System.currentTimeMillis() + PUBLISH_TEARDOWN_WAIT_MS
+            while (teardownsInFlight > 0) {
+                val remaining = deadline - System.currentTimeMillis()
+                if (remaining <= 0) return false
+                // `wait` releases the lock, so ownership is re-checked on every wakeup: an
+                // attempt that was superseded while it waited must not publish on the
+                // strength of its original check.
+                monitor.wait(remaining)
+                if (!ownsServiceLocked(attempt)) return false
+            }
+            // Ownership is re-checked HERE, immediately before the write, and the lock is
+            // held across both. A check-then-act pair with the lock dropped in between is
+            // the classic shape this whole change exists to remove: an attempt could pass
+            // the check, be superseded, and then write its core into a slot that now
+            // belongs to someone else - one core reachable, one orphaned and never
+            // released. `block` runs under the lock on purpose, exactly as before.
+            if (!ownsServiceLocked(attempt)) return false
+            block()
+            published = attempt
+            return true
+        }
+    }
+
+    /**
+     * True when [attempt] may fill the core slots if no teardown is clearing them.
+     *
+     * ## Why this needs BOTH counters, and why each has the shape it has
+     *
+     * `published` and the `core`/`factSession`/`fileDescriptor` fields are single slots, and
+     * exactly one start attempt may fill them. Three separate events can take that right
+     * away, and each is checked by the counter that actually moves for it:
+     *
+     *  1. **a newer start** — only [beginStart] moves [startAttempts], so
+     *     `attempt == startAttempts` is the newest-start test. It has to be an *equality*,
+     *     not "newer than some boundary": with a boundary, take token 2, publish it, then
+     *     take token 3 — 3 > 2, so both publish and the first core is silently replaced by
+     *     a second one nobody released.
+     *  2. **a stop's teardown** — [endStop] pins [stopStaleUpTo] to everything alive while
+     *     the slots were dirty, so `attempt > stopStaleUpTo` refuses those.
+     *  3. **a destroy** — `closed`, checked first, refuses everything.
+     *
+     * A *release* is deliberately absent from this list. It moves no counter, because the
+     * only attempts it may refuse are ones the teardown itself covered (2). The round-5/6
+     * shape tested a counter that a release moved, so any release also refused a
+     * legitimate successor and stranded the Service in `Status.Starting` with no core —
+     * the round-7 R7-P0 defect. Testing (2) instead lets the successor keep its token and
+     * simply **wait** for the teardown.
+     *
+     * Caller must hold [lock].
+     */
+    private fun ownsServiceLocked(attempt: Long): Boolean =
+        !closed &&
+            attempt == startAttempts &&
+            attempt > stopStaleUpTo
 
     /** Forget [attempt] after a failed startup, without publishing anything. */
     fun abandon(attempt: Long) {

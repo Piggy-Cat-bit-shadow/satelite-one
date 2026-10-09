@@ -57,8 +57,23 @@ class StopConvergenceTest {
         /** `stopService()` / `stopAndAlert()` prologue, on the caller's thread. */
         fun stopWatermark(): Long = lifecycle.currentStartAttempt()
 
-        /** `releaseCore()`: what it does to lifecycle ownership. */
-        fun releaseCore() = lifecycle.invalidate()
+        /**
+         * `releaseCore()`: what it does to lifecycle ownership.
+         *
+         * Round 7 made this a **bracketed** event. `invalidate()` still stops a start that
+         * was requested *before* the stop from publishing, but it no longer decides a
+         * successor's fate — `endStop()` pins the stale boundary to everything alive while
+         * the core slots were dirty, which is what lets a start accepted afterwards keep
+         * its token instead of being stranded.
+         */
+        fun releaseCore() {
+            lifecycle.beginStop()
+            try {
+                lifecycle.invalidate()
+            } finally {
+                lifecycle.endStop()
+            }
+        }
 
         /**
          * The single guarded finalizer both stop paths now use.
@@ -83,6 +98,9 @@ class StopConvergenceTest {
 
         /** True when [attempt] is allowed to write its core back. */
         fun publish(attempt: Long): Boolean = lifecycle.publish(attempt) {}
+
+        /** Diagnostic accessor used by the failure messages. */
+        fun supersededOf(attempt: Long): Boolean = lifecycle.isSupersededByNewerStart(attempt)
 
         fun destroy() = lifecycle.close()
     }
@@ -183,11 +201,38 @@ class StopConvergenceTest {
         val second = h.onStartCommand()
         val third = h.onStartCommand()
         check(first != null && second != null && third != null)
-        check(!h.publish(first)) { "the first of three taps must not publish" }
-        check(!h.publish(second)) { "the second of three taps must not publish" }
+        check(!h.publish(first)) {
+            "the first of three taps must not publish [tokens=$first/$second/$third " +
+                "superseded=${h.supersededOf(first)}/${h.supersededOf(second)}/${h.supersededOf(third)}]"
+        }
+        check(!h.publish(second)) {
+            "the second of three taps must not publish [tokens=$first/$second/$third " +
+                "superseded=${h.supersededOf(first)}/${h.supersededOf(second)}/${h.supersededOf(third)}]"
+        }
         check(h.publish(third)) { "the newest tap must publish" }
         h.finalizeStop(watermark)
         check(!h.stoppedSelf) { "a stale stop killed the newest of three taps" }
+    }
+
+    @Test
+    fun `S04b sequential taps each publish, and each supersedes the one before it`() {
+        // The contrast that makes S04's claim precise. S04 covers three attempts that are
+        // all in flight at once, so only the newest may publish. Here each tap is published
+        // before the next arrives, which is the ordinary connect→reconnect case: the newer
+        // tap supersedes the older one, and the older one may no longer publish again.
+        //
+        // Round 7 had to make this origin explicit. Round 5's `publish` compared against a
+        // counter that only a *release or destroy* moved, so a merely superseded attempt
+        // could still write its core back - one core reachable, the other orphaned.
+        val h = Harness()
+        val first = h.onStartCommand()
+        check(first != null)
+        check(h.publish(first)) { "the first tap publishes when nothing precedes it" }
+
+        val second = h.onStartCommand()
+        check(second != null)
+        check(h.publish(second)) { "a later tap publishes in turn" }
+        check(!h.publish(first)) { "the superseded first tap must not publish again" }
     }
 
     @Test

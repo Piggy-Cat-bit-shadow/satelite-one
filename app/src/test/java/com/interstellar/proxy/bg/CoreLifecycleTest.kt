@@ -33,8 +33,12 @@ class CoreLifecycleTest {
     fun `a release invalidates a start that is still in flight`() {
         val lifecycle = CoreLifecycle()
         val attempt = lifecycle.beginStart() ?: error("a fresh lifecycle must authorize a start")
-        // The teardown runs while startup() is still busy.
+        // The teardown runs while startup() is still busy. Round 7: a stop is bracketed by
+        // beginStop/endStop, and it is endStop that pins the stale boundary to everything
+        // alive while the core slots were dirty.
+        lifecycle.beginStop()
         lifecycle.invalidate()
+        lifecycle.endStop()
         val published = CopyOnWriteArrayList<String>()
         check(!lifecycle.publish(attempt) { published += "core" }) {
             "a released generation must not be written back"
@@ -80,7 +84,10 @@ class CoreLifecycleTest {
         }
         publisher.start()
         check(entering.await(5, TimeUnit.SECONDS)) { "the publish never started" }
-        val invalidator = Thread { lifecycle.invalidate(); order += "invalidated" }
+        val invalidator = Thread {
+            lifecycle.beginStop(); lifecycle.invalidate(); lifecycle.endStop()
+            order += "invalidated"
+        }
         invalidator.start()
         invalidator.join(300)
         check(invalidator.isAlive) { "invalidate() interleaved inside a publish" }
@@ -98,7 +105,10 @@ class CoreLifecycleTest {
             val published = CopyOnWriteArrayList<String>()
             val go = CountDownLatch(1)
             val starter = Thread { go.await(5, TimeUnit.SECONDS); lifecycle.publish(attempt) { published += "core" } }
-            val releaser = Thread { go.await(5, TimeUnit.SECONDS); lifecycle.invalidate() }
+            val releaser = Thread {
+                go.await(5, TimeUnit.SECONDS)
+                lifecycle.beginStop(); lifecycle.invalidate(); lifecycle.endStop()
+            }
             starter.start(); releaser.start()
             go.countDown()
             starter.join(5_000); releaser.join(5_000)
@@ -139,8 +149,19 @@ class CoreLifecycleTest {
         /** onDestroy. */
         fun destroy() = lifecycle.close()
 
-        /** stopService, which may still be followed by a requested restart. */
-        fun stop() = lifecycle.invalidate()
+        /**
+         * stopService, which may still be followed by a requested restart.
+         *
+         * Round 7: a stop is a *bracketed* event. `invalidate()` alone no longer decides a
+         * successor's fate — that is `endStop()`'s job, and it pins the boundary to
+         * everything alive while `core`/`factSession`/`fileDescriptor` were dirty. These
+         * tests therefore go through the same bracket production uses.
+         */
+        fun stop() {
+            lifecycle.beginStop()
+            lifecycle.invalidate()
+            lifecycle.endStop()
+        }
     }
 
     @Test
@@ -296,9 +317,13 @@ class CoreLifecycleTest {
         val attempt = lifecycle.beginStart() ?: error("expected a token")
         check(lifecycle.isCurrent(attempt)) { "a fresh attempt owns the service" }
 
-        // A stop moved the generation on: this attempt's failure is no longer its to
-        // report, and reporting it would write Stopped over whatever came next.
+        // A stop took the service away from this attempt: its failure is no longer its to
+        // report, and reporting it would write Stopped over whatever came next. Round 7:
+        // the stale boundary is pinned at the end of the teardown, so the bracket is what
+        // production uses.
+        lifecycle.beginStop()
         lifecycle.invalidate()
+        lifecycle.endStop()
         check(!lifecycle.isCurrent(attempt)) { "a stopped attempt must not report a failure" }
     }
 
@@ -331,7 +356,10 @@ class CoreLifecycleTest {
         check(lifecycle.publish(attempt) {})
         check(lifecycle.isPublished) { "a published core must be reported as published" }
 
-        lifecycle.invalidate()   // stopService() -> releaseCore()
+        // stopService() -> releaseCore(): the round-7 bracket.
+        lifecycle.beginStop()
+        lifecycle.invalidate()
+        lifecycle.endStop()
         check(!lifecycle.isPublished) {
             "a released core must not still be reported as published"
         }
