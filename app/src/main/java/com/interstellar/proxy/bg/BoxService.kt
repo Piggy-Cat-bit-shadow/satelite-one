@@ -99,13 +99,13 @@ class BoxService(private val service: Service, private val platformInterface: Pl
 
     private var receiverRegistered = false
 
-    /**
-     * A start intent that arrived while the previous run was still tearing
-     * down (core switching stops-then-starts): honor it by restarting in
-     * place once the shutdown finishes, instead of dropping it.
-     */
-    @Volatile
-    private var pendingRestart = false
+    // `pendingRestart` used to live here as a @Volatile Boolean. It is gone on purpose:
+    // a flag that a stale stop could clear (`pendingRestart = false` on the way out) had
+    // to encode BOTH "a start was requested during teardown" and "whose request is it".
+    // The lifecycle's start-attempt counter now carries both facts directly - a start
+    // intent is claimed as a real attempt at the moment it is accepted, and
+    // `startsSince(watermark)` answers "did a newer request arrive" without a second,
+    // separately-mutable piece of state that another generation can clobber.
     private val receiver =
         object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
@@ -127,13 +127,18 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             selectedTag = Settings.selectedOutboundTag.takeIf { it.isNotBlank() },
         )
 
-    private suspend fun startCore(): CoreStartResult {
-        // A destroyed instance refuses to build a core at all (P0-A). Returning here
-        // means no CommandServer, no fact bridge and no socket ever come into being.
-        val attempt = lifecycle.beginStart()
-            ?: return CoreStartResult.Superseded.also {
-                com.interstellar.proxy.core.AppLog.log("service", "service destroyed; refused to start a core")
-            }
+    /**
+     * Build and publish the core for an attempt token that was **already claimed**.
+     *
+     * The token is claimed by [onStartCommand] on the main thread, deliberately not here.
+     * Claiming it on this IO coroutine left a window the fifth round did not close: the
+     * main thread had already written `Status.Starting`, but no new *start attempt* was
+     * visible to the lifecycle yet — so a stop that was mid-release saw "no newer start"
+     * and converged (Stopped + `stopSelf()`) onto a service the user had just started.
+     * Taking the token at the request's entry point is what makes "the start request
+     * owns the service" true from the moment the request is accepted.
+     */
+    private suspend fun startCore(attempt: Long): CoreStartResult {
         com.interstellar.proxy.core.AppLog.log("service", "启动内核 sing-box (attempt $attempt)")
         val created = CoreEngines.create(platformInterface, this)
         try {
@@ -379,42 +384,38 @@ class BoxService(private val service: Service, private val platformInterface: Pl
     private fun stopService() {
         val current = status.value
         if (current == Status.Stopped || current == Status.Stopping) return
-        // Stamp this stop with the start generation it belongs to, BEFORE anything
-        // can be released. `releaseCore()` bumps the lifecycle's generation, so a
-        // watermark taken afterwards could never tell "my own release" apart from
-        // "a newer start took the service".
         val stopWatermark = lifecycle.currentStartAttempt()
         status.value = Status.Stopping
         notifyStopped()
-        if (receiverRegistered) {
-            service.unregisterReceiver(receiver)
-            receiverRegistered = false
-        }
-        notification.close()
         GlobalScope.launch(Dispatchers.IO) {
             // Facts stop flowing to the core before its teardown starts; the Android
             // sources themselves are process-scoped and stay installed.
             releaseCore()
             withContext(Dispatchers.Main) {
-                // A start intent that arrived while this stop was tearing down may
-                // already have moved the service on. Converging to Stopped here would
-                // overwrite the new generation's status, and `stopSelf()` would tear
-                // the foreground service down under a core that is already live and
-                // whose notification this stop has just closed.
+                // ONE decision, then all of the convergence, or none of it.
+                //
+                // Checking ownership *between* `unregisterReceiver`, `notification.close()`
+                // and `status = Stopped` is not enough: the first two are themselves harm
+                // to a successor. `notification` and `receiver` are per-BoxService objects,
+                // but the foreground notification slot and the registration are shared
+                // process-wide state — closing them after the user already started a new
+                // generation removes the notification that generation just posted and
+                // deregisters the receiver it is relying on, and `stopSelf()` then tears
+                // the whole foreground service down underneath a live core.
                 if (lifecycle.startsSince(stopWatermark)) {
                     android.util.Log.i(
                         "InterstellarUI",
-                        "stop superseded by a newer start; not converging to Stopped",
+                        "stop superseded by a newer start; withholding every convergence effect",
                     )
                     return@withContext
                 }
-                status.value = Status.Stopped
-                if (pendingRestart) {
-                    pendingRestart = false
-                    onStartCommand()
-                } else {
-                    service.stopSelf()
+                if (receiverRegistered) {
+                    service.unregisterReceiver(receiver)
+                    receiverRegistered = false
                 }
+                notification.close()
+                status.value = Status.Stopped
+                service.stopSelf()
             }
         }
     }
@@ -434,31 +435,31 @@ class BoxService(private val service: Service, private val platformInterface: Pl
         // Same shared release as the normal stop — this path used to reach
         // core.shutdown() without unbinding the fact bridge at all.
         releaseCore()
-        // This path is a failure, not a switch: it must not honour (or keep) a start
-        // intent that arrived while tearing down, or a stale flag would trigger an
-        // unwanted restart after some later, unrelated stop.
-        pendingRestart = false
         withContext(Dispatchers.Main) {
+            // The alert is the ONE thing whose meaning does not depend on who owns the
+            // service: the user must still learn that the core failed, and the failure
+            // realmente happened. It runs before the ownership check on purpose, and it
+            // has no side effect on the service's resources.
+            binder.broadcast { callback ->
+                callback.onServiceAlert(type.ordinal, message)
+            }
+            // Convergence is withheld wholesale when a newer generation owns the
+            // service. Reporting the alert is not the same as acting as the owner, and
+            // the previous shape did the acting first (unregister + close) and only then
+            // asked whether it was still allowed to - which is how an old failure could
+            // darken a healthy successor's notification and receiver.
+            if (lifecycle.startsSince(stopWatermark)) {
+                android.util.Log.i(
+                    "InterstellarUI",
+                    "alert raised by a superseded generation; reported without converging",
+                )
+                return@withContext
+            }
             if (receiverRegistered) {
                 service.unregisterReceiver(receiver)
                 receiverRegistered = false
             }
             notification.close()
-            binder.broadcast { callback ->
-                callback.onServiceAlert(type.ordinal, message)
-            }
-            // The alert itself is still reported — the user must learn that the core
-            // failed. What is withheld is only the claim of ownership: a newer
-            // generation may have started during the release, and writing Stopped over
-            // it (plus stopSelf()) would kill a healthy service and leave its core
-            // running with a closed notification.
-            if (lifecycle.startsSince(stopWatermark)) {
-                android.util.Log.i(
-                    "InterstellarUI",
-                    "alert raised by a superseded generation; reporting it without converging",
-                )
-                return@withContext
-            }
             status.value = Status.Stopped
             notifyStopped()
             service.stopSelf()
@@ -478,13 +479,32 @@ class BoxService(private val service: Service, private val platformInterface: Pl
         when (status.value) {
             Status.Starting, Status.Started -> return Service.START_NOT_STICKY
 
-            // still tearing down the previous run — run again right after
-            Status.Stopping -> {
-                pendingRestart = true
-                return Service.START_NOT_STICKY
-            }
+            // Still tearing down the previous run. The restart is not queued behind a
+            // boolean here: the intent is claimed as a real start attempt BELOW, on this
+            // same (main) thread, so the teardown that is in flight can see it and
+            // withhold its own convergence instead of killing what the user just started.
+            Status.Stopping -> Unit
 
             null, Status.Stopped -> Unit
+        }
+
+        // Claim the attempt HERE, synchronously, before `Status.Starting` is observable.
+        //
+        // This is the linearization point the invariant needs: "a start request owns the
+        // service" must be established at the moment the request is accepted, not later
+        // on the IO coroutine that builds the core. The previous shape wrote
+        // `Status.Starting` first and only took a token inside `startCore()`, so a stop
+        // releasing concurrently still saw no newer start and converged on top of it.
+        //
+        // The claim is synchronous and does no native work, so it is safe on the main
+        // thread: `CoreLifecycle`'s lock is held only for counter arithmetic (the one
+        // exception, `publish`, is held by the IO thread and calls only
+        // `PlatformFacts.attach`, which is a map write plus queue sends).
+        val attempt = lifecycle.beginStart()
+        if (attempt == null) {
+            // Lost a race with onDestroy between the check above and the claim.
+            android.util.Log.i("InterstellarUI", "service destroyed while claiming a start; refusing")
+            return Service.START_NOT_STICKY
         }
         status.value = Status.Starting
 
@@ -508,7 +528,7 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             // startCore() no longer throws for a startup failure: it reports one only
             // while the attempt still owns the service (see CoreStartResult.Failed), so a
             // superseded attempt cannot stop a newer generation.
-            when (val started = startCore()) {
+            when (val started = startCore(attempt)) {
                 is CoreStartResult.Failed -> {
                     stopAndAlert(Alert.StartCommandServer, started.cause.message)
                     return@launch

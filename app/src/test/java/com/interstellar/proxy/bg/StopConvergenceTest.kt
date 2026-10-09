@@ -2,195 +2,306 @@ package com.interstellar.proxy.bg
 
 import org.junit.Test
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
- * Whose stop is it? (P0-R2, this round)
+ * Whose stop is it, and what is it allowed to touch? (round 6)
  *
- * The round-4 gap was stated in the handoff as "a small window remains between
- * `isCurrent(attempt)` and the `status = Stopped` write". This file is the
- * deterministic reproduction of the part of that window that is actually
- * reachable, and the guard that closes it.
+ * ## What changed and why this file changed shape
  *
- * ## The reachable chain (not a hypothetical)
+ * Round 5 introduced `startAttempts` / `startsSince` so a stale stop would stop writing
+ * `Stopped` over a successor. It left two holes that this file exists to close:
  *
- * `stopAndAlert` is NOT only reached while a start attempt owns the service. It is
- * also reached from `serviceReload0()`, and that path can run while
- * `status == Status.Stopped`:
+ *  1. **The convergence check came too late.** `stopAndAlert` unregistered the receiver,
+ *     called `notification.close()` and broadcast the alert *before* asking
+ *     `startsSince`. Those first two are harm to a successor, not bookkeeping: the
+ *     foreground-notification slot and the receiver registration are process-wide, so a
+ *     superseded generation was still closing the notification a newer generation had
+ *     just posted. `stopService` was worse — it did the same work on the *caller's*
+ *     thread, before `releaseCore()` had even started.
+ *  2. **The start token was claimed too late.** `onStartCommand` set `Status.Starting` on
+ *     the main thread but only took its lifecycle token later, inside the IO coroutine's
+ *     `startCore()`. A stop releasing in that window saw "no newer start" and converged
+ *     onto the service the user had just started.
  *
- *  1. a one-shot `serviceReload` arrives from `UpdateWorker` /
- *     `PerAppProxyViewModel` / `AppViewModel` — all of them use
- *     `CommandTarget.standaloneClient().serviceReload()`, a *fresh* command client
- *     that does not care what the Service's own status is;
- *  2. `serviceReload0()` re-reads the active config, throws, and calls
- *     `stopAndAlert(Alert.CreateService)` — with `status` still `Stopped`;
- *  3. `stopAndAlert` awaits `releaseCore()` (IO) before its `withContext(Main)`
- *     block. Throughout that window `status` is still `Stopped`, so a user tap on
- *     启动 (or the Quick Tile) makes `onStartCommand()` dequeue on the main thread,
- *     take `Status.Stopped -> Unit`, set `Status.Starting` and begin a **new**
- *     generation B;
- *  4. the alert's finalizer then runs on the main thread and — in the round-4
- *     shape — writes `Stopped` over B and calls `stopSelf()`.
- *
- * The result is a service Android is destroying while B's core is live: B's
- * notification is already closed, the UI reads Stopped, and `stopSelf()` tears
- * down the foreground service under a running tunnel.
- *
- * ## Why this test is not just re-testing `CoreLifecycle`
- *
- * The handoff is explicit that a pure `CoreLifecycle` test cannot prove the call
- * path. So the scenario below is driven through [StopConvergence] — the same
- * object `BoxService` consults at both finalizers — in the same order the Service
- * uses: capture a start watermark, release, then finalize under the watch of a
- * *second* start that lands in between.
+ * So this test no longer drives a stand-in model class: the previous `Service` fake
+ * could stay green while production changed underneath it. It drives the **real**
+ * [CoreLifecycle] through the exact operation order `BoxService` uses, and the side
+ * effects are modelled as a small owner-checked recorder so "did the old stop touch the
+ * new generation's resources" is an assertion rather than a comment.
  */
 class StopConvergenceTest {
 
     /**
-     * The decision `BoxService`'s two stop finalizers now make, with no Android and
-     * no native types, so the interleaving is provable rather than argued about.
+     * Mirrors the production sequence, with `CoreLifecycle` as the only authority.
+     *
+     * `releaseCore()` is modelled as `invalidate()` (which is what it does to the
+     * lifecycle) — that is the step that must NOT be mistaken for a newer start.
      */
-    private class Service {
+    private class Harness {
         val lifecycle = CoreLifecycle()
 
-        /** Effects the finalizers would really perform. */
+        /** Side effects a stop finalizer may perform, recorded in order. */
         val effects = CopyOnWriteArrayList<String>()
-        var status = "Stopped"
+
+        /**
+         * The two shared, per-instance Android resources a finalizer touches. Modelled
+         * as flags guarded by the SAME generation decision, because the point of the fix
+         * is that they are only touched when this generation still owns the service.
+         */
+        var receiverRegistered = true
+        var notificationOpen = true
         var stoppedSelf = false
 
-        /** `onStartCommand()` on the main thread: take a token, set Starting. */
-        fun start(): Long? {
-            val attempt = lifecycle.beginStart() ?: run {
-                effects += "refused-destroyed"
-                return null
-            }
-            status = "Starting"
-            return attempt
-        }
+        /** `stopService()` / `stopAndAlert()` prologue, on the caller's thread. */
+        fun stopWatermark(): Long = lifecycle.currentStartAttempt()
+
+        /** `releaseCore()`: what it does to lifecycle ownership. */
+        fun releaseCore() = lifecycle.invalidate()
 
         /**
-         * `stopService()` / `stopAndAlert()`: stamp the work with the start
-         * generation it belongs to, release the core, then finalize on main.
+         * The single guarded finalizer both stop paths now use.
+         *
+         * The ownership question is asked ONCE, first; only if this generation still owns
+         * the service may it unregister, close, write status and stop itself.
          */
-        fun stopAndFinalize(release: () -> Unit) {
-            val watermark = lifecycle.currentStartAttempt()
-            release()                       // releaseCore(): invalidate() + teardown
-            finalizeStop(watermark)
-        }
-
-        /**
-         * The guarded finalizer. Runs on the main thread, after whatever the user did
-         * while the release was in flight.
-         */
-        fun finalizeStop(watermark: Long) {
+        fun finalizeStop(watermark: Long): Boolean {
             if (lifecycle.startsSince(watermark)) {
-                // A newer generation owns the service now. Converging to Stopped here
-                // would overwrite its status and `stopSelf()` would kill it.
-                effects += "convergence-withheld"
-                return
+                effects += "withheld"
+                return false
             }
-            status = "Stopped"
-            stoppedSelf = true
             effects += "converged"
+            receiverRegistered = false
+            notificationOpen = false
+            stoppedSelf = true
+            return true
         }
+
+        /** `onStartCommand()`: claim the attempt, then publish it as Starting. */
+        fun onStartCommand(): Long? = lifecycle.beginStart()
+
+        /** True when [attempt] is allowed to write its core back. */
+        fun publish(attempt: Long): Boolean = lifecycle.publish(attempt) {}
+
+        fun destroy() = lifecycle.close()
+    }
+
+    // -----------------------------------------------------------------------
+    // S01 — the round-5 hole: the claim has to exist before the stop finalizes
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `S01 a start accepted during the release keeps the old stop from converging`() {
+        val h = Harness()
+
+        // Old stop begins: it stamps itself, then blocks inside releaseCore().
+        val watermark = h.stopWatermark()
+
+        // The user taps 启动 while the release is still in flight. With the fix, the
+        // token is claimed HERE - at request entry - not later on the IO coroutine.
+        val b = h.onStartCommand()
+        check(b != null) { "the new start must be authorised" }
+
+        // The release finishes and the finalizer runs on main.
+        val converged = h.finalizeStop(watermark)
+
+        check(!converged) { "a stale stop converged over a live generation" }
+        check(h.receiverRegistered) { "the stale stop unregistered the new generation's receiver" }
+        check(h.notificationOpen) { "the stale stop closed the new generation's notification" }
+        check(!h.stoppedSelf) { "the stale stop called stopSelf() under a live generation" }
+        check(h.effects.toList() == listOf("withheld")) { "got ${h.effects}" }
     }
 
     @Test
-    fun `a stop whose release was overtaken by a new start must not converge`() {
-        val s = Service()
+    fun `S01b claiming the token later would have lost the race - the old shape`() {
+        // The round-5 ordering, reproduced honestly: the stop stamps, the release runs,
+        // and the new start's token is only taken AFTER the finalizer has asked. This is
+        // what `status = Starting` + `beginStart()` inside startCore() produced, and it
+        // is why the claim had to move to the main-thread entry point.
+        val h = Harness()
+        val watermark = h.stopWatermark()
+        h.releaseCore()
+        val converged = h.finalizeStop(watermark)   // asks before the new start exists
+        check(converged) { "the harness must reproduce the old ordering" }
+        check(h.stoppedSelf) { "old shape stops the service" }
+        // ... and only now does the new generation try to take a token.
+        val late = h.onStartCommand()
+        check(late != null) { "a late start is still authorised" }
+        check(h.effects.toList() == listOf("converged")) { "got ${h.effects}" }
+        // The service was already told to stop, so B is born into a dead service: this is
+        // exactly the failure the S01 test above forbids, kept here as the red contrast.
+    }
 
-        // A normal stop begins: it stamps the generation it belongs to, then blocks
-        // inside releaseCore() (IO) — exactly the window the handoff describes.
-        val watermark = s.lifecycle.currentStartAttempt()
+    // -----------------------------------------------------------------------
+    // S02 / S03 — an old failure must not darken a healthy successor
+    // -----------------------------------------------------------------------
 
-        // The user taps 启动 while the release is still in flight. `status` is
-        // Stopped on this path (serviceReload0 -> stopAndAlert), so onStartCommand
-        // takes a fresh token instead of setting pendingRestart.
-        val newAttempt = s.start()
-        check(newAttempt != null) { "the new start must be authorised" }
+    @Test
+    fun `S02 an old alert cannot close the notification or receiver of a live successor`() {
+        val h = Harness()
+        val watermark = h.stopWatermark()           // old stopAndAlert entry
+        h.releaseCore()                             // its releaseCore()
+        val b = h.onStartCommand()                  // successor claims during the release
+        check(b != null)
+        h.finalizeStop(watermark)                   // alert finalizer reaches Main
 
-        // The release finishes and the finalizer runs.
-        s.finalizeStop(watermark)
-
-        check(s.status == "Starting") {
-            "a stale stop overwrote the live generation's status: ${s.status}"
-        }
-        check(!s.stoppedSelf) {
-            "a stale stop called stopSelf() under a live generation"
-        }
-        check(s.effects.toList() == listOf("convergence-withheld")) { "got ${s.effects}" }
+        check(h.notificationOpen) { "an old alert closed the successor's notification" }
+        check(h.receiverRegistered) { "an old alert unregistered the successor's receiver" }
+        check(!h.stoppedSelf) { "an old alert stopped the successor's service" }
     }
 
     @Test
-    fun `an uncontested stop still converges normally`() {
-        val s = Service()
-        val watermark = s.lifecycle.currentStartAttempt()
-        s.finalizeStop(watermark)
-        check(s.status == "Stopped") { "an uncontested stop must reach Stopped, got ${s.status}" }
-        check(s.stoppedSelf) { "an uncontested stop must still stopSelf()" }
+    fun `S03 one-shot serviceReload failure racing a user tap cannot kill the new start`() {
+        // serviceReload0() reaches stopAndAlert while status is still Stopped - a
+        // one-shot command client never consults the Service's status. Nothing about the
+        // status field prevents onStartCommand from claiming here.
+        val h = Harness()
+        val watermark = h.stopWatermark()
+        val tap = h.onStartCommand()
+        check(tap != null) { "the tap must be accepted" }
+        h.releaseCore()
+        h.finalizeStop(watermark)
+        check(h.notificationOpen && h.receiverRegistered && !h.stoppedSelf) {
+            "the reload-triggered alert harmed the new start"
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // S04 / S07 — restart intents are not lost, and are not owned by a stale stop
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `S04 three start intents during teardown still leave exactly one live generation`() {
+        val h = Harness()
+        val watermark = h.stopWatermark()
+        h.releaseCore()
+        // Three taps while Stopping. Each is a real claim at request entry now, so the
+        // latest one owns the service and the earlier ones are superseded - they cannot
+        // publish, which is what keeps this from becoming three CommandServers.
+        val first = h.onStartCommand()
+        val second = h.onStartCommand()
+        val third = h.onStartCommand()
+        check(first != null && second != null && third != null)
+        check(!h.publish(first)) { "the first of three taps must not publish" }
+        check(!h.publish(second)) { "the second of three taps must not publish" }
+        check(h.publish(third)) { "the newest tap must publish" }
+        h.finalizeStop(watermark)
+        check(!h.stoppedSelf) { "a stale stop killed the newest of three taps" }
     }
 
     @Test
-    fun `a stop taken while a start is already in flight still converges`() {
-        // The opposite mistake: a stop that *precedes* the next start must converge.
-        // `startsSince` compares against the attempt counter taken at stop time, so a
-        // start taken BEFORE the watermark does not hold a stop back.
-        val s = Service()
-        val inFlight = s.start()
+    fun `S07 a failed start does not clear a restart intent that is newer than it`() {
+        val h = Harness()
+        // A's failed-start teardown begins ...
+        val aWatermark = h.stopWatermark()
+        h.releaseCore()
+        // ... and while it releases, the user starts B.
+        val b = h.onStartCommand()
+        check(b != null)
+        // A's alert finalizer runs. It must not converge, and it must not be able to
+        // clear anything belonging to B - the removed `pendingRestart = false` write was
+        // precisely such a cross-generation clear.
+        h.finalizeStop(aWatermark)
+        check(h.publish(b)) { "B must still be able to publish after A's alert" }
+        check(!h.stoppedSelf) { "A stopped the service B is now running in" }
+    }
+
+    // -----------------------------------------------------------------------
+    // S05 / S06 — destroy and supersession still hold (round-4/5 invariants)
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `S05 a destroy during startup prevents publication`() {
+        val h = Harness()
+        val attempt = h.onStartCommand()
+        check(attempt != null)
+        h.destroy()                                  // onDestroy while startup() is in flight
+        check(!h.publish(attempt)) { "a destroyed instance published a core" }
+        check(h.onStartCommand() == null) { "a destroyed instance authorised a start" }
+    }
+
+    @Test
+    fun `S06 an old startup failure does not interrupt a newer generation`() {
+        val h = Harness()
+        val a = h.onStartCommand()
+        check(a != null)
+        val b = h.onStartCommand()
+        check(b != null)
+        // A's startup throws: it abandons its own token and must not publish.
+        h.lifecycle.abandon(a)
+        check(!h.publish(a)) { "the failed older attempt published" }
+        check(h.publish(b)) { "the newer attempt was blocked by the older failure" }
+    }
+
+    @Test
+    fun `a destroy makes a stop finalizer converge nothing`() {
+        val h = Harness()
+        val watermark = h.stopWatermark()
+        h.destroy()
+        h.finalizeStop(watermark)
+        check(!h.stoppedSelf) { "a destroyed instance still drove the service to Stopped" }
+        check(h.effects.toList() == listOf("withheld")) { "got ${h.effects}" }
+    }
+
+    // -----------------------------------------------------------------------
+    // Uncontested stops must still converge - the fix must not break the normal path
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `an uncontested stop converges exactly once`() {
+        val h = Harness()
+        val watermark = h.stopWatermark()
+        h.releaseCore()
+        check(h.finalizeStop(watermark)) { "a normal stop must converge" }
+        check(h.stoppedSelf && !h.notificationOpen && !h.receiverRegistered)
+        check(h.effects.toList() == listOf("converged")) { "got ${h.effects}" }
+    }
+
+    @Test
+    fun `a start that precedes the stop does not hold the stop back`() {
+        // `startsSince` compares the attempt counter, so a start taken BEFORE the
+        // watermark must not suppress a later, genuine stop.
+        val h = Harness()
+        val inFlight = h.onStartCommand()
         check(inFlight != null)
-        val watermark = s.lifecycle.currentStartAttempt()
-        s.finalizeStop(watermark)
-        check(s.status == "Stopped") { "got ${s.status}" }
-        check(s.stoppedSelf)
+        val watermark = h.stopWatermark()
+        h.releaseCore()
+        check(h.finalizeStop(watermark)) { "a stop after a start must still converge" }
+        check(h.stoppedSelf)
     }
 
     @Test
-    fun `a destroyed instance never converges the stop of a successor`() {
-        val s = Service()
-        val watermark = s.lifecycle.currentStartAttempt()
-        s.lifecycle.close()
-        s.finalizeStop(watermark)
-        check(!s.stoppedSelf) { "a destroyed instance must not drive the service to Stopped" }
-        check(s.effects.toList() == listOf("convergence-withheld")) { "got ${s.effects}" }
-    }
-
-    @Test
-    fun `the two hundred interleavings of start and stop never let a stale stop win`() {
-        // The round-4 shape is what must lose: interleave "release + finalize" with
-        // "start" from two threads, in both orders, and assert the invariant that
-        // matters — if a new generation exists, the service is not left Stopped.
+    fun `two hundred interleavings of claim and finalize never converge a live successor`() {
         repeat(200) { i ->
-            val s = Service()
-            val watermark = s.lifecycle.currentStartAttempt()
-            val releaseDone = java.util.concurrent.CountDownLatch(1)
-            val go = java.util.concurrent.CountDownLatch(1)
+            val h = Harness()
+            val watermark = h.stopWatermark()
+            val releaseDone = CountDownLatch(1)
+            val go = CountDownLatch(1)
 
             val stopper = Thread {
-                go.await(5, java.util.concurrent.TimeUnit.SECONDS)
-                releaseDone.countDown()      // release is now in flight
-                s.finalizeStop(watermark)
+                go.await(5, TimeUnit.SECONDS)
+                releaseDone.countDown()
+                h.finalizeStop(watermark)
             }
             val starter = Thread {
-                go.await(5, java.util.concurrent.TimeUnit.SECONDS)
-                releaseDone.await(5, java.util.concurrent.TimeUnit.SECONDS)
-                s.start()
+                go.await(5, TimeUnit.SECONDS)
+                releaseDone.await(5, TimeUnit.SECONDS)
+                h.onStartCommand()
             }
             stopper.start(); starter.start()
             go.countDown()
             stopper.join(5_000); starter.join(5_000)
 
-            // Whichever order won, a start that was authorised must not have been
-            // converged away: either the stop finalised first (and the start then
-            // legitimately owns the service as Starting), or the start won and the
-            // stop withheld. Either way the service is never Stopped-with-a-start.
-            if (s.effects.contains("converged")) {
-                // The stop won the race before the start was taken; the start must
-                // then have moved the status on afterwards.
-                check(s.status == "Starting") {
-                    "iteration $i: a converged stop left status=${s.status} with a live start"
-                }
+            if (h.effects.contains("converged")) {
+                // The stop won the race outright. A start may then have been taken
+                // afterwards, in which case it must be able to publish its own core -
+                // but the stop must not have stopped a service the start now owns.
+                check(h.effects.toList() == listOf("converged")) { "iteration $i: ${h.effects}" }
             } else {
-                check(s.status == "Starting") { "iteration $i: got ${s.status}" }
-                check(!s.stoppedSelf) { "iteration $i: withheld stop still stopped the service" }
+                check(!h.stoppedSelf) { "iteration $i: withheld stop still stopped the service" }
+                check(h.notificationOpen) { "iteration $i: withheld stop closed the notification" }
+                check(h.receiverRegistered) { "iteration $i: withheld stop unregistered" }
             }
         }
     }

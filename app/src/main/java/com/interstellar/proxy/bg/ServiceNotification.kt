@@ -118,8 +118,9 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
             // text; only a Stop->Start opens a new generation. The rule is in the gate so
             // it is unit-tested rather than trusted.
             generation = gate.beginOrRefreshSession()
-            // A restart (pendingRestart Stop→Start) reuses this instance after close()
-            // cancelled the previous scope, so a fresh session is mandatory here.
+            // A restart (Stop→Start, including a start that arrived while the previous
+            // teardown was still running) reuses this instance after close() cancelled the
+            // previous scope, so a fresh session is mandatory here.
             if (session == null) session = newSession(generation)
             showingTraffic = false
         }
