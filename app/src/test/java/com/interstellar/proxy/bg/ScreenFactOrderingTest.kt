@@ -27,6 +27,19 @@ import java.util.concurrent.TimeUnit
  * live. Both writers now go through one locked entry point ([ScreenFactState.onChanged]),
  * which removes the ordering question instead of answering it.
  *
+ * **Round 8 corrected this class in two ways**, both found by reading the source rather
+ * than the report:
+ *
+ *  1. The guard's key was taken *after* the platform read (`sample()` was called once
+ *     `isInteractive` had already been read), so the key already contained the very
+ *     observation it was supposed to detect. The tests here sampled before the simulated
+ *     broadcast, i.e. they pinned the *ideal* usage of the API, not the order
+ *     `PlatformFacts.install()` actually performed — green JVM, unprotected production.
+ *  2. The key counted level *transitions*, so a broadcast repeating the current value was
+ *     invisible to it. See `A04b` for why the old assertion about that was backwards, and
+ *     `ScreenSeedWiringTest` for the tests that drive the real production helper
+ *     ([PlatformFacts.seedInitialScreen]) instead of a model of it.
+ *
  * These tests therefore pin the *rule*, and the destructive contrast shows what the rule
  * is protecting against.
  */
@@ -82,18 +95,29 @@ class ScreenFactOrderingTest {
     }
 
     @Test
-    fun `A04b only real transitions bump the version`() {
-        // The version is the whole basis for rejecting a stale seed, so an observation that
-        // changes nothing must not bump it - otherwise an unrelated repeated broadcast would
-        // make a legitimately current reading look stale and silently drop it.
+    fun `A04b the changed flag tracks level transitions, the epoch tracks observations`() {
+        // These are two different questions and they have different answers, which round 8
+        // had to separate. The boolean says "did the level move?", which is what the
+        // `(unchanged)` debug line and the delivery side care about. The epoch says "was
+        // the screen observed at all?", which is the only thing that can decide whether a
+        // reading taken earlier is still current.
+        //
+        // The earlier revision of this test asserted that an unchanged observation must
+        // NOT bump the version, reasoning that "an unrelated repeated broadcast would make
+        // a legitimately current reading look stale and silently drop it". That reasoning
+        // is backwards: a repeated broadcast *is* newer than the reading, so the reading is
+        // no longer current and dropping it is the correct outcome. Keeping the old
+        // assertion would have required keeping the hole it protected — a stale snapshot
+        // could pass the guard and revert the newest observation. See
+        // `ScreenSeedWiringTest.S03`, which is the destructive counterpart.
         val state = ScreenFactState()
-        val (_, v0) = state.sample()
-        state.onChanged(true)                 // no change from the default
-        val (_, v1) = state.sample()
-        check(v0 == v1) { "an unchanged observation must not bump the version" }
-        state.onChanged(false)                // a real transition
-        val (_, v2) = state.sample()
-        check(v2 != v1) { "a real transition must bump the version" }
+        val epoch0 = state.observationEpoch()
+        check(!state.onChanged(true)) { "ON over the default ON is not a level change" }
+        check(state.observationEpoch() != epoch0) { "it is still an observation, so the epoch moves" }
+        check(state.onChanged(false)) { "OFF is a real transition" }
+        check(state.observationEpoch() > epoch0) { "and it moves the epoch too" }
+        check(!state.onChanged(false)) { "a repeated OFF is not a transition" }
+        check(state.observationEpoch() > epoch0 + 1) { "but it is still an observation" }
     }
 
     @Test
