@@ -57,15 +57,19 @@ class ConnectionsViewModel(application: Application) : AndroidViewModel(applicat
     val connected: StateFlow<Boolean> = _connected
 
     /** Bumped on every session start/stop; late callbacks from an old session see a stale value. */
-    private var sessionGeneration = 0
+    /** Session generation + the serialized snapshot commit (see [SessionGate]). */
+    private val gate = SessionGate<ActiveConnection> { _connections.value = it }
 
+    @Volatile
     private var store: Connections? = null
+
+    @Volatile
     private var client: CommandClient? = null
     private var pollJob: Job? = null
 
     private val active: Boolean get() = store != null && client != null
 
-    private fun isCurrent(generation: Int): Boolean = generation == sessionGeneration && active
+    private fun isCurrent(generation: Int): Boolean = generation == gate.generationValue && active
 
     /**
      * Page visibility gate. Idempotent: repeated `true`/`false` are no-ops, so a
@@ -77,7 +81,7 @@ class ConnectionsViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     private fun startSession() {
-        val generation = ++sessionGeneration
+        val generation = gate.start()
         val newStore = Libbox.newConnections()
         store = newStore
         val newClient = CommandClient(
@@ -120,19 +124,22 @@ class ConnectionsViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     private fun stopSession() {
-        // Invalidate first: anything still in flight from this session becomes a
-        // no-op before we tear the client down.
-        sessionGeneration++
+        // Stop the source first, so no new callback can start work for this session.
         pollJob?.cancel()
         pollJob = null
         client?.disconnect()
         client = null
         store = null
         _connected.value = false
-        // Drop the snapshot: nobody is looking at it, and holding ActiveConnection
-        // rows alive while the page is closed is exactly the background work this
-        // class is meant to avoid.
-        _connections.value = emptyList()
+        // Then invalidate and drop the snapshot as ONE step. The generation bump and
+        // the clear must be atomic with respect to a commit that already passed its
+        // own check: otherwise that commit could write a stale list back *after* this
+        // clear and resurrect a closed page's snapshot.
+        //
+        // Nobody is looking at the snapshot once the page is closed, and holding
+        // ActiveConnection rows alive while it is closed is exactly the background
+        // work this class exists to avoid.
+        gate.stop()
     }
 
     private suspend fun publish(generation: Int, store: Connections, events: ConnectionEvents) =
@@ -164,7 +171,7 @@ class ConnectionsViewModel(application: Application) : AndroidViewModel(applicat
                 )
             }
             list.sortWith(compareBy({ !it.closed }, { -it.createdAt }))
-            if (isCurrent(generation)) _connections.value = list
+            gate.commit(generation, list)
         }
 
     fun closeConnection(id: String) {
@@ -182,5 +189,51 @@ class ConnectionsViewModel(application: Application) : AndroidViewModel(applicat
     override fun onCleared() {
         stopSession()
         super.onCleared()
+    }
+}
+
+/**
+ * Session bookkeeping for the page-scoped connections stream.
+ *
+ * Pure — no Android, no libbox — so the ordering rules are unit-testable instead of
+ * being argued about in comments. It owns two guarantees:
+ *
+ *  1. **Cross-thread visibility.** The generation is written from the UI thread by
+ *     [start]/[stop] and read from the libbox callback thread. A plain field gives no
+ *     visibility guarantee, and a stale read is exactly how an old session's result
+ *     gets committed.
+ *  2. **No resurrected snapshot.** The final commit is serialized against the clear.
+ *     Without that, the ordering "check generation → stop clears → commit writes"
+ *     re-publishes a list that was just discarded. With it, either the commit lands
+ *     first and the clear wipes it, or the clear lands first and the check inside the
+ *     lock rejects the commit: both orders end empty.
+ */
+internal class SessionGate<T>(private val publish: (List<T>) -> Unit) {
+
+    @Volatile
+    private var generation = 0
+
+    private val lock = Any()
+
+    /** Open a new session and return its generation. */
+    fun start(): Int = synchronized(lock) { ++generation }
+
+    /** The live session's generation. */
+    val generationValue: Int get() = generation
+
+    /** Publish [list] only if [candidate] is still the live session. */
+    fun commit(candidate: Int, list: List<T>) {
+        synchronized(lock) {
+            if (candidate != generation) return
+            publish(list)
+        }
+    }
+
+    /** Close the session and clear what it published, as one atomic step. */
+    fun stop() {
+        synchronized(lock) {
+            generation++
+            publish(emptyList())
+        }
     }
 }
