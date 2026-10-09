@@ -2,10 +2,38 @@
 # 发版: 改 version.properties → 提交 → git tag v<versionName> && git push origin v<versionName>
 #
 # 流程: 从 Piggy-Cat-bit-shadow/sing-box 构建唯一内核 libbox.aar
-#       (app/libs 被 gitignore, CI 从源码重建) → 注入签名(可选 secrets)
-#       → assembleRelease(按 ABI 分包) → 校验和 → 上传 Release
+#       (app/libs 被 gitignore, CI 从源码重建) → [仅授权发布路径]注入签名
+#       → assembleRelease(按 ABI 分包) → 用 apksigner 实测签名状态 → 校验和
+#       → 上传 artifact → [仅授权发布路径]独立的 publish job 建 Release
 #
 # 这里没有任何 mihomo / Xray / hev 的下载或编译步骤 —— 本客户端只有一个内核。
+#
+# ---------------------------------------------------------------------------
+# 签名行为的真实定义(与 app/build.gradle.kts 一致, 不是推测):
+#   (a) release 变体 + 没有 signing.properties → 产物 UNSIGNED(未签名), 装不上。
+#       app/build.gradle.kts 只在 signing.properties 里存在 storeFile 时才给
+#       release 变体挂 signingConfig; 没有它, release 变体就是一个不签名的包。
+#       这里没有"回退到 debug 签名"这回事 —— release 变体从不挂 debug 签名,
+#       debug 签名只属于 debug 变体。
+#   (b) debug 变体(assembleDebug) → 由 AGP 默认 debug keystore 签名, 且带
+#       .debug 后缀的 applicationId; 但只要仓库根存在 signing.properties,
+#       debug 变体也会改用正式签名(app/build.gradle.kts 的 debug { } 分支)。
+#   (c) 本地正式签名 → 在仓库根放 signing.properties
+#       (storeFile/storePassword/keyAlias/keyPassword), 签名材料不入库。
+#   本 workflow 因此不在日志或文件名里断言"用了 debug 签名", 而是用 apksigner
+#   对产物实测, 并把实测结果( unsigned / debug-signed / signed-by-user )写进文件名、
+#   apksigner-verify.txt 和 build-info.json 的 signature_state。
+#
+# 权限最小化:
+#   整个 workflow 默认 contents: read —— 构建 / 验证 / dry-run 全部只读。
+#   只有 publish job(只可能在 v* tag push 且 dry_run != true 时运行)单独声明
+#   contents: write。写权限不再授予每一次运行。
+#
+# 签名材料隔离:
+#   "Restore signing config" 只在 v* tag push 且 dry_run != true 时可达。
+#   workflow_dispatch 默认 dry_run=true, 所以手动触发的运行既不读生产签名
+#   secret, 也不会恢复 interstellar.jks / signing.properties。
+# ---------------------------------------------------------------------------
 
 name: Release APK
 
@@ -13,17 +41,19 @@ on:
   push:
     tags:
       - 'v*'
-  # Dry run: exercises the full release path (pinned core, provenance gate,
-  # release build, checksums, build-info) but publishes nothing.
+  # Dry run(默认): 走完整的 release 路径(固定内核、provenance 门禁、release 构建、
+  # 校验和、build-info), 但不签名、不发布。dry_run=false 只在 v* tag push 时才有
+  # 意义 —— 分支上的 dispatch 无论如何都不会发布, 见 publish job 的条件。
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Build and validate only — skip tag check and publishing'
+        description: 'Build and validate only — no signing material, no release'
         type: boolean
         default: true
 
+# 最小权限: 默认只读。publish job 需要写权限时在那里单独声明。
 permissions:
-  contents: write
+  contents: read
 
 env:
   CORE_REPO: Piggy-Cat-bit-shadow/sing-box
@@ -34,14 +64,20 @@ env:
 
 jobs:
   build:
-    name: Build & release APK
+    name: Build APK (read-only dry run unless tag push)
     runs-on: ubuntu-latest
+    # 显式声明, 不依赖仓库的默认 GITHUB_TOKEN 权限设置。
+    permissions:
+      contents: read
+    outputs:
+      artifact_name: ${{ steps.naming.outputs.artifact_name }}
+      signature_state: ${{ steps.sig.outputs.state }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # full history + tags: the release-notes step diffs against the previous tag
-          fetch-depth: 0
+          # 生成 release notes 需要历史与 tag, 那是 publish job 的事; 构建只要一份工作树。
+          fetch-depth: 1
 
       # Make the app side of the evidence chain explicit instead of assumed. Actions
       # checks out github.sha, so this asserts the contract: a misconfigured runner or a
@@ -201,25 +237,32 @@ jobs:
       - name: Unit tests
         run: ./gradlew :app:testDebugUnitTest --no-daemon --console=plain
 
-      # 签名材料不入库。配置以下 repo secrets 后, CI 产物与本地正式签名一致:
-      #   INTERSTELLAR_KEYSTORE_B64     base64(interstellar.jks)
-      #   INTERSTELLAR_STORE_PASSWORD   storePassword
-      #   INTERSTELLAR_KEY_ALIAS        keyAlias
-      #   INTERSTELLAR_KEY_PASSWORD     keyPassword
-      # 未配置时按 app/build.gradle.kts 的回退逻辑使用 debug 签名。
+      # ---------------------------------------------------------------------
+      # 签名材料: 只在这一个条件成立时可达 —— v* tag push 且 dry_run != true。
+      # workflow_dispatch(默认 dry_run=true)与分支 push 都到不了这里: secrets 不会
+      # 被解析进环境, interstellar.jks / signing.properties 不会出现。
+      # 注意: 有没有签名材料不改变 release 怎么构建, 只决定它签不签名 ——
+      # 没有 signing.properties 的 release 变体是 UNSIGNED, 不是 debug 签名。
+      # ---------------------------------------------------------------------
       - name: Restore signing config
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true
         env:
           KEYSTORE_B64: ${{ secrets.INTERSTELLAR_KEYSTORE_B64 }}
           STORE_PASSWORD: ${{ secrets.INTERSTELLAR_STORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.INTERSTELLAR_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.INTERSTELLAR_KEY_PASSWORD }}
         run: |
+          set -euo pipefail
           if [ -z "$KEYSTORE_B64" ]; then
-            echo "::warning::签名 secrets 未配置, 本次 APK 使用 debug 签名"
-            # Recorded in build-info.json so nobody has to infer it later: a
-            # debug-signed artifact must never be presented as an unsigned RC.
-            echo "SIGNATURE_STATE=debug-signed" >> "$GITHUB_ENV"
-            exit 0
+            # main used to warn here and carry on, exporting SIGNATURE_STATE=debug-signed.
+            # That was wrong twice over: an assembleRelease with no signing.properties is
+            # UNSIGNED (app/build.gradle.kts only attaches a signingConfig when
+            # signing.properties carries storeFile), and it let an unsigned APK walk toward
+            # a release. Fail instead, and let the apksigner measurement below be the only
+            # thing that ever names the signature state.
+            echo "::error::v* tag push 要求正式签名, 但 INTERSTELLAR_KEYSTORE_B64 未配置。"
+            echo "::error::不签名就发布 release 会被下面的 apksigner 检查拦下 —— 这里提前失败, 不产生未签名的'正式包'。"
+            exit 1
           fi
           printf '%s' "$KEYSTORE_B64" | base64 -d > interstellar.jks
           {
@@ -228,7 +271,23 @@ jobs:
             echo "keyAlias=${KEY_ALIAS}"
             echo "keyPassword=${KEY_PASSWORD}"
           } > signing.properties
-          echo "SIGNATURE_STATE=signed-by-user" >> "$GITHUB_ENV"
+          # No SIGNATURE_STATE export: the state is measured from the built APKs by
+          # apksigner, never asserted by the step that installed the keystore.
+          echo "signing material restored for a tag-push release build"
+
+      # 反向断言: 非授权路径上不允许存在任何签名材料。它与上面的 if 互为补集,
+      # 所以"dry run 读不到生产签名材料"在 CI 日志里是可见的事实而不是承诺。
+      - name: Assert no signing material on the read-only path
+        if: ${{ !(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true) }}
+        run: |
+          set -euo pipefail
+          for f in interstellar.jks signing.properties keystore.properties; do
+            if [ -e "$f" ]; then
+              echo "::error::$f exists on a non-release path — signing material must never reach a dry run"
+              exit 1
+            fi
+          done
+          echo "no signing material present (interstellar.jks / signing.properties / keystore.properties all absent)"
 
       - name: Verify tag matches version.properties
         if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
@@ -256,21 +315,120 @@ jobs:
           chmod +x gradlew
           ./gradlew :app:assembleRelease :app:verifyCoreProvenance --no-daemon --console=plain
 
-      # satelite-one-<abi>-release.apk → satelite-one-<abi>-<tag>.apk
-      - name: Rename APKs with tag
+      # 签名状态是"测"出来的, 不是从注释推断的。apksigner 的原始输出随 artifact
+      # 一起上传(apksigner-verify.txt), 并写进 build-info.json。
+      - name: Measure APK signature state with apksigner
+        id: sig
+        env:
+          RELEASE_BUILD: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true }}
         run: |
           set -euo pipefail
-          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
-            SUFFIX="${GITHUB_REF_NAME}"
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          APKSIGNER="$(find "$SDK/build-tools" -maxdepth 2 -type f -name apksigner 2>/dev/null | sort -V | tail -n1 || true)"
+          if [ -z "$APKSIGNER" ]; then
+            echo "::error::apksigner not found under ${SDK}/build-tools"
+            exit 1
+          fi
+          echo "using ${APKSIGNER}"
+          cd app/build/outputs/apk/release
+          # no `mapfile`: bash 4+ only, and this step must run on any bash the
+          # runner or a local reproduction provides.
+          APKS=()
+          while IFS= read -r f; do APKS+=("$f"); done < <(find . -maxdepth 1 -type f -name '*.apk' | sort)
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "::error::no release APKs found to verify"
+            exit 1
+          fi
+          : > apksigner-verify.txt
+          SIGNED=0
+          UNSIGNED=0
+          for f in "${APKS[@]}"; do
+            {
+              echo "================================================================"
+              echo "### ${f}"
+            } >> apksigner-verify.txt
+            if "$APKSIGNER" verify --verbose --print-certs "$f" >> apksigner-verify.txt 2>&1; then
+              echo "${f}: SIGNED" | tee -a apksigner-verify.txt
+              SIGNED=$((SIGNED + 1))
+            else
+              echo "${f}: UNSIGNED (apksigner verify exited non-zero)" | tee -a apksigner-verify.txt
+              UNSIGNED=$((UNSIGNED + 1))
+            fi
+          done
+          cat apksigner-verify.txt
+          if [ "$SIGNED" -gt 0 ] && [ "$UNSIGNED" -gt 0 ]; then
+            echo "::error::mixed signature state (${SIGNED} signed, ${UNSIGNED} unsigned) — refusing to guess"
+            exit 1
+          fi
+          # Three states, all measured: the same vocabulary the rest of the project uses
+          # (unsigned / debug-signed / signed-by-user), but read off the APKs instead of
+          # declared by whichever step happened to run.
+          if [ "$UNSIGNED" -gt 0 ]; then
+            STATE=unsigned
+          elif grep -q 'CN=Android Debug' apksigner-verify.txt; then
+            STATE=debug-signed
           else
-            # dry run on a branch: don't label the artifact with the branch name
-            SUFFIX="dryrun"
+            STATE=signed-by-user
+          fi
+          # 真发布路径必须用用户自己的证书签过名; 否则拒绝继续。
+          if [ "${RELEASE_BUILD:-false}" = "true" ]; then
+            if [ "$STATE" = "unsigned" ]; then
+              echo "::error::a v* tag release must be signed, but apksigner reports the APKs as unsigned"
+              exit 1
+            fi
+            if [ "$STATE" = "debug-signed" ]; then
+              echo "::error::a v* tag release is signed with the Android debug keystore — refusing to continue"
+              exit 1
+            fi
+          else
+            # dry run 必须是未签名的 —— 签了名说明签名材料漏进了一条本该只读的路径。
+            if [ "$STATE" != "unsigned" ]; then
+              echo "::error::this run is a dry run but the APKs verify as ${STATE}"
+              echo "::error::signing material reached a path that must not have it — check the signing gate"
+              exit 1
+            fi
+          fi
+          echo "state=${STATE}" >> "$GITHUB_OUTPUT"
+          echo "measured signature state: ${STATE}"
+
+      # 文件名必须自己说清楚这是什么, 不能让未签名的 dry-run 产物看起来像可以直接
+      # 安装的正式包:
+      #   dry run  → satelite-one-<version>-<abi>-unsigned-dryrun.apk
+      #   正式发布 → satelite-one-<version>-<abi>-signed-<tag>.apk
+      - name: Rename APKs to unambiguous names
+        id: naming
+        env:
+          RELEASE_BUILD: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true }}
+          SIG_STATE: ${{ steps.sig.outputs.state }}
+        run: |
+          set -euo pipefail
+          VERSION="$(grep '^versionName=' version.properties | cut -d= -f2 | tr -d ' \r')"
+          if [ "${RELEASE_BUILD:-false}" = "true" ]; then
+            KIND="${GITHUB_REF_NAME}"
+          else
+            KIND="dryrun"
+          fi
+          if [ "$SIG_STATE" = "signed-by-user" ]; then
+            KIND="signed-${KIND}"
+          else
+            KIND="${SIG_STATE}-${KIND}"
           fi
           cd app/build/outputs/apk/release
+          shopt -s nullglob
           for f in satelite-one-*-release.apk; do
-            mv "$f" "${f%-release.apk}-${SUFFIX}.apk"
+            ABI="${f#satelite-one-}"
+            ABI="${ABI%-release.apk}"
+            mv "$f" "satelite-one-${VERSION}-${ABI}-${KIND}.apk"
           done
+          shopt -u nullglob
           ls -la
+          # KIND already carries the measured signature state (signed-… / unsigned-…),
+          # so it must not be repeated here.
+          ARTIFACT_NAME="satelite-one-${VERSION}-${KIND}-run${GITHUB_RUN_NUMBER}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "kind=${KIND}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
+          echo "artifact: ${ARTIFACT_NAME}"
 
       - name: Generate checksums
         run: |
@@ -284,14 +442,18 @@ jobs:
       - name: Write build-info.json
         env:
           CORE_SHA: ${{ steps.core.outputs.sha }}
+          SIG_STATE: ${{ steps.sig.outputs.state }}
         run: |
           set -euo pipefail
           VERSION_NAME="$(grep '^versionName=' version.properties | cut -d= -f2 | tr -d ' \r')"
           VERSION_CODE="$(grep '^versionCode=' version.properties | cut -d= -f2 | tr -d ' \r')"
-          APK_SHA="$(grep -F 'satelite-one-arm64-v8a-' SHA256SUMS.txt 2>/dev/null | awk '{print $1}' || true)"
-          if [ -z "$APK_SHA" ]; then
-            APK_SHA="$(cd app/build/outputs/apk/release && grep -F 'satelite-one-arm64-v8a-' SHA256SUMS.txt | awk '{print $1}')"
-          fi
+          cd app/build/outputs/apk/release
+          sha_for() { grep -F -m1 -- "-$1-" SHA256SUMS.txt | awk '{print $1}'; }
+          APK_ARM64_SHA="$(sha_for arm64-v8a)"
+          APK_X86_64_SHA="$(sha_for x86_64)"
+          AAR_SHA="$(sha256sum "${GITHUB_WORKSPACE}/app/libs/libbox.aar" | awk '{print $1}')"
+          AAR_SIZE="$(wc -c < "${GITHUB_WORKSPACE}/app/libs/libbox.aar" | tr -d ' ')"
+          cd "${GITHUB_WORKSPACE}"
           cat > build-info.json <<JSON
           {
             "app_repository": "${GITHUB_REPOSITORY}",
@@ -305,9 +467,12 @@ jobs:
             "core_ref": "pinned",
             "core_branch_hint": "${CORE_BRANCH}",
             "core_version_string": "${CORE_SHA}",
-            "core_aar_sha256": "$(sha256sum app/libs/libbox.aar | awk '{print $1}')",
-            "apk_arm64_v8a_sha256": "${APK_SHA}",
-            "signature_state": "${SIGNATURE_STATE:-unknown}",
+            "core_aar_sha256": "${AAR_SHA}",
+            "core_aar_size": ${AAR_SIZE},
+            "signature_state": "${SIG_STATE}",
+            "signature_state_measured_by": "apksigner verify --verbose --print-certs",
+            "apk_arm64_v8a_sha256": "${APK_ARM64_SHA}",
+            "apk_x86_64_sha256": "${APK_X86_64_SHA}",
             "build_time": "${BUILD_DATE}",
             "run_id": "${GITHUB_RUN_ID}"
           }
@@ -318,20 +483,93 @@ jobs:
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: satelite-one-release-${{ github.run_number }}
+          # 名字里带版本与实测签名状态: artifact 列表本身就能区分
+          # "未签名的 dry run" 和 "签过名的正式包"。
+          name: ${{ steps.naming.outputs.artifact_name }}
           path: |
             app/build/outputs/apk/release/*.apk
             app/build/outputs/apk/release/SHA256SUMS.txt
+            app/build/outputs/apk/release/apksigner-verify.txt
             build-info.json
           if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 发布是独立 job, 也是唯一持有写权限的地方。两道门:
+  #   1) job-level if: 只可能在 v* tag push 且 dry_run != true 时运行;
+  #   2) 发布前用 apksigner 复测签名, 未签名或 debug keystore 签名就拒绝发布。
+  # 分支 push 与 workflow_dispatch 永远到不了这里 —— 分支 push 不会自动发布。
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish GitHub release (tag push, explicitly authorized)
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # full history + tags: the release-notes step diffs against the previous tag
+          fetch-depth: 0
+
+      - name: Download APK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: .
+
+      # 发布前的最后一道工具化检查: 这一步失败就没有 Release。
+      - name: Verify the APKs are signed before publishing
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          APKSIGNER="$(find "$SDK/build-tools" -maxdepth 2 -type f -name apksigner 2>/dev/null | sort -V | tail -n1 || true)"
+          if [ -z "$APKSIGNER" ]; then
+            echo "::error::apksigner not found; refusing to publish unverified APKs"
+            exit 1
+          fi
+          shopt -s nullglob
+          APKS=(app/build/outputs/apk/release/*.apk)
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "::error::no APKs in the downloaded artifact"
+            exit 1
+          fi
+          for f in "${APKS[@]}"; do
+            if ! OUT="$("$APKSIGNER" verify --verbose --print-certs "$f")"; then
+              echo "$OUT"
+              echo "::error::${f} does not verify — refusing to publish an unsigned APK"
+              exit 1
+            fi
+            echo "$OUT"
+            if grep -q 'CN=Android Debug' <<<"$OUT"; then
+              echo "::error::${f} is signed with the Android debug keystore — refusing to publish"
+              exit 1
+            fi
+          done
+          echo "all ${#APKS[@]} APKs verify as signed with a non-debug certificate"
 
       # 更新摘要 = "版本提交"(范围内最后改 version.properties 的那个)的完整
       # message(标题+正文), 再附自上一 tag 以来的其余提交。按 version.properties
       # 定位而不是 tag 落点 —— tag 可能落在版本提交之后的杂项提交上(如 v0.5.3)。
+      # 内核/构建元数据取自 artifact 里的 build-info.json, 因为构建 job 的环境变量
+      # 不会跨 job 传递。
       - name: Generate release notes
-        if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
         run: |
           set -euo pipefail
+          python3 - <<'PY' > core_meta.txt
+          import json
+          d = json.load(open("build-info.json"))
+          for key in ("core_repository", "core_branch_hint", "core_commit", "build_time", "signature_state"):
+              print(d[key])
+          PY
+          META=()
+          while IFS= read -r line; do META+=("$line"); done < core_meta.txt
+          CORE_REPO_OUT="${META[0]}"
+          CORE_BRANCH_OUT="${META[1]}"
+          CORE_COMMIT_OUT="${META[2]}"
+          BUILD_DATE_OUT="${META[3]}"
+          SIGNATURE_STATE_OUT="${META[4]}"
           TAG="${GITHUB_REF_NAME}"
           PREV_TAG=$(git tag --list 'v*' --sort=-v:refname | grep -vx "$TAG" | head -n1 || true)
           RANGE="${PREV_TAG:+${PREV_TAG}..}${TAG}"
@@ -341,9 +579,11 @@ jobs:
           {
             echo "## 内核"
             echo
-            echo "- ${CORE_REPO} @ ${CORE_BRANCH}"
-            echo "- commit: \`${CORE_COMMIT:-unknown}\`"
-            echo "- build: ${BUILD_DATE:-unknown}"
+            echo "- ${CORE_REPO_OUT} @ ${CORE_BRANCH_OUT}"
+            echo "- commit: \`${CORE_COMMIT_OUT}\`"
+            echo "- build: ${BUILD_DATE_OUT}"
+            echo "- APK 签名: \`${SIGNATURE_STATE_OUT}\`(apksigner 实测, 见 apksigner-verify.txt)"
+            echo "- app commit: \`${APP_COMMIT_FULL:-unknown}\`"
             echo
             echo "## 更新摘要"
             echo
@@ -360,12 +600,12 @@ jobs:
           cat release_notes.md
 
       - name: Publish GitHub release
-        if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
         uses: softprops/action-gh-release@v2
         with:
           files: |
             app/build/outputs/apk/release/*.apk
             app/build/outputs/apk/release/SHA256SUMS.txt
+            app/build/outputs/apk/release/apksigner-verify.txt
             build-info.json
           body_path: release_notes.md
           fail_on_unmatched_files: true

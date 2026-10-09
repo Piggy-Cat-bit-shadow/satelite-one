@@ -12,8 +12,13 @@ plugins {
     id("org.jetbrains.kotlin.plugin.serialization")
 }
 
-// signing.properties (gitignored) — release builds fall back to debug signing
-// when absent so the project still builds on fresh checkouts.
+// signing.properties (gitignored) is the only switch, and it decides *whether* a
+// variant is signed — never *what kind* of artifact it is. When it is absent the
+// release variant is UNSIGNED (it gets no signingConfig at all, so `assembleRelease`
+// emits an uninstallable APK); there is no "fall back to debug signing" for release.
+// Debug signing belongs to the debug variant alone, and only while
+// signing.properties is absent — if it exists, `debug` uses the release keystore too.
+// Measure the result instead of assuming: apksigner verify --print-certs <apk>.
 val signingProps = Properties().apply {
     val f = rootProject.file("signing.properties")
     if (f.exists()) f.inputStream().use { load(it) }

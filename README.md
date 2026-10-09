@@ -161,8 +161,34 @@ BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
 
 ### 3. 签名
 
-签名材料**不入库**。`signing.properties`（已 gitignore）存在时 release 使用正式签名，
-否则回退到 debug 签名。CI 通过以下 secrets 注入：
+签名材料**不入库**。`signing.properties`（已 gitignore）是唯一的开关，而它只影响
+"签不签名"，不影响产物类型。三种情况的真实行为（与 `app/build.gradle.kts` 一致）：
+
+| 命令 | 仓库根有 `signing.properties` | 产物 |
+|---|---|---|
+| `./gradlew :app:assembleRelease` | 否 | **UNSIGNED**（未签名，装不上）。`release` 变体只有在 `signing.properties` 含 `storeFile` 时才挂 `signingConfig`；没有它就没有签名步骤 —— **不存在"回退到 debug 签名"这回事**，`release` 变体从不挂 debug 签名 |
+| `./gradlew :app:assembleRelease` | 是 | 用 `signing.properties` 指定的 keystore 正式签名 |
+| `./gradlew :app:assembleDebug` | 否 | 由 AGP 默认 debug keystore 签名（applicationId 带 `.debug` 后缀） |
+| `./gradlew :app:assembleDebug` | 是 | 同样改用正式签名（`debug { }` 分支也读 `signing.properties`），applicationId 仍带 `.debug` 后缀 |
+
+也就是说：**默认的 `assembleRelease` 产物是未签名的**。要判断手里这个包到底是什么状态，
+不要看注释或文件名，用工具实测：
+
+```bash
+$HOME/Library/Android/sdk/build-tools/36.0.0/apksigner verify --verbose --print-certs <apk>
+```
+
+CI 用同样的方式实测，并把结果写进产物文件名（`...-unsigned-dryrun.apk` /
+`...-signed-<tag>.apk`）、`apksigner-verify.txt` 和 `build-info.json` 的
+`signature_state` 字段。`signature_state` 的值就是实测结果本身，没有第二个来源：
+
+| `signature_state` | 含义 | 什么产物会测出这个值 |
+|---|---|---|
+| `unsigned` | apksigner 报 `DOES NOT VERIFY` | 默认的 `assembleRelease`（没有 `signing.properties`） |
+| `debug-signed` | 签了名，签名者 DN 含 `CN=Android Debug` | 只有 debug 变体 |
+| `signed-by-user` | 签了名，且签名者不是 debug key | 仓库根有 `signing.properties` 的构建 |
+
+CI 通过以下 secrets 注入正式签名材料（只在 `v*` tag push 且 `dry_run != true` 时读取）：
 
 ```
 INTERSTELLAR_KEYSTORE_B64     base64(interstellar.jks)
@@ -174,9 +200,17 @@ INTERSTELLAR_KEY_PASSWORD
 ## CI
 
 - **Android CI**（`.github/workflows/android-ci.yml`）：checkout app → checkout 自定义内核并构建
-  `libbox.aar`（按内核 commit 缓存）→ 单元测试 → `assembleDebug` → 上传 APK
-- **Release APK**（`.github/workflows/release-apk.yml`）：推送 `v*` tag 时构建
-  `libbox.aar` → `assembleRelease` → SHA256 校验和 → 发布 GitHub Release
+  `libbox.aar`（按内核 commit 缓存）→ 单元测试 → `assembleDebug` → 上传 APK。权限只有
+  `contents: read`。
+- **Release APK**（`.github/workflows/release-apk.yml`）：构建 `libbox.aar` → `assembleRelease`
+  → SHA256 校验和 → 上传 artifact。默认权限只有 `contents: read`：
+  - `workflow_dispatch` 的 `dry_run` 默认 `true`：**不读签名 secret、不恢复 JKS、不建 Release**，
+    artifact 名字明确写着 `unsigned-dryrun`。
+  - 分支 push 不会触发本 workflow（只监听 `v*` tag），因此**分支 push 不会自动发布**。
+  - 只有推送 `v*` tag（或显式 `dry_run=false` 的 tag 运行）才会进入独立的 `publish` job，
+    那是唯一持有 `contents: write` 的地方，且在发布前用 `apksigner` 复测签名 —— 未签名或
+    用 debug keystore 签名就拒绝发布。
+  - 自动发布与否完全由"有没有推 `v*` tag"决定；不打 tag 就没有 Release。
 
 ## 技术要点
 
