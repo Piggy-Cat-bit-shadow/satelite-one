@@ -65,11 +65,14 @@ interface PlatformInterfaceWrapper : PlatformInterface {
     }
 
     override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {
-        DefaultNetworkMonitor.setListener(listener)
+        // Register this core's own listener. A teardown of another core can only remove
+        // the object it was handed, so a handover between cores (headless ProxyService
+        // <-> VPNService) can no longer leave the live core unsubscribed.
+        DefaultNetworkMonitor.addListener(listener)
     }
 
     override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {
-        DefaultNetworkMonitor.setListener(null)
+        DefaultNetworkMonitor.removeListener(listener)
     }
 
     override fun getInterfaces(): NetworkInterfaceIterator {
