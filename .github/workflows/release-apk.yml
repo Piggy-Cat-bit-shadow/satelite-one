@@ -240,10 +240,15 @@ jobs:
             exit 1
           fi
 
-      - name: Build release APK
+      # verifyCoreProvenance is the Gradle twin of the Python gate above. The Python
+      # one checks the artifact before anything is built; this one re-checks the AAR
+      # that AGP actually packaged, against the same pinned coreCommit. Running only
+      # one of them would leave a gap between "the file on disk is right" and "the
+      # APK contains it".
+      - name: Build release APK and verify the packaged core identity
         run: |
           chmod +x gradlew
-          ./gradlew :app:assembleRelease --no-daemon --console=plain
+          ./gradlew :app:assembleRelease :app:verifyCoreProvenance --no-daemon --console=plain
 
       # satelite-one-<abi>-release.apk → satelite-one-<abi>-<tag>.apk
       - name: Rename APKs with tag

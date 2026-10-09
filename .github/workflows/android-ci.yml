@@ -140,8 +140,8 @@ jobs:
       - name: Unit tests
         run: ./gradlew :app:testDebugUnitTest --no-daemon --console=plain
 
-      - name: Assemble debug APK
-        run: ./gradlew :app:assembleDebug --no-daemon --console=plain
+      - name: Assemble debug APK and verify the packaged core identity
+        run: ./gradlew :app:assembleDebug :app:verifyCoreProvenance --no-daemon --console=plain
 
       - name: Record artifact checksums
         run: |
