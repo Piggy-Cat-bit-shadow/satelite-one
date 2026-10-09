@@ -36,6 +36,7 @@ import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 
@@ -80,6 +81,15 @@ class BoxService(private val service: Service, private val platformInterface: Pl
     private val notification = ServiceNotification(status, service)
     private var core: ProxyCore? = null
 
+    /**
+     * The fact bridge belonging to [core]. Held so teardown can unbind *its own*
+     * session: a stale instance finishing late must not detach a newer core.
+     */
+    private var factSession: PlatformFacts.Session? = null
+
+    /** Serializes [releaseCore] between a normal stop and a failed-start teardown. */
+    private val releaseMutex = kotlinx.coroutines.sync.Mutex()
+
     private var receiverRegistered = false
 
     /**
@@ -117,7 +127,44 @@ class BoxService(private val service: Service, private val platformInterface: Pl
         // Bind the Android fact bridge. attach() also reports the current screen and
         // foreground state immediately, so a core started while the screen is off or
         // the app is already backgrounded is not left guessing until the next event.
-        PlatformFacts.attach(started)
+        factSession = PlatformFacts.attach(started)
+    }
+
+    /**
+     * The one place that releases the core and everything bound to it.
+     *
+     * Idempotent by state (a second caller finds no core, no fd and no session) and
+     * serialized by [releaseMutex], so a normal stop racing a failed start cannot
+     * close the same fd twice or shut the same core twice.
+     *
+     * Every path that can destroy the core funnels through here precisely so the
+     * ORDER cannot drift between them:
+     *
+     *  1. unbind the fact bridge and **wait for in-flight deliveries to drain**, so
+     *     the `PlatformEvents.close()` inside [ProxyCore.shutdown] can never race a
+     *     native call on the same object
+     *  2. release the tun fd
+     *  3. stop the network monitor
+     *  4. shut the core down and drop it
+     *
+     * Step 1 before step 4 is the whole point: `stopAndAlert` used to skip it, which
+     * is how a failed start could close the bridge with facts still queued.
+     */
+    private suspend fun releaseCore() = releaseMutex.withLock {
+        val session = factSession
+        factSession = null
+        runCatching { PlatformFacts.detachAndDrain(session) }
+            .onFailure { android.util.Log.w("InterstellarUI", "fact bridge drain failed", it) }
+
+        val pfd = fileDescriptor
+        if (pfd != null) {
+            runCatching { pfd.close() }
+            fileDescriptor = null
+        }
+        DefaultNetworkMonitor.stop()
+        val running = core
+        core = null
+        running?.shutdown()
     }
 
     private suspend fun startService() {
@@ -246,18 +293,10 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             receiverRegistered = false
         }
         notification.close()
-        // Facts stop flowing to the core before its teardown starts; the Android
-        // sources themselves are process-scoped and stay installed.
-        PlatformFacts.detach()
         GlobalScope.launch(Dispatchers.IO) {
-            val pfd = fileDescriptor
-            if (pfd != null) {
-                pfd.close()
-                fileDescriptor = null
-            }
-            DefaultNetworkMonitor.stop()
-            core?.shutdown()
-            core = null
+            // Facts stop flowing to the core before its teardown starts; the Android
+            // sources themselves are process-scoped and stay installed.
+            releaseCore()
             withContext(Dispatchers.Main) {
                 status.value = Status.Stopped
                 if (pendingRestart) {
@@ -273,14 +312,9 @@ class BoxService(private val service: Service, private val platformInterface: Pl
     private suspend fun stopAndAlert(type: Alert, message: String? = null) {
         android.util.Log.e("InterstellarUI", "service stopped: $type msg=$message", Throwable("trace"))
         com.interstellar.proxy.core.AppLog.log("service", "已停止: $type${message?.let { " · $it" } ?: ""}")
-        val pfd = fileDescriptor
-        if (pfd != null) {
-            pfd.close()
-            fileDescriptor = null
-        }
-        DefaultNetworkMonitor.stop()
-        core?.shutdown()
-        core = null
+        // Same shared release as the normal stop — this path used to reach
+        // core.shutdown() without unbinding the fact bridge at all.
+        releaseCore()
         withContext(Dispatchers.Main) {
             if (receiverRegistered) {
                 service.unregisterReceiver(receiver)
@@ -335,7 +369,17 @@ class BoxService(private val service: Service, private val platformInterface: Pl
                 stopAndAlert(Alert.StartCommandServer, e.message)
                 return@launch
             }
-            if (status.value != Status.Starting) return@launch
+            // A stop that landed while startCore() was in flight must win. The check
+            // below is not enough on its own: startCore() has already assigned `core`
+            // and attached the fact bridge by now, so simply returning here would
+            // leave a running core, an attached bridge, a log stream and a command
+            // socket behind a service that was already told to stop. releaseCore() is
+            // idempotent and mutex-serialized, so it also covers the ordering where
+            // the stop path's own release ran before this assignment.
+            if (status.value != Status.Starting) {
+                releaseCore()
+                return@launch
+            }
             startService()
         }
         return Service.START_NOT_STICKY
