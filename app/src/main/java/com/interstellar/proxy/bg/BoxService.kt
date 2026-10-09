@@ -379,6 +379,11 @@ class BoxService(private val service: Service, private val platformInterface: Pl
     private fun stopService() {
         val current = status.value
         if (current == Status.Stopped || current == Status.Stopping) return
+        // Stamp this stop with the start generation it belongs to, BEFORE anything
+        // can be released. `releaseCore()` bumps the lifecycle's generation, so a
+        // watermark taken afterwards could never tell "my own release" apart from
+        // "a newer start took the service".
+        val stopWatermark = lifecycle.currentStartAttempt()
         status.value = Status.Stopping
         notifyStopped()
         if (receiverRegistered) {
@@ -391,6 +396,18 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             // sources themselves are process-scoped and stay installed.
             releaseCore()
             withContext(Dispatchers.Main) {
+                // A start intent that arrived while this stop was tearing down may
+                // already have moved the service on. Converging to Stopped here would
+                // overwrite the new generation's status, and `stopSelf()` would tear
+                // the foreground service down under a core that is already live and
+                // whose notification this stop has just closed.
+                if (lifecycle.startsSince(stopWatermark)) {
+                    android.util.Log.i(
+                        "InterstellarUI",
+                        "stop superseded by a newer start; not converging to Stopped",
+                    )
+                    return@withContext
+                }
                 status.value = Status.Stopped
                 if (pendingRestart) {
                     pendingRestart = false
@@ -405,6 +422,15 @@ class BoxService(private val service: Service, private val platformInterface: Pl
     private suspend fun stopAndAlert(type: Alert, message: String? = null) {
         android.util.Log.e("InterstellarUI", "service stopped: $type msg=$message", Throwable("trace"))
         com.interstellar.proxy.core.AppLog.log("service", "已停止: $type${message?.let { " · $it" } ?: ""}")
+        // Same watermark rule as stopService(): taken before the release, because the
+        // release itself bumps the lifecycle generation.
+        //
+        // This path needs it more than the normal stop does: `stopAndAlert` is also
+        // reachable from `serviceReload0()` while `status` is already `Stopped` (a
+        // one-shot reload command client does not consult the Service's status), and
+        // with `status == Stopped` nothing stops `onStartCommand` from taking a fresh
+        // attempt during the release. See StopConvergenceTest for the interleaving.
+        val stopWatermark = lifecycle.currentStartAttempt()
         // Same shared release as the normal stop — this path used to reach
         // core.shutdown() without unbinding the fact bridge at all.
         releaseCore()
@@ -420,6 +446,18 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             notification.close()
             binder.broadcast { callback ->
                 callback.onServiceAlert(type.ordinal, message)
+            }
+            // The alert itself is still reported — the user must learn that the core
+            // failed. What is withheld is only the claim of ownership: a newer
+            // generation may have started during the release, and writing Stopped over
+            // it (plus stopSelf()) would kill a healthy service and leave its core
+            // running with a closed notification.
+            if (lifecycle.startsSince(stopWatermark)) {
+                android.util.Log.i(
+                    "InterstellarUI",
+                    "alert raised by a superseded generation; reporting it without converging",
+                )
+                return@withContext
             }
             status.value = Status.Stopped
             notifyStopped()
@@ -610,7 +648,26 @@ internal sealed interface CoreStartResult {
 internal class CoreLifecycle {
 
     private val lock = Any()
+
+    /**
+     * Bumped by every ownership move: a new start attempt ([beginStart]), a release
+     * ([invalidate]) or a destroy ([close]). Its only job is to make an *older*
+     * attempt stale for [publish], which is why a release has to bump it too.
+     */
     private var generation = 0L
+
+    /**
+     * The id of the newest start attempt, and the watermark a stop is stamped with.
+     *
+     * Separate from [generation] on purpose, and the separation is what closes the
+     * stale-stop hole. [generation] moves on every ownership change — including a
+     * release — because [publish] needs exactly that. A stop path, by contrast, must
+     * be able to tell "my own release" apart from "a newer start took the service":
+     * stamped with [currentStartAttempt] and asked through [startsSince], only
+     * [beginStart] can answer it, and this counter is moved by nothing else.
+     */
+    private var startAttempts = 0L
+
     private var published: Long? = null
     private var closed = false
 
@@ -624,6 +681,12 @@ internal class CoreLifecycle {
     fun beginStart(): Long? = synchronized(lock) {
         if (closed) return null
         ++generation
+        // The stop watermark moves only here: a *new start* is the one event that may
+        // suppress a stop's convergence, and a release must never look like one.
+        ++startAttempts
+        // The attempt id stays the generation: `publish`/`isCurrent` compare against
+        // the value that a release also moves.
+        generation
     }
 
     /** Invalidate in-flight attempts without closing: a normal stop may still restart. */
@@ -633,6 +696,26 @@ internal class CoreLifecycle {
         // true here. Leaving it set made isPublished claim a live core after the core had
         // already been shut down - an assertion that tests then trusted.
         published = null
+    }
+
+    /**
+     * The watermark a stop path stamps itself with before it starts releasing.
+     *
+     * Exposed as a plain counter read so a finalizer can be written as
+     * `startsSince(watermark)` instead of "check, then act" — the two-step shape is
+     * exactly what let a stale stop overwrite a successor.
+     */
+    fun currentStartAttempt(): Long = synchronized(lock) { startAttempts }
+
+    /**
+     * True when a **new start attempt** has been taken since [watermark].
+     *
+     * Deliberately not `generation`: a release moves that on, so comparing against it
+     * would make every stop look superseded by itself. Only [beginStart] moves this,
+     * which is what makes the answer mean "someone newer owns the service now".
+     */
+    fun startsSince(watermark: Long): Boolean = synchronized(lock) {
+        closed || startAttempts != watermark
     }
 
     /**
@@ -671,12 +754,11 @@ internal class CoreLifecycle {
      * a core without its bridge (or the reverse).
      */
     fun publish(attempt: Long, block: () -> Unit): Boolean = synchronized(lock) {
-        // Only the generation is consulted here, and that is sufficient by
-        // construction: [close] bumps the generation, so every attempt taken before a
-        // destroy is stale by the time it tries to publish, and [beginStart] refuses to
-        // issue an attempt after one. A `closed` test here would be unreachable code
-        // pretending to be the protection - the generation bump is the protection, and
-        // the test suite injects its removal to prove that.
+        // Only [generation] is consulted here, and that is sufficient by construction:
+        // it moves on every ownership change - a release, a newer start and a destroy -
+        // so any attempt older than the newest one is refused, and [beginStart] refuses
+        // to issue an attempt at all after a destroy. A `closed` test here would be
+        // unreachable code pretending to be the protection.
         if (attempt != generation) return false
         block()
         published = attempt
