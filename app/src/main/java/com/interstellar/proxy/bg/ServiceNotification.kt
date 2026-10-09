@@ -47,31 +47,34 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
     }
 
     /**
-     * Owns the notification's status client. Cancelled in [close] so a connect
-     * coroutine started here cannot outlive the notification object.
+     * One generation's status client and the scope that owns its connect coroutine.
      *
-     * Cancelling this scope does NOT lose the native teardown: CommandClient's
-     * own disconnect runs on its independent cleanup scope precisely because the
-     * caller's scope may already be gone.
+     * The scope is cancelled by [close] and is **never revived**: a cancelled
+     * CoroutineScope cannot be restarted, so reusing the same instance after a close
+     * would leave `connect()` launching into a dead scope and the dynamic traffic
+     * notification silently dead. A new generation therefore always gets a new pair.
      */
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private class Session(val scope: CoroutineScope, val client: CommandClient)
 
-    private val commandClient =
-        CommandClient(scope, CommandClient.ConnectionType.Status, this, localOnly = true)
     private var receiverRegistered = false
 
     /** Serializes [registerReceiver] against [unregisterReceiverIfNeeded]. */
     private val receiverLock = Any()
 
+    /** Guards session creation/teardown. Never nested inside [receiverLock]. */
+    private val lifecycleLock = Any()
+
     /**
-     * Set by close(): the service notification is gone. A late traffic
-     * callback (a race with core shutdown — the traffic job is cancelled
-     * only after close) must not re-post it via NotificationManager.notify —
-     * that re-posted notification is no longer bound to the foreground
-     * service and survives stopSelf() as a stale "still connected" one.
+     * The publish/terminate order for this notification, extracted so it is provable in
+     * a plain JVM test (see NotificationPublishGateTest).
      */
+    private val gate = NotificationPublishGate()
+
+    /** Current generation token; every publish and the receiver path consult the gate. */
     @Volatile
-    private var released = false
+    private var generation = 0
+
+    private var session: Session? = null
 
     private val notificationBuilder by lazy {
         NotificationCompat.Builder(service, notificationChannel).setShowWhen(false).setOngoing(true)
@@ -111,10 +114,15 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
     private var showingTraffic = false
 
     fun show(profileName: String, @StringRes contentTextId: Int) {
-        released = false
+        synchronized(lifecycleLock) {
+            generation = gate.open()
+            // A restart (pendingRestart Stop→Start) reuses this instance after close()
+            // cancelled the previous scope, so a fresh session is mandatory here.
+            if (session == null) session = newSession()
+            showingTraffic = false
+        }
         staticTitle = profileName.takeIf { it.isNotBlank() } ?: service.getString(R.string.app_name)
         staticText = service.getString(contentTextId)
-        showingTraffic = false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             // re-creating with the same id updates the stored channel name on
             // language switches
@@ -150,9 +158,28 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
         )
     }
 
+    /** The live generation's client. Must be called before [close] invalidates it. */
+    private fun currentClient(): CommandClient? = synchronized(lifecycleLock) {
+        if (!gate.isOpen(generation)) return null
+        session?.client ?: newSession().let { created ->
+            // Store the Session (scope + client), not the client alone: the scope is what
+            // close() must cancel, and keeping only the client would leak the scope.
+            session = created
+            created.client
+        }
+    }
+
+    private fun newSession(): Session {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        return Session(
+            scope,
+            CommandClient(scope, CommandClient.ConnectionType.Status, this, localOnly = true),
+        )
+    }
+
     suspend fun start() {
         if (Settings.dynamicNotification && checkPermission()) {
-            commandClient.connect()
+            currentClient()?.connect() ?: return
             withContext(Dispatchers.Main) {
                 registerReceiver()
             }
@@ -163,15 +190,17 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
      * Registration and unregistration share one lock.
      *
      * `start()` hops to the main thread to register while `close()` may already be
-     * running; checking `released` alone is not enough, because the check and the
+     * running; checking the generation alone is not enough, because the check and the
      * `registerReceiver` call are two separate steps and a `close()` landing between
      * them would leave a receiver installed that nothing ever unregisters — it would
      * then keep waking this object on every screen change for the life of the
      * process. Holding the lock across check-and-register (and across
-     * check-and-unregister, with `released` set first) makes either order safe.
+     * check-and-unregister, with the generation closed first) makes either order safe.
      */
     private fun registerReceiver() = synchronized(receiverLock) {
-        if (released || receiverRegistered) return
+        // A closed generation must never install a receiver: nothing would ever
+        // unregister it, so it would keep waking this object for the process lifetime.
+        if (!gate.isOpen(generation) || receiverRegistered) return
         service.registerReceiver(
             this,
             IntentFilter().apply {
@@ -205,48 +234,125 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
      * Falls back to the static line exactly once per transition.
      */
     private fun restoreStaticContent() {
-        if (!showingTraffic) return
-        showingTraffic = false
-        if (released || !Settings.dynamicNotification || !checkPermission()) return
+        if (!Settings.dynamicNotification || !checkPermission()) return
         val title = staticTitle ?: return
         val text = staticText ?: return
-        InterstellarApplication.notificationManager.notify(
-            notificationId,
-            notificationBuilder.setContentTitle(title).setContentText(text).build(),
-        )
+        gate.publish(generation) {
+            if (!showingTraffic) return@publish
+            showingTraffic = false
+            InterstellarApplication.notificationManager.notify(
+                notificationId,
+                notificationBuilder.setContentTitle(title).setContentText(text).build(),
+            )
+        }
     }
 
     /** Engine-agnostic traffic line. */
     fun updateTraffic(upPerSecond: Long, downPerSecond: Long) {
-        if (released || !Settings.dynamicNotification || !checkPermission()) return
-        showingTraffic = true
+        if (!Settings.dynamicNotification || !checkPermission()) return
         val content =
             Libbox.formatBytes(upPerSecond) + "/s ↑\t" + Libbox.formatBytes(downPerSecond) + "/s ↓"
-        InterstellarApplication.notificationManager.notify(
-            notificationId,
-            notificationBuilder.setContentText(content).build(),
-        )
+        // The gate makes the check and the post one indivisible step: close() flips the
+        // generation inside the same lock, so this either posts entirely before close
+        // (and close's own cancel removes it) or does nothing at all. That is what
+        // removes the old window in which close could cancel between the check and the
+        // post, leaving a notification that outlived the foreground service.
+        gate.publish(generation) {
+            showingTraffic = true
+            InterstellarApplication.notificationManager.notify(
+                notificationId,
+                notificationBuilder.setContentText(content).build(),
+            )
+        }
     }
 
     override fun onReceive(context: Context, intent: Intent) {
+        // Bound to the live generation: after close() there is no client to drive, and
+        // a late broadcast must not resurrect one on a cancelled scope.
+        val client = synchronized(lifecycleLock) {
+            if (gate.isOpen(generation)) session?.client else null
+        } ?: return
         when (intent.action) {
-            Intent.ACTION_SCREEN_ON -> commandClient.connect()
+            Intent.ACTION_SCREEN_ON -> client.connect()
 
-            Intent.ACTION_SCREEN_OFF -> commandClient.disconnect()
+            Intent.ACTION_SCREEN_OFF -> client.disconnect()
         }
     }
 
     fun close() {
-        released = true
-        commandClient.disconnect()
+        // Closing the generation first is what makes "no publish after close" true:
+        // every publish consults this same gate.
+        gate.close()
+        val closing = synchronized(lifecycleLock) {
+            val current = session
+            // Drop the session before releasing the lock: `currentClient()` can no longer
+            // hand this dead session out, and a later show() builds a new one.
+            session = null
+            current
+        }
+        // Past this point no publish can slip through: every publish consults the gate
+        // closed above.
+        closing?.let { runCatching { it.client.disconnect() } }
         ServiceCompat.stopForeground(service, ServiceCompat.STOP_FOREGROUND_REMOVE)
-        // a traffic update may have slipped in just before stopForeground ran;
-        // cancel it explicitly — it would not be removed by service death
+        // A publish may have completed just before the generation closed; cancel
+        // explicitly so nothing from this generation survives service death.
         InterstellarApplication.notificationManager.cancel(notificationId)
         unregisterReceiverIfNeeded()
-        // After the teardown above, never before it. CommandClient.disconnect() runs
-        // its native teardown on an independent cleanup scope, so cancelling this one
-        // cannot leave the disconnect half-done.
-        scope.cancel()
+        // Last, and never before the teardown above: CommandClient.disconnect() runs
+        // its native cleanup on an independent scope, so cancelling this one cannot
+        // leave the disconnect half-done.
+        closing?.scope?.cancel()
+    }
+}
+
+/**
+ * Generation gate for the service notification's publish/terminate order.
+ *
+ * Pure — no Android, no NotificationManager — so the ordering the previous
+ * "check `@Volatile released`, then `notify`" could not prove is directly testable:
+ *
+ *  - [publish] runs its block only while the *specific* generation it was given is
+ *    still open, and it holds the lock for the whole check-and-post;
+ *  - [close] flips that state inside the same lock.
+ *
+ * So a publish either completes entirely before close (and the caller's
+ * `NotificationManager.cancel` then removes what it posted), or it observes a closed
+ * generation and posts nothing. No interleaving leaves a stale notification behind
+ * after close returns — the window the old two-step check had.
+ */
+internal class NotificationPublishGate {
+
+    private val lock = Any()
+    private var generation = 0
+    private var open = false
+
+    /** Begin a generation and return its token. */
+    fun open(): Int = synchronized(lock) {
+        open = true
+        ++generation
+        generation
+    }
+
+    /** True while [candidate] is the open generation. */
+    fun isOpen(candidate: Int): Boolean = synchronized(lock) { open && candidate == generation }
+
+    /**
+     * Run [block] only if [candidate] is still the open generation.
+     *
+     * @return true when the block ran.
+     */
+    fun publish(candidate: Int, block: () -> Unit): Boolean = synchronized(lock) {
+        if (!open || candidate != generation) return false
+        block()
+        true
+    }
+
+    /** Close the current generation. Returns its token, or null when already closed. */
+    fun close(): Int? = synchronized(lock) {
+        if (!open) return null
+        open = false
+        val closed = generation
+        ++generation
+        closed
     }
 }
