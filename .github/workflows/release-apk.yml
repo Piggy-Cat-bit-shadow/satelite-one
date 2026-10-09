@@ -215,6 +215,14 @@ jobs:
       - name: Provenance gate negative tests
         run: python3 .github/scripts/test_check_core_provenance.py
 
+      # 同一个理由, 针对签名与发布门禁: publish job 只在 v* tag 才跑, 所以
+      #   * APK 从哪来(download-artifact 落到工作目录)与校验步骤去哪找是否一致,
+      #   * 空列表是否必然失败,
+      #   * unsigned / debug-signed / signed-by-user 的判定表是否 fail-closed,
+      # 这三件事必须在这里被证明 —— 否则它们只会在真要发版的那一次才第一次执行。
+      - name: Release publish gate checks
+        run: python3 .github/scripts/test_release_publish_gate.py
+
       # The core's own provenance record is the single source of truth; it also
       # has to survive a cache hit, where no checkout exists.
       - name: Validate core provenance
@@ -317,79 +325,22 @@ jobs:
 
       # 签名状态是"测"出来的, 不是从注释推断的。apksigner 的原始输出随 artifact
       # 一起上传(apksigner-verify.txt), 并写进 build-info.json。
+      #
+      # 测量本身搬进了 .github/scripts/measure_apk_signature.sh, 原因不是好看:
+      #   * 它由 test_release_publish_gate.py 逐条读回来验证 —— 判定表(case 分支的
+      #     顺序与 fail-closed)和"空列表必然失败"都是被断言的对象, 而不是注释里的承诺;
+      #   * publish job 现在调用同一个脚本, 所以"构建时怎么判"与"发布前怎么判"
+      #     不可能再各自漂移 —— 之前那两份拷贝里的路径就是不一致的。
       - name: Measure APK signature state with apksigner
         id: sig
         env:
-          RELEASE_BUILD: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true }}
+          # dry run 必须实测 unsigned; v* tag 正式路径必须实测 signed-by-user。
+          EXPECT_SIGNATURE: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true) && 'signed' || 'unsigned' }}
         run: |
           set -euo pipefail
-          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-          APKSIGNER="$(find "$SDK/build-tools" -maxdepth 2 -type f -name apksigner 2>/dev/null | sort -V | tail -n1 || true)"
-          if [ -z "$APKSIGNER" ]; then
-            echo "::error::apksigner not found under ${SDK}/build-tools"
-            exit 1
-          fi
-          echo "using ${APKSIGNER}"
-          cd app/build/outputs/apk/release
-          # no `mapfile`: bash 4+ only, and this step must run on any bash the
-          # runner or a local reproduction provides.
-          APKS=()
-          while IFS= read -r f; do APKS+=("$f"); done < <(find . -maxdepth 1 -type f -name '*.apk' | sort)
-          if [ "${#APKS[@]}" -eq 0 ]; then
-            echo "::error::no release APKs found to verify"
-            exit 1
-          fi
-          : > apksigner-verify.txt
-          SIGNED=0
-          UNSIGNED=0
-          for f in "${APKS[@]}"; do
-            {
-              echo "================================================================"
-              echo "### ${f}"
-            } >> apksigner-verify.txt
-            if "$APKSIGNER" verify --verbose --print-certs "$f" >> apksigner-verify.txt 2>&1; then
-              echo "${f}: SIGNED" | tee -a apksigner-verify.txt
-              SIGNED=$((SIGNED + 1))
-            else
-              echo "${f}: UNSIGNED (apksigner verify exited non-zero)" | tee -a apksigner-verify.txt
-              UNSIGNED=$((UNSIGNED + 1))
-            fi
-          done
-          cat apksigner-verify.txt
-          if [ "$SIGNED" -gt 0 ] && [ "$UNSIGNED" -gt 0 ]; then
-            echo "::error::mixed signature state (${SIGNED} signed, ${UNSIGNED} unsigned) — refusing to guess"
-            exit 1
-          fi
-          # Three states, all measured: the same vocabulary the rest of the project uses
-          # (unsigned / debug-signed / signed-by-user), but read off the APKs instead of
-          # declared by whichever step happened to run.
-          if [ "$UNSIGNED" -gt 0 ]; then
-            STATE=unsigned
-          elif grep -q 'CN=Android Debug' apksigner-verify.txt; then
-            STATE=debug-signed
-          else
-            STATE=signed-by-user
-          fi
-          # 真发布路径必须用用户自己的证书签过名; 否则拒绝继续。
-          if [ "${RELEASE_BUILD:-false}" = "true" ]; then
-            if [ "$STATE" = "unsigned" ]; then
-              echo "::error::a v* tag release must be signed, but apksigner reports the APKs as unsigned"
-              exit 1
-            fi
-            if [ "$STATE" = "debug-signed" ]; then
-              echo "::error::a v* tag release is signed with the Android debug keystore — refusing to continue"
-              exit 1
-            fi
-          else
-            # dry run 必须是未签名的 —— 签了名说明签名材料漏进了一条本该只读的路径。
-            if [ "$STATE" != "unsigned" ]; then
-              echo "::error::this run is a dry run but the APKs verify as ${STATE}"
-              echo "::error::signing material reached a path that must not have it — check the signing gate"
-              exit 1
-            fi
-          fi
-          echo "state=${STATE}" >> "$GITHUB_OUTPUT"
-          echo "measured signature state: ${STATE}"
+          bash .github/scripts/measure_apk_signature.sh \
+            "$EXPECT_SIGNATURE" app/build/outputs/apk/release \
+            | tee app/build/outputs/apk/release/apksigner-verify.txt
 
       # 文件名必须自己说清楚这是什么, 不能让未签名的 dry-run 产物看起来像可以直接
       # 安装的正式包:
@@ -520,33 +471,38 @@ jobs:
           path: .
 
       # 发布前的最后一道工具化检查: 这一步失败就没有 Release。
+      #
+      # 这里曾经找错路径: download-artifact 把 artifact 的内容摊在当前目录
+      # (APK 与 build-info.json 都在仓库根), 但这一步去 app/build/outputs/apk/release/
+      # 里找。那正是 build job 里真实存在的目录, 而 publish job 只做 fetch-depth: 0 的
+      # checkout —— 它并不重建 APK, 所以那是另一个目录。配合 `shopt -s nullglob`,
+      # 通配符展开为空数组, for 循环体一次都不执行, 于是脚本会打印
+      # "all 0 APKs verify as signed with a non-debug certificate" 并成功退出,
+      # 把一个**从未被验证过**的 artifact 直接送进 Release。
+      #
+      # 现在的形式让"什么都没找到"必然是失败: 先按 artifact 实际落点枚举, 再要求
+      # 数量正好是每个 ABI 一个, 最后才交给与 build job 同一个测量脚本。
       - name: Verify the APKs are signed before publishing
         run: |
           set -euo pipefail
-          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-          APKSIGNER="$(find "$SDK/build-tools" -maxdepth 2 -type f -name apksigner 2>/dev/null | sort -V | tail -n1 || true)"
-          if [ -z "$APKSIGNER" ]; then
-            echo "::error::apksigner not found; refusing to publish unverified APKs"
-            exit 1
-          fi
-          shopt -s nullglob
-          APKS=(app/build/outputs/apk/release/*.apk)
+          # artifact 的落点就是当前目录; 递归找是为了不依赖 ABI 目录结构。
+          mapfile -t APKS < <(find . -type f -name '*.apk' | sort)
           if [ "${#APKS[@]}" -eq 0 ]; then
-            echo "::error::no APKs in the downloaded artifact"
+            echo "::error::no APKs anywhere in the downloaded artifact"
+            find . -maxdepth 3 | sort
             exit 1
           fi
-          for f in "${APKS[@]}"; do
-            if ! OUT="$("$APKSIGNER" verify --verbose --print-certs "$f")"; then
-              echo "$OUT"
-              echo "::error::${f} does not verify — refusing to publish an unsigned APK"
-              exit 1
-            fi
-            echo "$OUT"
-            if grep -q 'CN=Android Debug' <<<"$OUT"; then
-              echo "::error::${f} is signed with the Android debug keystore — refusing to publish"
-              exit 1
-            fi
-          done
+          # split ABI 每个一个: 数量不对说明 artifact 与 naming 步骤的约定漂了,
+          # 这时宁可失败也不要发布一个形状不明的包。
+          if [ "${#APKS[@]}" -ne 2 ]; then
+            echo "::error::expected 2 per-ABI release APKs (arm64-v8a + x86_64), found ${#APKS[@]}"
+            printf '%s\n' "${APKS[@]}"
+            exit 1
+          fi
+          printf 'found %d APK(s):\n' "${#APKS[@]}"
+          printf '  %s\n' "${APKS[@]}"
+          # 与 build job 同一个测量脚本, 所以两处的判定不可能各自漂移。
+          bash .github/scripts/measure_apk_signature.sh signed "${APKS[@]}"
           echo "all ${#APKS[@]} APKs verify as signed with a non-debug certificate"
 
       # 更新摘要 = "版本提交"(范围内最后改 version.properties 的那个)的完整

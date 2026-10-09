@@ -124,6 +124,14 @@ jobs:
       - name: Provenance gate negative tests
         run: python3 .github/scripts/test_check_core_provenance.py
 
+      # 发布门禁(签名测量 + publish job 的 APK 路径)只有在 v* tag 才会真正运行,
+      # 所以它的回归必须在一个**每次 push 都跑**的地方被证明。这一条就是那个地方:
+      # 它读 release-apk.yml 与 measure_apk_signature.sh 本身, 检查"下载到哪里"与
+      # "去哪里找"是否一致、空列表是否必然失败、以及 unsigned / debug-signed /
+      # signed-by-user 的判定表是否 fail-closed。
+      - name: Release publish gate checks
+        run: python3 .github/scripts/test_release_publish_gate.py
+
       # What this proves: the AAR matches the revision THIS RUN resolved from
       # CORE_BRANCH=testing. It is deliberately NOT evidence about the revision pinned in
       # version.properties - a green dev run says nothing about the release combination.
