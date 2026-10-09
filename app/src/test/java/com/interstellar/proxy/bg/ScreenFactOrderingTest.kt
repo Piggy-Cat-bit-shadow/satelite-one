@@ -184,6 +184,90 @@ class ScreenFactOrderingTest {
         }
     }
 
+
+    // ------------------------------------------------- P1-E: network vs wake
+
+    @Test
+    fun `E01 the network path cannot reach a screen or wake fact`() {
+        // P1-E: a network handoff must not be misread as a screen wake. The structural
+        // guarantee is that the two never touch: the files that implement default-network
+        // tracking must not mention a screen fact, a wake report or a screen broadcast.
+        //
+        // The tempting wrong fix this keeps out is "on a network change, wake the core" -
+        // a handoff is not a user returning, and reporting it as one would fire
+        // reportDeviceWake() for something the user never did.
+        val root = java.io.File("src/main/java/com/interstellar/proxy")
+        check(root.isDirectory) { "cannot find the source root" }
+        val networkFiles = listOf("DefaultNetworkMonitor.kt", "DefaultNetworkListener.kt",
+                                  "PlatformInterfaceWrapper.kt", "InterfaceResolutionEpoch.kt")
+        val offenders = mutableListOf<String>()
+        for (name in networkFiles) {
+            val f = root.walkTopDown().firstOrNull { it.name == name } ?: continue
+            val text = f.readText()
+            for (needle in listOf("reportDeviceWake", "setScreenOn", "ACTION_SCREEN",
+                                  "USER_PRESENT", "onUserPresent")) {
+                if (text.contains(needle)) offenders += "$name contains $needle"
+            }
+        }
+        check(offenders.isEmpty()) { "the network path touches a wake/screen fact: $offenders" }
+    }
+
+    @Test
+    fun `E02 reportDeviceWake has exactly one producer, and it is USER_PRESENT`() {
+        // The fact's provenance, asserted rather than assumed. If a second producer ever
+        // appears, one of them is somebody else's event wearing the user's name.
+        val root = java.io.File("src/main/java/com/interstellar/proxy")
+        check(root.isDirectory) { "cannot find the source root" }
+        val producers = mutableListOf<String>()
+        root.walkTopDown().filter { it.extension == "kt" }.forEach { f ->
+            f.readText().lineSequence().forEachIndexed { i: Int, line: String ->
+                // Count only ENQUEUES of the fact, not its declaration or its bridge
+                // forwarding. The first cut also excluded anything containing
+                // "sink.reportDeviceWake" and so excluded the real enqueue as well - the
+                // actual line reads `enqueue(live) { sink -> sink.reportDeviceWake() }` -
+                // which made the list come back empty. Exclude DECLARATIONS, not calls.
+                if (line.contains("reportDeviceWake()") &&
+                    !line.contains("fun reportDeviceWake") &&
+                    !line.contains("override fun") &&
+                    !line.contains("platformEvents?.reportDeviceWake")
+                ) {
+                    producers += "${f.name}:${i + 1}"
+                }
+            }
+        }
+        check(producers.size == 1) {
+            "expected exactly one enqueue site for reportDeviceWake, found $producers"
+        }
+        // ... and that single site is the USER_PRESENT path.
+        //
+        // Read the function body by line scan rather than a delimiter substring: the first
+        // cut embedded a literal newline inside a string literal here and did not compile.
+        val factLines = java.io.File(root, "bg/PlatformFacts.kt").readText().lines()
+        val start = factLines.indexOfFirst { it.contains("fun onUserPresent()") }
+        check(start >= 0) { "onUserPresent() not found in PlatformFacts.kt" }
+        val body = factLines.subList(start, minOf(start + 3, factLines.size)).joinToString(" ")
+        check(body.contains("reportDeviceWake")) {
+            "the single reportDeviceWake producer is not onUserPresent(): $body"
+        }
+    }
+
+    @Test
+    fun `E03 no screen handler rebuilds the tunnel`() {
+        // The other forbidden family: "screen on -> rebuild the VPN" as a blanket remedy.
+        val root = java.io.File("src/main/java/com/interstellar/proxy")
+        check(root.isDirectory) { "cannot find the source root" }
+        val offenders = mutableListOf<String>()
+        root.walkTopDown().filter { it.extension == "kt" }.forEach { f ->
+            val text = f.readText()
+            if (!text.contains("ACTION_SCREEN") && !text.contains("onScreenChanged")) return@forEach
+            for (needle in listOf("ResetNetwork", "restartService", "closeService(",
+                                  "rebuildVpn", "forceReconnect")) {
+                if (text.contains(needle)) offenders += "${f.name} contains $needle"
+            }
+        }
+        check(offenders.isEmpty()) { "a screen handler rebuilds the tunnel: $offenders" }
+    }
+
     // ---------------------------------------------------------- the install latch
 
     @Test
