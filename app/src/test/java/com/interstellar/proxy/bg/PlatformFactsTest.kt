@@ -64,7 +64,9 @@ class PlatformFactsTest {
 
     @After
     fun tearDown() {
-        runBlocking { PlatformFacts.detachAndDrain() }
+        // No tokenless "detach everything" API exists any more, so a test cleanup must
+        // name the session it is tearing down.
+        PlatformFacts.attachedSession?.let { live -> runBlocking { PlatformFacts.detachAndDrain(live) } }
         // leave deterministic facts for the next test
         PlatformFacts.onScreenChanged(true)
         PlatformFacts.onForegroundChanged(false)
@@ -182,7 +184,7 @@ class PlatformFactsTest {
         val sink = RecordingSink()
         PlatformFacts.attach(sink)
         awaitAtLeast(sink, 2)
-        runBlocking { PlatformFacts.detachAndDrain() }
+        PlatformFacts.attachedSession?.let { live -> runBlocking { PlatformFacts.detachAndDrain(live) } }
         sink.events.clear()
 
         PlatformFacts.onMemoryTrim(80)
@@ -196,7 +198,7 @@ class PlatformFactsTest {
 
     @Test
     fun `facts recorded while detached are still reported when the next core attaches`() {
-        runBlocking { PlatformFacts.detachAndDrain() }
+        PlatformFacts.attachedSession?.let { live -> runBlocking { PlatformFacts.detachAndDrain(live) } }
         PlatformFacts.onScreenChanged(false)
         PlatformFacts.onForegroundChanged(false)
         settle()
@@ -291,9 +293,10 @@ class PlatformFactsTest {
         PlatformFacts.onMemoryTrim(80)
         check(started.await(5, TimeUnit.SECONDS)) { "the lane never started the trim call" }
 
+        val live = PlatformFacts.attachedSession!!
         val drained = CountDownLatch(1)
         Thread {
-            runBlocking { PlatformFacts.detachAndDrain() }
+            runBlocking { PlatformFacts.detachAndDrain(live) }
             drained.countDown()
         }.start()
 
@@ -337,7 +340,7 @@ class PlatformFactsTest {
         PlatformFacts.attach(old)
         awaitAtLeast(old, 2)
 
-        runBlocking { PlatformFacts.detachAndDrain() }
+        PlatformFacts.attachedSession?.let { live -> runBlocking { PlatformFacts.detachAndDrain(live) } }
         val fresh = RecordingSink()
         PlatformFacts.attach(fresh)
         awaitAtLeast(fresh, 2)
@@ -350,5 +353,115 @@ class PlatformFactsTest {
 
         check(old.events.isEmpty()) { "the replaced session still received facts: ${old.events}" }
         check(fresh.events.contains("trim:60")) { "the live session missed facts: ${fresh.events}" }
+    }
+
+    // ---- ownership: the two hazards the previous revision left open ----
+
+    @Test
+    fun `a replaced session still drains its in-flight call and leaves the new one alone`() {
+        // The old implementation returned early when `expected` was no longer current:
+        // it neither waited for A's running native call NOR touched B. The first half of
+        // that was a use-after-close waiting to happen, because the caller closes A's
+        // bridge right after this returns.
+        val started = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val finished = CountDownLatch(1)
+        val sinkA = object : RecordingSink() {
+            override fun memoryTrim(level: Int) {
+                started.countDown()
+                release.await(5, TimeUnit.SECONDS)
+                super.memoryTrim(level)
+                finished.countDown()
+            }
+        }
+        val sessionA = PlatformFacts.attach(sinkA)
+        awaitAtLeast(sinkA, 2)
+        PlatformFacts.onMemoryTrim(64)
+        check(started.await(5, TimeUnit.SECONDS)) { "A's trim never started" }
+
+        // B replaces A while A's native call is still blocked. B's own initial report
+        // queues behind that call — the lane is deliberately serial, so it is NOT
+        // expected to arrive yet.
+        val sinkB = RecordingSink()
+        PlatformFacts.attach(sinkB)
+
+        val drained = CountDownLatch(1)
+        var drainResult: Boolean? = null
+        Thread {
+            drainResult = runBlocking { PlatformFacts.detachAndDrain(sessionA) }
+            drained.countDown()
+        }.start()
+
+        // Must NOT report "drained" while A's call is still executing.
+        check(!drained.await(300, TimeUnit.MILLISECONDS)) {
+            "detachAndDrain(A) returned while A's native call was still in flight"
+        }
+        release.countDown()
+        check(finished.await(5, TimeUnit.SECONDS)) { "A's call never finished" }
+        check(drained.await(5, TimeUnit.SECONDS)) { "the drain never completed" }
+        check(drainResult == true) { "a completed drain must report true" }
+
+        // B was never unbound: once the lane drains, B gets both its own initial report
+        // and the next fact.
+        awaitAtLeast(sinkB, 2)
+        check(sinkB.events.contains("screen:true")) { "B never got its initial report: ${sinkB.events}" }
+        sinkB.events.clear()
+        PlatformFacts.onUserPresent()
+        awaitAtLeast(sinkB, 1)
+        check(sinkB.events.contains("wake")) {
+            "draining the replaced session A damaged the live session B: ${sinkB.events}"
+        }
+    }
+
+    @Test
+    fun `unbinding is refused for a session that is no longer current`() {
+        val first = RecordingSink()
+        val sessionA = PlatformFacts.attach(first)
+        awaitAtLeast(first, 2)
+        val second = RecordingSink()
+        PlatformFacts.attach(second)
+        awaitAtLeast(second, 2)
+
+        // A is stale; the call must still drain (returns true) but must not unbind B.
+        val drained = runBlocking { PlatformFacts.detachAndDrain(sessionA) }
+        check(drained) { "a stale session must still be drainable" }
+        check(PlatformFacts.attachedSession != null) { "B was unbound by A's teardown" }
+        second.events.clear()
+        PlatformFacts.onMemoryTrim(80)
+        awaitAtLeast(second, 1)
+        check(second.events.contains("trim:80")) { "B stopped receiving facts: ${second.events}" }
+    }
+
+    @Test
+    fun `an undrainable lane is reported instead of pretending success`() {
+        // A sink that never returns blocks the single worker forever. The drain must
+        // give up after its bound and report "not proven" rather than hanging teardown
+        // or claiming the session is idle.
+        val entered = CountDownLatch(1)
+        val never = CountDownLatch(1)
+        val sink = object : RecordingSink() {
+            override fun memoryTrim(level: Int) {
+                entered.countDown()
+                never.await(30, TimeUnit.SECONDS)
+                super.memoryTrim(level)
+            }
+        }
+        val session = PlatformFacts.attach(sink)
+        awaitAtLeast(sink, 2)
+        PlatformFacts.onMemoryTrim(80)
+        check(entered.await(5, TimeUnit.SECONDS)) { "the blocking trim never started" }
+
+        val startedAt = System.currentTimeMillis()
+        val proven = try {
+            runBlocking { PlatformFacts.detachAndDrain(session) }
+        } finally {
+            // MUST run even if the assertions below fail: the worker is shared by every
+            // test in this class, and leaving it blocked would cascade failures into
+            // unrelated tests instead of reporting one honest failure.
+            never.countDown()
+        }
+        val elapsed = System.currentTimeMillis() - startedAt
+        check(!proven) { "an undrainable lane must report false" }
+        check(elapsed < 20_000) { "the drain must be bounded, took ${elapsed}ms" }
     }
 }

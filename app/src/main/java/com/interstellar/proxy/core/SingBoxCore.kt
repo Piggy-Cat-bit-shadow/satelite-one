@@ -72,12 +72,23 @@ class SingBoxCore(
 
     override fun needWifiState() = commandServer?.needWIFIState() ?: false
 
-    override suspend fun shutdown() {
-        // Order matters: release the fact bridge first so nothing new can be
-        // delivered, then tear the server down. The caller has already stopped the
-        // Android receivers/lifecycle sources before getting here.
+    override fun closePlatformEvents() {
+        // Idempotent: a second call, or one after shutdown, is a no-op.
         platformEvents?.let { events -> runCatching { events.close() } }
         platformEvents = null
+    }
+
+    override suspend fun shutdown() {
+        // The bridge is closed by the caller *before* this, and only when it could
+        // prove the fact lane had drained. Reaching here with it still open means that
+        // proof was unavailable: leave it open (one unreachable Go object) instead of
+        // closing it under a native call, and say so loudly.
+        if (platformEvents != null) {
+            android.util.Log.e(
+                "InterstellarUI",
+                "SingBoxCore.shutdown() with the platform-events bridge still open: drain was not proven",
+            )
+        }
         val server = commandServer ?: return
         runCatching {
             server.closeService()

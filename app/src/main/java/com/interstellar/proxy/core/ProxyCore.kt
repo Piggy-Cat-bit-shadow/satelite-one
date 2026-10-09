@@ -49,7 +49,24 @@ interface ProxyCore : PlatformFactSink {
 
     fun wake()
 
-    /** Tear the engine down completely before the Android service stops. */
+    /**
+     * Close the platform-events bridge. Idempotent, and safe to call twice.
+     *
+     * Split out of [shutdown] deliberately, because closing this object while a fact
+     * call is still executing on its session's lane is a native use-after-close. The
+     * service layer therefore calls this **only after a proven drain**
+     * (`PlatformFacts.detachAndDrain` returning true). When the drain cannot be
+     * proven the caller must leave the bridge open: that leaks one bounded Go object
+     * which can no longer be reached (the session is unbound), which is strictly
+     * better than closing it under a running call.
+     */
+    fun closePlatformEvents()
+
+    /**
+     * Tear the engine down. Does **not** touch the platform-events bridge — call
+     * [closePlatformEvents] first. If it is still open here, the caller did not prove
+     * a drain; that is logged loudly rather than papered over.
+     */
     suspend fun shutdown()
 
     /** Whether the core needs WIFI-state location permission. */

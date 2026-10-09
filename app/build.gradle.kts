@@ -185,6 +185,16 @@ android {
         }
     }
 
+    testOptions {
+        unitTests {
+            // The production code logs failures through android.util.Log, and the tests
+            // that matter most here are exactly the failure/timeout paths. Without this
+            // the framework stubs throw "not mocked" instead of returning a default,
+            // which would make those paths untestable on the JVM.
+            isReturnDefaultValues = true
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

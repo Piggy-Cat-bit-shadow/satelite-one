@@ -90,6 +90,13 @@ class BoxService(private val service: Service, private val platformInterface: Pl
     /** Serializes [releaseCore] between a normal stop and a failed-start teardown. */
     private val releaseMutex = kotlinx.coroutines.sync.Mutex()
 
+    /**
+     * Decides which start attempt may publish a core. [releaseMutex] only serializes
+     * *releasers*; this is what stops a start that is still inside `startup()` from
+     * writing its core back after a teardown has already run.
+     */
+    private val lifecycle = CoreLifecycle()
+
     private var receiverRegistered = false
 
     /**
@@ -122,12 +129,34 @@ class BoxService(private val service: Service, private val platformInterface: Pl
 
     private suspend fun startCore() {
         com.interstellar.proxy.core.AppLog.log("service", "启动内核 sing-box")
-        val started = CoreEngines.create(platformInterface, this).also { it.startup() }
-        core = started
-        // Bind the Android fact bridge. attach() also reports the current screen and
-        // foreground state immediately, so a core started while the screen is off or
-        // the app is already backgrounded is not left guessing until the next event.
-        factSession = PlatformFacts.attach(started)
+        val attempt = lifecycle.beginStart()
+        val created = CoreEngines.create(platformInterface, this)
+        try {
+            created.startup()
+        } catch (e: Exception) {
+            // startup() builds real native objects (the CommandServer, the fact bridge)
+            // before it can fail. Dispose the object we actually hold — not the `core`
+            // field, which was never assigned — so a partial start cannot leak a
+            // CommandServer or leave a socket behind.
+            runCatching { created.closePlatformEvents() }
+            runCatching { created.shutdown() }
+            lifecycle.abandon(attempt)
+            throw e
+        }
+        // Publishing is the linearization point: a teardown that ran while startup()
+        // was in flight has already bumped the generation, so this publish is refused
+        // and the core can never be written back after being released.
+        val published = lifecycle.publish(attempt) {
+            core = created
+            // Attach inside the same critical section as the publish: there is no
+            // window in which a core is visible without its fact bridge, or vice versa.
+            factSession = PlatformFacts.attach(created)
+        }
+        if (!published) {
+            android.util.Log.i("InterstellarUI", "core start superseded by a stop; disposing the new core")
+            runCatching { created.closePlatformEvents() }
+            runCatching { created.shutdown() }
+        }
     }
 
     /**
@@ -151,20 +180,44 @@ class BoxService(private val service: Service, private val platformInterface: Pl
      * is how a failed start could close the bridge with facts still queued.
      */
     private suspend fun releaseCore() = releaseMutex.withLock {
+        // Stop authorising any in-flight start attempt first: a start that is still
+        // inside startup() must not publish its core after this point.
+        lifecycle.invalidate()
+
         val session = factSession
         factSession = null
-        runCatching { PlatformFacts.detachAndDrain(session) }
-            .onFailure { android.util.Log.w("InterstellarUI", "fact bridge drain failed", it) }
+        val running = core
+        core = null
 
+        // 1) Facts stop, and any native call already running for THIS session drains.
+        // The token is non-null and identifies our own session, so a newer session
+        // attached by someone else can never be unbound here.
+        val drained = session == null || runCatching { PlatformFacts.detachAndDrain(session) }
+            .onFailure { android.util.Log.w("InterstellarUI", "fact bridge drain failed", it) }
+            .getOrDefault(false)
+
+        // 2) Only close the native bridge once the drain is proven. Unproven means a
+        // fact call may still be executing on that object; leaving one unreachable Go
+        // object behind is strictly better than a use-after-close.
+        if (running != null) {
+            if (drained) {
+                runCatching { running.closePlatformEvents() }
+            } else {
+                android.util.Log.e(
+                    "InterstellarUI",
+                    "fact drain unproven; leaving the platform-events bridge open",
+                )
+            }
+        }
+
+        // 3) Then the Android-side resources, then the server itself.
         val pfd = fileDescriptor
         if (pfd != null) {
             runCatching { pfd.close() }
             fileDescriptor = null
         }
         DefaultNetworkMonitor.stop()
-        val running = core
-        core = null
-        running?.shutdown()
+        runCatching { running?.shutdown() }
     }
 
     private suspend fun startService() {
@@ -391,8 +444,24 @@ class BoxService(private val service: Service, private val platformInterface: Pl
 
     internal fun onBind(): IBinder = binder
 
+    @OptIn(DelicateCoroutinesApi::class)
     internal fun onDestroy() {
         binder.close()
+        // System-initiated destruction arrives with no preceding stopService(): a
+        // process teardown, a revoked VPN, an OEM kill. Whatever is still held must
+        // still converge, and through the SAME idempotent release every other path
+        // uses - not a second, drifting cleanup.
+        if (receiverRegistered) {
+            runCatching { service.unregisterReceiver(receiver) }
+            receiverRegistered = false
+        }
+        runCatching { notification.close() }
+        if (core != null || factSession != null || fileDescriptor != null) {
+            // GlobalScope is deliberate rather than incidental: every Android-owned
+            // scope may already be dying with this Service, and the native teardown
+            // (fact drain, then CommandServer shutdown) must still reach completion.
+            GlobalScope.launch(Dispatchers.IO) { releaseCore() }
+        }
     }
 
     internal fun onRevoke() {
@@ -442,4 +511,54 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             InterstellarApplication.notification.cancel(identifier, typeID)
         }
     }
+}
+
+/**
+ * Ownership gate for "which core generation may be published".
+ *
+ * The hazard it removes is a released core being written back by a start that was
+ * already in flight:
+ *
+ *   start: beginStart() ──► startup() (slow) ─┐
+ *   stop:  invalidate() ──► releaseCore()     │  publish() now refused
+ *                                             ┘
+ *
+ * Pure Kotlin, no Android and no native types, so every interleaving above is
+ * unit-testable without a device.
+ */
+internal class CoreLifecycle {
+
+    private val lock = Any()
+    private var generation = 0L
+    private var published: Long? = null
+
+    /** Begin a start attempt. The returned token authorizes exactly one [publish]. */
+    fun beginStart(): Long = synchronized(lock) { ++generation }
+
+    /** Invalidate every in-flight start attempt. Called by teardown, before release. */
+    fun invalidate(): Long = synchronized(lock) { ++generation }
+
+    /**
+     * Run [block] only if [attempt] is still the youngest generation.
+     *
+     * [block] runs inside the critical section on purpose: publishing the core and
+     * attaching its fact bridge must be one indivisible step, so no observer can see
+     * a core without its bridge (or the reverse).
+     */
+    fun publish(attempt: Long, block: () -> Unit): Boolean = synchronized(lock) {
+        if (attempt != generation) return false
+        block()
+        published = attempt
+        true
+    }
+
+    /** Forget [attempt] after a failed startup, without publishing anything. */
+    fun abandon(attempt: Long) {
+        synchronized(lock) {
+            if (published == attempt) published = null
+        }
+    }
+
+    /** True while some generation is published. */
+    val isPublished: Boolean get() = synchronized(lock) { published != null }
 }

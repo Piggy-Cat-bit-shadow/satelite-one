@@ -94,7 +94,18 @@ object PlatformFacts {
 
     // ---- the single delivery lane ----
 
+    /**
+     * Task queue for the lane. **Not capacity-bounded**: platform facts are rare
+     * (screen transitions, trims, unlocks), so an unbounded queue cannot be driven
+     * to meaningful depth by Android itself — but it is not a bounded buffer and
+     * must not be described as one. Bounding it would mean dropping or merging
+     * one-shot facts (a trim, an unlock) or reordering an ON/OFF pair, which is
+     * worse than the theoretical growth.
+     */
     private val queue = Channel<() -> Unit>(Channel.UNLIMITED)
+
+    /** Ceiling on how long teardown may wait for a proven drain. */
+    private const val DRAIN_TIMEOUT_MS = 5_000L
     private val laneScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val laneWorker = laneScope.launch {
         for (task in queue) {
@@ -110,12 +121,20 @@ object PlatformFacts {
      * Queue a native call for [target]. The ownership check happens when the task
      * *runs*, not when it is queued.
      */
-    private fun enqueue(target: Session, action: (PlatformFactSink) -> Unit) {
-        queue.trySend {
+    private fun enqueue(target: Session, action: (PlatformFactSink) -> Unit): Boolean {
+        val sent = queue.trySend {
             // Re-checked here, on the lane thread, immediately before the native
             // call: a detach or re-attach that raced this job makes it a no-op.
             if (current?.id == target.id) action(target.sink)
         }
+        if (sent.isFailure) {
+            // The lane is gone, so this fact can never be delivered. Losing one fact
+            // is survivable; silently believing it was delivered is not, so it is
+            // logged. (The channel is never closed and the worker never stops in this
+            // app, so this is a defence against future changes, not a live path.)
+            android.util.Log.w("InterstellarUI", "PlatformFacts lane unavailable; dropped one fact", sent.exceptionOrNull())
+        }
+        return sent.isSuccess
     }
 
     /**
@@ -137,30 +156,59 @@ object PlatformFacts {
     }
 
     /**
-     * Unbind [expected] and wait until every delivery queued before this call has
-     * finished, so the caller may then close the native bridge with nothing in
-     * flight.
+     * Unbind [expected] and wait until every native call already started for **that**
+     * session has finished, so the caller may then close its bridge safely.
      *
-     * A null [expected] unbinds whatever is attached; passing the token from
-     * [attach] is what stops a stale holder from tearing down a newer session.
+     * [expected] is required and non-null on purpose. There is deliberately no
+     * "unbind whatever happens to be attached" overload: a teardown that lost its
+     * token must never be able to tear down a *newer* session's bridge, and an
+     * implicit force-detach reachable from ordinary teardown is exactly how that
+     * happens.
+     *
+     * The two responsibilities are kept apart:
+     *
+     *  - **Unbinding** only happens when [expected] is still the live session. A
+     *    replaced session leaves [current] untouched, so session B is never harmed.
+     *  - **Draining** happens unconditionally. Even when [expected] was already
+     *    replaced, its native calls may still be executing on the lane, and the
+     *    caller is about to close that session's bridge — so we must still wait.
+     *
+     * @return true only when the barrier actually ran, which proves every delivery
+     *   queued before this call has completed. **false means the drain is NOT
+     *   proven** (the lane is unavailable); the caller must not close native state
+     *   it cannot prove is idle.
      */
-    suspend fun detachAndDrain(expected: Session? = null) {
-        val unbound = synchronized(lock) {
-            val live = current
-            if (live != null && (expected == null || live.id == expected.id)) {
-                current = null
-                true
-            } else {
-                false
-            }
+    suspend fun detachAndDrain(expected: Session): Boolean {
+        synchronized(lock) {
+            // Only our own session is ever unbound; a replaced session leaves
+            // `current` pointing at the newer one.
+            if (current?.id == expected.id) current = null
         }
-        if (!unbound) return
-        // The channel is FIFO, so once this barrier runs, every task sent before it
-        // has completed. That — not a nullable field — is the synchronization
-        // boundary between "facts stop" and "the bridge is closed".
+        // Linearization point: the barrier is enqueued *after* the unbind above, so
+        // no task submitted later can slip in front of it. The channel is FIFO and
+        // single-consumer, so when the barrier runs, every task sent before it has
+        // completed. A task queued before the unbind is a no-op (the ownership check
+        // fails), and a task already running is waited for — which is the point.
         val barrier = CompletableDeferred<Unit>()
-        queue.trySend { barrier.complete(Unit) }
-        barrier.await()
+        if (queue.trySend { barrier.complete(Unit) }.isFailure) {
+            android.util.Log.e(
+                "InterstellarUI",
+                "PlatformFacts lane unavailable; cannot prove session ${expected.id} drained",
+            )
+            return false
+        }
+        // Bounded: a lane that accepted the barrier but never runs it (for example a
+        // future change that cancels the lane scope) must not hang service teardown
+        // forever. Timing out reports "not proven" rather than pretending success.
+        val drained = kotlinx.coroutines.withTimeoutOrNull(DRAIN_TIMEOUT_MS) { barrier.await() }
+        if (drained == null) {
+            android.util.Log.e(
+                "InterstellarUI",
+                "PlatformFacts drain for session ${expected.id} timed out after ${DRAIN_TIMEOUT_MS}ms",
+            )
+            return false
+        }
+        return true
     }
 
     // ---- fact entry points ----
