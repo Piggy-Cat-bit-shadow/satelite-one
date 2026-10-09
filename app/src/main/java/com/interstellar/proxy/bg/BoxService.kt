@@ -380,6 +380,34 @@ class BoxService(private val service: Service, private val platformInterface: Pl
         }
     }
 
+    /**
+     * Stop the service and clear everything that belongs to this Service object.
+     *
+     * ## Why the notification and the receiver are closed HERE and not in a finalizer
+     *
+     * Round 6 found that `stopService` closed both *before* `releaseCore()`, on the
+     * caller's thread. That is `unregisterReceiver` + `notification.close()` for a
+     * generation that might already have been superseded — and both touch process-wide
+     * Android state (the FGS notification slot and the registration), so a dying
+     * generation could darken a live successor.
+     *
+     * The fix moved them behind the ownership check in the finalizer, which is correct
+     * but relies on an invariant worth writing down: **every Service instance destroys
+     * itself through here or through `stopAndAlert`, and an instance whose stop is
+     * superseded is still destroyed by the successor's own stop later.** The receiver is
+     * registered once per instance and the notification is a singleton slot, so there is
+     * nothing a superseded stop leaves behind that the surviving generation does not
+     * still own.
+     *
+     * A direct consequence also worth stating: because the notification is only closed
+     * at convergence, the 5 s timeouts inside `PlatformFacts.detachAndDrain` (up to two
+     * of them) delay user-visible feedback on a slow teardown. That is a real,
+     * bounded cost — a user pressing Stop while a fact call is wedged waits ~10 s before
+     * the notification disappears — and it is preferable to the alternative. The other
+     * direction would close the notification while a core is still alive, which is the
+     * "UI says disconnected but the tunnel is up" failure this class exists to prevent.
+     * An emulator run measured the normal path at well under a second.
+     */
     @OptIn(DelicateCoroutinesApi::class)
     private fun stopService() {
         val current = status.value
