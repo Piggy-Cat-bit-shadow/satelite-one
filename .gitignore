@@ -26,3 +26,9 @@ app/src/main/jniLibs/
 # agent workspace / kotlin session files
 .zcode/
 .kotlin/
+
+# Local compile-only scratch: a generated libbox.aar + the stub sources it was built
+# from, used on a machine that does not have the pinned core artifact (see the
+# release workflow's cache path). It must never be committed — a stub AAR has no
+# libbox.so and would make the provenance gate's warnings meaningless.
+/local-stub-aar/
