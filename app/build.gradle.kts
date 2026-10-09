@@ -80,6 +80,18 @@ val coreCheckout: java.io.File? =
         "/tmp/sb/sing-box",
     ).filterNotNull().map(::File).firstOrNull { it.isDirectory }
 
+/**
+ * The identity this build advertises.
+ *
+ * NOTE the precedence: the provenance file wins over CORE_COMMIT_FULL and over any
+ * local checkout. `verifyCoreProvenance` therefore checks that the packaged binary
+ * carries the identity *its own provenance records* - self-consistency, which catches a
+ * relabelled or stale AAR. It does NOT check that the revision is the one
+ * version.properties pins: a dev CI build deliberately follows the `testing` tip, so
+ * making this task pin-strict would fail every dev run. The pin comparison is CI's
+ * `.github/scripts/check_core_provenance.py`, which is given the expected SHA
+ * explicitly (the pin in release-apk.yml). Keep both.
+ */
 val coreCommitFull: String =
     provenance["commit"]?.takeIf { it.isNotBlank() && it != "unknown" }
         ?: System.getenv("CORE_COMMIT_FULL")?.takeIf { it.isNotBlank() }

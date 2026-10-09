@@ -240,11 +240,17 @@ jobs:
             exit 1
           fi
 
-      # verifyCoreProvenance is the Gradle twin of the Python gate above. The Python
-      # one checks the artifact before anything is built; this one re-checks the AAR
-      # that AGP actually packaged, against the same pinned coreCommit. Running only
-      # one of them would leave a gap between "the file on disk is right" and "the
-      # APK contains it".
+      # What each gate actually proves - they are NOT redundant and NOT interchangeable:
+      #
+      #  * check_core_provenance.py (above) is the PIN check: it compares the AAR and its
+      #    provenance against the revision this run resolved from version.properties.
+      #    That is the only non-circular check that the shipped core is the pinned one.
+      #  * :app:verifyCoreProvenance is the SELF-CONSISTENCY check: its expectation comes
+      #    from app/libs/libbox.provenance itself (that file wins over CORE_COMMIT_FULL and
+      #    over any local checkout), so it catches "the packaged libbox.so does not carry
+      #    the identity its own provenance records" - a relabelled or stale AAR. It cannot
+      #    by itself detect a wrong pin, which is exactly why the Python gate must run too.
+      # Running both covers "the file on disk is the pinned one" AND "the APK contains it".
       - name: Build release APK and verify the packaged core identity
         run: |
           chmod +x gradlew

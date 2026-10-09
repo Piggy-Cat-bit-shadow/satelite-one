@@ -124,6 +124,11 @@ jobs:
       - name: Provenance gate negative tests
         run: python3 .github/scripts/test_check_core_provenance.py
 
+      # What this proves: the AAR matches the revision THIS RUN resolved from
+      # CORE_BRANCH=testing. It is deliberately NOT evidence about the revision pinned in
+      # version.properties - a green dev run says nothing about the release combination.
+      # Only release-apk.yml (which resolves the pin) can attest to that.
+      #
       # Cache hits skip the build, so verify the artifact against the resolved
       # revision on every run, not only when it was just compiled.
       - name: Validate core provenance
