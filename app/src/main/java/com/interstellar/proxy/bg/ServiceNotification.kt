@@ -23,8 +23,10 @@ import com.interstellar.proxy.constant.Status
 import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.utils.CommandClient
 import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.withContext
 
 class ServiceNotification(private val status: MutableLiveData<Status>, private val service: Service) :
@@ -44,9 +46,18 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
         }
     }
 
-    @OptIn(DelicateCoroutinesApi::class)
+    /**
+     * Owns the notification's status client. Cancelled in [close] so a connect
+     * coroutine started here cannot outlive the notification object.
+     *
+     * Cancelling this scope does NOT lose the native teardown: CommandClient's
+     * own disconnect runs on its independent cleanup scope precisely because the
+     * caller's scope may already be gone.
+     */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     private val commandClient =
-        CommandClient(GlobalScope, CommandClient.ConnectionType.Status, this, localOnly = true)
+        CommandClient(scope, CommandClient.ConnectionType.Status, this, localOnly = true)
     private var receiverRegistered = false
 
     /**
@@ -180,5 +191,7 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
             service.unregisterReceiver(this)
             receiverRegistered = false
         }
+        // After the teardown above, never before it.
+        scope.cancel()
     }
 }
