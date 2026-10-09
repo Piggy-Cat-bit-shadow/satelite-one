@@ -119,6 +119,11 @@ jobs:
           cp libbox.provenance "${GITHUB_WORKSPACE}/app/libs/libbox.provenance"
           ls -la "${GITHUB_WORKSPACE}/app/libs/"
 
+      # The gate that catches "this AAR is not from the revision we think" must itself
+      # be shown to reject; see the negative cases in that script.
+      - name: Provenance gate negative tests
+        run: python3 .github/scripts/test_check_core_provenance.py
+
       # Cache hits skip the build, so verify the artifact against the resolved
       # revision on every run, not only when it was just compiled.
       - name: Validate core provenance

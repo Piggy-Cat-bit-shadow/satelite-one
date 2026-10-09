@@ -43,6 +43,21 @@ jobs:
           # full history + tags: the release-notes step diffs against the previous tag
           fetch-depth: 0
 
+      # Make the app side of the evidence chain explicit instead of assumed. Actions
+      # checks out github.sha, so this asserts the contract: a misconfigured runner or a
+      # stale local tree fails here rather than producing an artifact whose
+      # build-info.json claims a revision it was not built from.
+      - name: Verify the checked-out app revision
+        run: |
+          set -euo pipefail
+          ACTUAL="$(git rev-parse HEAD)"
+          if [ "${ACTUAL}" != "${GITHUB_SHA}" ]; then
+            echo "::error::checked out ${ACTUAL} but this run is for ${GITHUB_SHA}"
+            exit 1
+          fi
+          echo "APP_COMMIT_FULL=${ACTUAL}" >> "$GITHUB_ENV"
+          echo "building app revision ${ACTUAL}"
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -157,6 +172,13 @@ jobs:
           cp libbox.aar "${GITHUB_WORKSPACE}/app/libs/libbox.aar"
           cp libbox.provenance "${GITHUB_WORKSPACE}/app/libs/libbox.provenance"
 
+      # A gate nobody has seen fail is not evidence. This exercises the rejection cases
+      # (AAR built from another revision = a cache collision, relabelled provenance,
+      # missing files, empty expected SHA, AAR without libbox.so) so a regression in the
+      # gate itself cannot silently pass a release.
+      - name: Provenance gate negative tests
+        run: python3 .github/scripts/test_check_core_provenance.py
+
       # The core's own provenance record is the single source of truth; it also
       # has to survive a cache hit, where no checkout exists.
       - name: Validate core provenance
@@ -194,6 +216,9 @@ jobs:
         run: |
           if [ -z "$KEYSTORE_B64" ]; then
             echo "::warning::签名 secrets 未配置, 本次 APK 使用 debug 签名"
+            # Recorded in build-info.json so nobody has to infer it later: a
+            # debug-signed artifact must never be presented as an unsigned RC.
+            echo "SIGNATURE_STATE=debug-signed" >> "$GITHUB_ENV"
             exit 0
           fi
           printf '%s' "$KEYSTORE_B64" | base64 -d > interstellar.jks
@@ -203,6 +228,7 @@ jobs:
             echo "keyAlias=${KEY_ALIAS}"
             echo "keyPassword=${KEY_PASSWORD}"
           } > signing.properties
+          echo "SIGNATURE_STATE=signed-by-user" >> "$GITHUB_ENV"
 
       - name: Verify tag matches version.properties
         if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
@@ -261,6 +287,7 @@ jobs:
             "app_version": "${VERSION_NAME}",
             "app_version_code": ${VERSION_CODE},
             "app_commit": "${GITHUB_SHA}",
+            "app_commit_full": "${APP_COMMIT_FULL:-${GITHUB_SHA}}",
             "app_ref": "${GITHUB_REF_NAME}",
             "core_repository": "${CORE_REPO}",
             "core_commit": "${CORE_SHA}",
@@ -269,6 +296,7 @@ jobs:
             "core_version_string": "${CORE_SHA}",
             "core_aar_sha256": "$(sha256sum app/libs/libbox.aar | awk '{print $1}')",
             "apk_arm64_v8a_sha256": "${APK_SHA}",
+            "signature_state": "${SIGNATURE_STATE:-unknown}",
             "build_time": "${BUILD_DATE}",
             "run_id": "${GITHUB_RUN_ID}"
           }
