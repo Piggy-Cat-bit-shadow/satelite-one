@@ -110,3 +110,28 @@ object CoreEngines {
         host: CoreHost,
     ): ProxyCore = SingBoxCore(platformInterface, host)
 }
+
+/**
+ * Run a synchronous teardown step, logging its failure instead of swallowing it.
+ *
+ * Two things this does NOT do, deliberately:
+ *
+ *  - it does not swallow [kotlinx.coroutines.CancellationException]. `runCatching` would,
+ *    and then a cancelled teardown would look like a completed one. These native calls
+ *    are synchronous, so a cancellation can only arrive *before* them — but if a binding
+ *    ever throws one from inside, it must propagate rather than be logged as success.
+ *  - it does not hide the difference between "closed" and "failed to close": the caller
+ *    decides, and [SingBoxCore] records the failure.
+ *
+ * @return the block's value, or null when it failed (the failure is logged).
+ */
+internal inline fun <T> closeReportingFailure(what: String, block: () -> T): T? {
+    return try {
+        block()
+    } catch (cancellation: kotlinx.coroutines.CancellationException) {
+        throw cancellation
+    } catch (error: Throwable) {
+        android.util.Log.w("InterstellarUI", "core teardown step failed: $what", error)
+        null
+    }
+}

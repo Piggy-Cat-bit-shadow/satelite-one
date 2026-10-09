@@ -35,8 +35,16 @@ class SingBoxCore(
 
     override suspend fun startup() {
         val server = CommandServer(this, platformInterface)
-        server.start()
+        // Staged ownership: publish the reference BEFORE start() can fail part-way. The
+        // previous order assigned `commandServer` only after a successful start(), so a
+        // throw from inside start() left a half-started CommandServer (and its socket)
+        // reachable from nothing at all - shutdown() saw a null field and returned.
+        // With the reference stored first, every failure path still has something to
+        // close, including the caller's `dispose after a partial start`.
         commandServer = server
+        server.start()
+        // A failure here leaves the server running but no bridge. That is a consistent
+        // state: shutdown() closes the server, and no caller ever saw a fact bridge.
         platformEvents = Libbox.newPlatformEvents(server)
     }
 
@@ -73,9 +81,12 @@ class SingBoxCore(
     override fun needWifiState() = commandServer?.needWIFIState() ?: false
 
     override fun closePlatformEvents() {
-        // Idempotent: a second call, or one after shutdown, is a no-op.
-        platformEvents?.let { events -> runCatching { events.close() } }
+        // Idempotent: a second call, or one after shutdown, is a no-op. The reference is
+        // cleared even when close() fails, so a retry cannot re-close a handle that
+        // already failed once and cannot keep it reachable from a dead generation.
+        val events = platformEvents ?: return
         platformEvents = null
+        closeReportingFailure("platformEvents.close") { events.close() }
     }
 
     override suspend fun shutdown() {
@@ -90,13 +101,22 @@ class SingBoxCore(
             )
         }
         val server = commandServer ?: return
-        runCatching {
-            server.closeService()
-        }.onFailure {
-            server.setError("android: close service: ${it.message}")
-        }
-        server.close()
+        // Clear the reference FIRST: whatever happens below, this generation is finished,
+        // and a failure must not leave a dead native handle reachable from applyConfig()
+        // or from a retry that would try to close it twice.
         commandServer = null
+        // Keep the original diagnostic text: a closeService failure must still surface the
+        // binding's message to the user-facing error path, not just to logcat.
+        try {
+            server.closeService()
+        } catch (cancellation: kotlinx.coroutines.CancellationException) {
+            throw cancellation
+        } catch (error: Throwable) {
+            closeReportingFailure("setError") {
+                server.setError("android: close service: ${error.message}")
+            }
+        }
+        closeReportingFailure("server.close") { server.close() }
     }
 
     // ---- CommandServerHandler → CoreHost ----
