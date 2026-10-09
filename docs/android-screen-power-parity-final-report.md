@@ -1,10 +1,19 @@
-# JiejieBox Android · 息屏 / 唤醒 / 省电链路收口报告（Round 7 Gate 4 补测 + Power）
+# JiejieBox Android · 息屏 / 唤醒 / 省电链路收口报告（Round 7 Gate 4 + Round 8 事实清理）
 
-> 施工对象：`Piggy-Cat-bit-shadow/satelite-one`（**唯一**被修改的仓库）
-> 起始 SHA：`58b83094f9a13594edc89467f419e5b0702b99ee`
+> 施工对象：`Piggy-Cat-bit-shadow/satelite-one`（**唯一**被修改的仓库），分支 `main`
+> 报告结构：**A–G 保留第七轮 Gate 4 与 Power 的原有证据**；第八轮在同一结构内**逐条更正
+> 矛盾**并追加实测（新增小节标 `C-1b` / `E-5d` / `E-7` / `E-8`）。
+> 第七轮起始 SHA：`58b83094f9a13594edc89467f419e5b0702b99ee`
+> **第八轮起始 SHA（= 第七轮最终 HEAD）**：`bffb8ad494fb06a0782c988c914d109f18bce5db`
+> **第八轮最终 HEAD**：见 F 节（`git rev-parse HEAD` 的实测值；本行刻意不预填 SHA，
+> 以免文档里的 SHA 与真实远端不一致）
 > 固定内核：`c35faabf402a4da93b8c31cdfad941b8b1528ffc`（**未改动**）
 > 版本：`versionCode=16` / `versionName=0.5.10`（**未改动**）
-> 本报告只写有证据的结论，范围标签见 G 节。
+> 本报告只写有证据的结论，范围标签见 G 节。所有 SHA / 时间 / 计数都是实际读出的值。
+>
+> **阅读提示（哪些内容属于哪一轮）**：A–B、C-2…C-5、D-0、E-1…E-3 是第七轮的证据，未改动
+> 或只做了带标记的更正；C-1 / C-1b / D-0b / D-1 / E-4…E-8 / F / G 含第八轮的更正与新增。
+> 标着 **`PENDING`** 的表格行表示对应的 CI 运行尚未返回 —— **未返回就是不写结论**。
 
 ---
 
@@ -60,7 +69,8 @@ git tag --list | wc -l                               → 15
 | Android 广播 | `PlatformFacts.install()` | `registerReceiver`（**不传 Handler** → 主 looper 派发）监听 `ACTION_SCREEN_ON` / `ACTION_SCREEN_OFF` / `ACTION_USER_PRESENT` |
 | Activity 生命周期 | `install()` | `registerActivityLifecycleCallbacks` → `ActivityForegroundTracker`（计数平衡，转屏不产生假后台沿） |
 | 内存压力 | `InterstellarApplication.onTrimMemory(level)` | 原值转发 `PlatformFacts.onMemoryTrim(level)` |
-| 本地事实缓存 | `ScreenFactState`（本轮新增）/ `appForeground` | 锁内单一入口 |
+| 初始屏幕读数 | `PlatformFacts.seedInitialScreen(readInteractive)` | **第八轮：唯一生产入口** —— 先取 `observationEpoch` → 再读平台 → epoch 未变才应用（见 C-1b） |
+| 本地事实缓存 | `ScreenFactState` / `appForeground` | 锁内单一入口；`onChanged` 返回**电平是否跳变**，`observationEpoch` 记录**是否被观测**（两个不同的问题，第八轮才分开） |
 | Session 入队 | `PlatformFacts.enqueue(target)` | 单消费者 `Channel(UNLIMITED)`，严格 FIFO |
 | 所有权检查 | 队列任务运行时 | `if (current?.id == target.id)` —— **在投递线程上、紧邻 native 调用之前**重校验 |
 | Native 调用 | `SingBoxCore` → `PlatformEvents` | `setScreenOn` / `setAppForeground` / `memoryTrim` / `reportDeviceWake` |
@@ -93,7 +103,12 @@ CommandServer  : close, closeService, pause, wake
 
 ## C. ROOT-CAUSE CLASSIFICATION
 
-### C-1 `CONFIRMED_BUG` — P0-A 初始屏幕快照的锁外写入
+### C-1 `FIXED_LATENT_CONTRACT_DEFECT` — P0-A 初始屏幕快照的第二写入者（第七轮）
+
+> **标签更正（第八轮）**：本节原标题是 `CONFIRMED_BUG`。按本节自己的可达性结论，它**不是**
+> 已确认的线上缺陷，而是**潜在契约缺陷**（latent contract defect）：代码声称了一道它并未实现的
+> 守卫。标签改为 `FIXED_LATENT_CONTRACT_DEFECT`，并见 C-1b —— 第八轮发现第七轮这道守卫
+> **本身也没成立**。
 
 **位置**：`PlatformFacts.install()`（旧 `screenOn = …isInteractive`）
 
@@ -108,8 +123,23 @@ CommandServer  : close, closeService, pause, wake
 给 receiver 加一个 Handler，或把 `install()` 挪到非主线程，它立刻变成活的。此外 `screenOn` 的
 快照写入是**锁外**的普通字段写，而广播路径在锁内 —— 同一条事实有两个不同步的写入者。
 
-**修复**：`ScreenFactState` 承载屏幕事实，广播与快照都只经其锁内入口；新增**版本号**，
+**修复（第七轮）**：`ScreenFactState` 承载屏幕事实，广播与快照都只经其锁内入口；新增**版本号**，
 `seedSnapshot(value, takenAt)` 只在"我读到它之后没有任何东西观测过屏幕"时才应用。
+
+> **第八轮更正（重要）**：上面这道守卫**当时并没有真正成立**，第七轮的测试也没有约束到生产
+> 接线。逐字复核 `PlatformFacts.install()` 的调用顺序是：
+>
+> ```kotlin
+> val interactive = context.getSystemService<PowerManager>()?.isInteractive ?: true
+> val (_, versionWhenRead) = screen.sample()          // 钥匙取在读之后
+> val applied = screen.seedSnapshot(interactive, versionWhenRead)
+> ```
+>
+> 于是（1）**钥匙取得太晚**：它已经包含了它本该去发现的那次观测；（2）**守卫量数错了东西**：
+> `onChanged` 只在电平真正跳变时自增，而一次**同值**广播（已经是 ON 时又来一条 SCREEN_ON）
+> 是更新的系统观测却不动这个计数。两个缺陷必须同时存在才会写坏事实，第七轮的 `A01` 把采样放在
+> 模拟事件**之前**，验证的是**理想用法**而不是 `install()` 的真实顺序 —— 这就是"JVM 绿、生产
+> 接线不受约束"的缺口。第八轮已按真实生产入口修复并补了驱动该入口的测试（见 C-1b 与 E-2）。
 
 **旧红 → 新绿**：
 - 破坏性对照：删掉版本守卫 → `A01` 变红（`the stale isInteractive seed overwrote the newer SCREEN_OFF fact`）；恢复 → 全绿。
@@ -154,8 +184,10 @@ CommandServer  : close, closeService, pause, wake
 `setScreenOn(boolean)` / `setAppForeground(boolean)` / `memoryTrim(int)` /
 `reportDeviceWake()` / `close()`（从产物常量池读出，非从源码推断）。
 
-**结论**：Android 客户端**无法**用现有 AAR 公开 API 表达独立 resume edge ——
+**结论（第八轮原样保留）**：Android 客户端**无法**用现有 AAR 公开 API 表达独立 resume edge ——
 `setScreenOn(true)` 只能更新一个**电平**，没有携带"这一次是新的 resume"的入口。
+本轮**没有**触碰 sing-box，也**没有**宣称 Apple 的 resume edge 已经移植；这里只保留
+`BLOCKED_BY_CORE_ABI` 与那份未来工单。
 
 **为什么不用 `CommandServer.wake()` 顶替**：该方法的语义可能是**解除设备暂停**，而不只是记录
 `Resumed`。在锁屏未解锁时用灯亮去调用它，会提前唤醒一个仍然锁屏的设备 —— 正是施工令 §7.1 禁止的
@@ -181,7 +213,64 @@ CommandServer  : close, closeService, pause, wake
 | 真机（OEM 深度省电、蜂窝、实体热点、长 Doze） | 无可用真机 → `DEVICE_NOT_TESTED` |
 | VPN `onRevoke` | 无 shell 可达路径（`am broadcast` 被平台拒绝，`result=0`）→ `BLOCKED` |
 | 强制 Doze | 需改动系统状态，未在未授权设备上执行 |
-| Gate 4-B 息屏基线 + T01–T12 | **本段未执行**，见 F 节 |
+| Gate 4-B 息屏基线 + T01–T12 | 第七轮本段未执行；**第八轮已补跑**，逐项判定见 D-1 |
+| 息屏期间注入触摸（T10） | 显示屏关闭时注入触摸被显示控制器丢弃 → **手段不可行**，不是"场景永远不可测" |
+| 解锁沿（T04/T06） | 本 AVD 无锁屏（`locksettings get-disabled=true`），且 `ACTION_USER_PRESENT` 是受保护广播，shell 身份发不出 |
+
+---
+
+### C-1b `FIXED_LATENT_CONTRACT_DEFECT` — 第八轮 P0：取样时序 + 守卫量（已修）
+
+**位置**：`PlatformFacts.install()` / `ScreenFactState`（commit `481e370`）
+
+**可达性（必须说准确）**：`registerReceiver` 不传 `Handler`，广播在主 looper 派发，而
+`Application.onCreate` 本就占着主 looper，所以**这个交错在今天的调用路径上不可达**。
+本轮**没有**发现线上用户发生过息屏断流，也不这样宣称。它是**契约缺陷**：代码声称了一道它
+并未实现的守卫，一旦给 receiver 加 `Handler` 或把 `install()` 挪到非主线程，守卫立刻变成装饰。
+
+**同值广播分支（第二条缺陷，逐字场景）**
+
+```text
+初始状态默认 ON, epoch=0
+T1 采样 epoch=0，且调用方此前读到、与现状矛盾的旧平台快照 OFF
+T2 收到新的 SCREEN_ON 广播，值仍 ON（电平不变）
+T3 旧实现 onChanged(ON) 不递增计数
+T4 seedSnapshot(OFF, 0) 通过守卫 → 把最近一次观测覆盖成 OFF
+```
+
+**关键不变式**：`snapshot` 是否有效，取决于**自取样以来有没有"新的屏幕观测"**，
+而不是**电平有没有变化**。
+
+**修复**（三件事，缺一不可）
+
+1. 生产算法收进**唯一**入口 `PlatformFacts.seedInitialScreen(readInteractive)`：
+   **先取 epoch → 再读平台 → epoch 未变才应用**。
+2. 守卫量改为 `observationEpoch`：**任意真实屏幕广播都自增**（含同值）。
+3. `onChanged` 仍返回"电平是否跳变"（`(unchanged)` 日志与交付侧语义不变），
+   `version` 不再承重**已删除** —— 本轮净减一个并发状态量。
+
+**旧红 → 新绿（断言原文，来自实际运行）**
+
+| 编号 | 修前 RED 断言原文 | 修后 |
+|---|---|---|
+| `S02` | `a reading superseded by a broadcast was still applied` | 绿 |
+| `S10` | `the startup reading was applied over an OFF observed before it returned` | 绿 |
+| `S03` | `a repeated observation must still advance the epoch` | 绿 |
+| `S07` | `100 observations must advance the epoch by exactly 100, got 1` | 绿 |
+| `A04b` | `it is still an observation, so the epoch moves` | 绿 |
+
+RED 的取得方式可复核：用 `round8/mutate.py` 把**生产源码**字节级改回旧形状（`onChanged`
+只在跳变时自增 + `seedInitialScreen` 改回"先读后取钥匙"），跑全量 `:app:testDebugUnitTest`
+得 **210 tests / 5 failed**；恢复修复版（sha256 校验一致）后 **210 / 0 failed**。
+
+**`A04b` 是改写语义而不是放松断言**：它原来断言"同值观测**不得**自增版本"，理由是"无关的重复
+广播会让仍然当前的读数看起来过期而被静默丢弃"。这个理由方向反了 —— 重复广播**就是**比该读数
+更新，丢掉它才是正确结果；保留旧断言等于保留它所庇护的洞。
+`ScreenSeedWiringTest.S03` / `S12b` 是该洞的破坏性对照。
+
+**注意结论范围**：`PlatformFacts` 的 `lock` 与 `ScreenFactState` 的内锁是**顺序调用、不嵌套**，
+锁顺序审计无反向嵌套；`attach()` 的初始状态、`onScreenChanged()`、`seedInitialScreen()` 共用
+同一个事实来源，没有影子 `screenOn` 状态。
 
 ---
 
@@ -189,8 +278,13 @@ CommandServer  : close, closeService, pause, wake
 
 ### D-0 本段真正跑过的设备项（有日志证据）
 
-在 round-7 代码（`7275c0f` 的 APK，即 CI run `37985013617` 的二进制）已连接状态下，
-用 `input keyevent 26` 真实驱动屏幕，`dumpsys power` 确认 `mWakefulness` 在
+**身份先写清楚，再写观察**（第七轮此处把"`7275c0f` 代码"和"run `37985013617` 的 APK"
+混进了一句话）：本段观察来自 **App SHA `58b83094f9a13594edc89467f419e5b0702b99ee` → CI run
+`37985013617` → x86_64 APK sha256 `53bcc3994eaea10cf500625e392ffb0f395cef45230dd388f54a523e92d55c76`
+→ 实测时间窗 2026-10-09 当日**。该 APK 的代码**早于** `7275c0f`，因此它**不具备**
+`ScreenFactState` 与 `(unchanged)` 日志 —— **不能用它当作新版这类日志的设备观测证据**。
+
+在该二进制已连接状态下，用真实电源键驱动屏幕，`dumpsys power` 确认 `mWakefulness` 在
 `Awake` ↔ `Asleep` 之间切换。
 
 | 观察 | 结果 |
@@ -198,13 +292,16 @@ CommandServer  : close, closeService, pause, wake
 | `SCREEN_OFF` 被采集 | **是** —— `platform fact: screen=false attached=true` |
 | App 前后台沿也被采集 | **是** —— `foreground=false`（息屏）与 `foreground=true`（亮屏） |
 | **事实顺序正确** | 每轮 OFF/ON 各产生 **一对** 事实，无颠倒、无重复：`screen=false` → … → `screen=true` |
-| `debugFact` 的 "unchanged" 标记**未出现** | 说明每次都是**真实跳变**，不是重复同值观测 —— 这正是 `A04b` 断言的设备侧对照 |
+| `debugFact` 的 "unchanged" 标记 | **该二进制没有这条日志**（`(unchanged)` 与 `ScreenFactState` 同在 `7275c0f`，晚于本 APK）。第七轮把它当作"未出现即真实跳变"的对照是**无效推断**，本版删除该结论 |
 | 隧道在息屏期间存活 | **是** —— 息屏 43 s 后 `tun0=1`、pid 存活、通知恰好 1、FGS 1 |
 | **未出现重连风暴** | **是** —— 屏幕事件期间 `startProxy invoked` 与 `core STARTED` **均为 0 次** |
 | 亮屏后无错误唤醒 | 同上：只有一对事实，没有附加动作 |
 
 **G4（息屏不得仅因事件本身断开活跃流）的证据强度**：隧道与进程在息屏 43 s 后完好，
 且**没有**任何由屏幕事件触发的重连 —— 这两条是直接证据。
+**第八轮在同一 AVD 上用 8 轮真实 OFF/ON 复测**：每轮恰好一对事实、无颠倒无重复、
+屏幕事件期间 `startProxy invoked` = 0、`core STARTED` = 0，整段结束后 `tun0` 仍在、pid 与
+FGS/通知唯一。
 
 **未能取得的证据（因此不写 PASS）**：息屏期间**活跃业务流是否连续**。
 原因：该窗口内**出口记录 0 条连接**，即根本没有流量尝试穿过隧道，所以"流被保住"无从证明。
@@ -228,8 +325,23 @@ CommandServer  : close, closeService, pause, wake
    算出 **0 的假阴性**。本次是靠**时间戳**（t≈12274 s 落在窗口内）才判对的。凡用该日志做增量统计，
    都必须改用时间戳区间，不能用计数差。
 
+**第八轮复核**：本轮的出口证据来自一个**不会轮转**的记录型 TCP 转发器（宿主
+`10.0.2.2:18082` → `127.0.0.1:18080`，`.debug` 包的节点端口临时改到 18082，测完已改回），
+所以可以按**时间戳区间**判定，不再依赖行数相减。两个窗口（60 s / 180 s，App 退后台且屏幕
+点亮）内确实有隧道路径流量，但**全部来自 App 自己**：`www.gstatic.com:443` 是 urltest 健康
+检查、`1.1.1.1:443` 是它自己的 DoH DNS 出口。
+
+- ✅ 再次证明：App 退后台（`foreground=false`）而屏幕点亮时隧道**存活并继续承载流量**、
+  `screen` 事实**不跟着变**、屏幕本身**不触发重连**。
+- ❌ **没有**复取到"**其它 App** 的流量穿过隧道"：这 180 s 内没有任何 GMS 连接（:5228 等）。
+  第七轮曾在另一个时间窗取到 4 条 GMS CONNECT 并据此把 T08 记为 PASS —— 那是**那一个窗口**
+  的证据，第八轮不重复声称。
+- 尝试补取的方式是把 Chrome 走完首次运行引导后加载 `https://example.com/`：Chrome 触发了约
+  40 条 `1.1.1.1:443` 的隧道路径连接，但**没有一条以 `example.com` 为目标**，本地 SOCKS 出口
+  无法证明端到端可达。如实记为未复取，不写成 PASS，也不写成产品缺陷。
+
 **结论**：这一项需要**真机 + 真实前台业务流（下载/通话/热点）**才能测，属
-`REAL_DEVICE_PENDING`，在模拟器上标 `NOT_RUN` 是准确的，不该用间接证据冒充。
+`REAL_DEVICE_PENDING`；在模拟器上标 `NOT_RUN` 是准确的，不该用间接证据冒充。
 
 
 ### D-1 T01–T12
@@ -251,7 +363,20 @@ CommandServer  : close, closeService, pause, wake
 | T11 | 应用被系统结束后重启 | **PASS** | `am kill` 被**拒绝**（应用持有前台服务，实测 pid 不变）；改用 `am force-stop`：pid 消失、`tun0=0`、通知 0（资源全部释放），重新拉起 pid 变化，启动时事实正确上报 `screen-seed=true` 与 `foreground=true`，`attached=false`（内核确实尚未启动）。0 crash |
 | T12 | UI 旋转多次后后台/亮屏/解锁 | **N/A（不可旋转）** | `AndroidManifest.xml` 中 `MainActivity` 为 `android:screenOrientation="portrait"`，`requestedOrientation=SCREEN_ORIENTATION_PORTRAIT`；驱动 6 次 `user_rotation` 后**没有**产生任何配置变更或前后台事实，因为该 Activity 不参与旋转。转屏计数的逻辑由 `ActivityForegroundTracker` 的 JVM 测试覆盖（计数平衡、"先减再判"）。**该项在本构建上不适用**，不是未测 |
 
-**功耗**：`POWER_NOT_QUANTIFIED`。无对照功耗样本，不写"省电 X%"，不伪造电量。
+**第八轮对 D-1 的逐项修正**
+
+| 项 | 第七轮说法 | 第八轮修正后的准确说法 |
+|---|---|---|
+| T05 | BLOCKED（充电不进入 Doze） | **BLOCKED 的范围是 Doze / Deep Idle 进入**。充电时不进入 Doze ≠ 不能做任何较长息屏；"长息屏下持续联网"是另一件事，本轮未做，不与 Doze 混为一谈 |
+| T08 | PASS | **本轮未复取到"其它 App"的流量**（见 D-0b 修订），改标 `NOT_RUN_THIS_ROUND`；第七轮那一个窗口的证据作为历史保留 |
+| T10 | NOT_RUN（方法不可行） | 保留 `NOT_RUN`，并明确**这是"当前注入手段不可行"，不是"整个场景技术上永远不可测试"**；真机或合法的通知栏控制路径可以另测 |
+| T11 | PASS | 降为 **`PARTIAL`（范围＝`am force-stop`）**：它验证的是"强制停止后的资源释放与手动重启"，**不等于** Android 系统低内存进程回收后的自动恢复 |
+| T12 | N/A（不可旋转） | 保留 N/A，并**分开陈述**另一半：`ActivityForegroundTracker` 的生命周期计数逻辑**已有 JVM 覆盖**（计数平衡、"先减再判"） |
+| T04 / T06 | BLOCKED | 保留 BLOCKED，补上第二条独立证据（受保护广播 `SecurityException: not allowed to send broadcast … from uid=2000`） |
+
+**功耗**：**`POWER_BENCHMARK_NOT_REQUIRED`** —— 用户已明确取消百分比 / 精细 CPU-RSS /
+耗电曲线专项量化。这**不是**未完成技术债，也**不等于**放弃真机稳定性验证（后者见 G-1）。
+第七轮写的 `POWER_NOT_QUANTIFIED` 已按用户决定改写。
 
 
 ---
@@ -270,7 +395,7 @@ CommandServer  : close, closeService, pause, wake
 | artifact 内 `SHA256SUMS.txt` | `53bcc399…  ./satelite-one-x86_64-debug.apk` → **一致** |
 | APK 内 `lib/x86_64/libbox.so` | `84 472 616` B，sha256 `f0ae9c726f8a2088a1f2e4f11ebc2ffd2947be66a0e2dda84b1d9136a7cf94c6` |
 | 该 `libbox.so` 含 pin | **1 处** |
-| 缓存 | 该 run 的 `Cache libbox.aar` = **Cache not found** → 内核是真构建出来的 |
+| 缓存 | 该 run 的 `Cache libbox.aar` = **Cache not found** → 这一次内核是**真从源码构建**的 |
 | **未使用** | 本地拼装 AAR、dex→jar、stub `classes.jar`、round-6 旧 APK |
 
 ### E-2 Gate 4-A 设备验收（`emulator-5554`，Android 16 / API 36 / x86_64）
@@ -307,6 +432,12 @@ CommandServer  : close, closeService, pause, wake
 
 > 自我纠正：最初我把"每轮只有 1 次 `startProxy`"误读为"第二次点击丢失"。核对 stop 路径日志后
 > 确认每轮**本应**只有 1 次（第一次点击是 Disconnect，不调 `startProxy`）。记录在此以免被当成缺陷。
+>
+> **第八轮更正（方法层面）**：这一段（以及 E-5c 的候选复测）用的是"两次固定坐标裸点击、
+> 点击之间不取样"的脚本。用 `logcat -d` 做**行数相减**来数 `startProxy` 的次数本身是不可靠的
+> —— `logcat -d` 只返回环缓冲**剩余**内容（当时 main 缓冲 2 MiB，实测一分钟就被系统刷掉），
+> 长周期里会算出 0 甚至**负增量**。第八轮改为"只扫描本轮标记之后的行"，并同时统计
+> `core STARTED`，才对得上。
 
 ### E-4 JVM 原样命令与结果
 
@@ -321,8 +452,35 @@ gradlew.bat --no-daemon --max-workers=2 --console=plain :app:testDebugUnitTest :
 
 | 类 | 变化 |
 |---|---|
-| `ScreenFactOrderingTest` | **新增 15 例**：A01 陈旧快照必须被拒 / A02 正常顺序 / A03 启动即息屏 / A04 幂等 / A04b 只有真实跳变才递增版本 / A05 完整事件流 / A06 100 次交替 / A07 旧形状破坏性对照 / B01 屏幕处理文件不得调用 wake/pause / B02 不得含重连与定时原语 / A08+A09 install 闩（含 8 线程×200 轮）/ **E01** 网络路径不得触及唤醒事实 / **E02** reportDeviceWake 唯一产生点且必须是 USER_PRESENT / **E03** 屏幕处理文件不得重建隧道/ **E01** 网络路径不得触及唤醒事实 / **E02** reportDeviceWake 唯一产生点且必须是 USER_PRESENT / **E03** 屏幕处理文件不得重建隧道 |
+| `ScreenFactOrderingTest` | **新增 14 例**（第七轮）：A01 陈旧快照必须被拒 / A02 正常顺序 / A03 启动即息屏 / A04 幂等 / A04b 计数语义 / A05 完整事件流 / A06 100 次交替 / A07 旧形状破坏性对照 / B01 屏幕处理文件不得调用 wake/pause / B02 不得含重连与定时原语 / A08+A09 install 闩（含 8 线程×200 轮）/ E01 网络路径不得触及唤醒事实 / E02 reportDeviceWake 唯一产生点且必须是 USER_PRESENT / E03 屏幕处理文件不得重建隧道 |
 | `PlatformFactsTest` | **+4 例**：B 在 A 被 drain 期间保持绑定并继续收事件 / 不可证明的 drain 必须返回 false 且不挂死（真实 5 s 超时路径）/ 全部 trim 级别原样按序到达 / detach 后不再收到 trim |
+
+> **重复行已清除**：第七轮这里的 `E01/E02/E03` 曾被**重复列了一遍**，本版删掉重复，只保留
+> 一次；`195` 与 `192` 两个数字并存的矛盾也在本节与 G 节统一为实测值（见下方第八轮数字）。
+
+**第八轮 JVM 实测（最终 HEAD）**
+
+```
+gradlew.bat --no-daemon --max-workers=2 --console=plain :app:testDebugUnitTest :app:compileDebugKotlin :app:verifyCoreProvenance
+→ exit 0
+```
+
+| 项 | 值 |
+|---|---|
+| 用例总数 | **210 PASS / 0 FAIL / 0 ERROR / 0 SKIP** |
+| 测试类数 | **20** |
+| `:app:verifyCoreProvenance` | `OK — packaged libbox carries the advertised core identity 'c35faabf402a4da93b8c31cdfad941b8b1528ffc'` |
+
+逐类：`ActivityForegroundTracker 10 · CoreLifecycle 18 · InterfaceListenerRegistry 11 ·
+InterfaceResolutionEpoch 8 · NotificationPublishGate 9 · PlatformFacts 20 ·
+RestartOwnership 9 · ScreenFactOrdering 15 · **ScreenSeedWiring 15（新）** ·
+StopConvergence 13 · LogRingBuffer 18 · TeardownFailure 4 · MinimalConfigBuilder 10 ·
+AppUpdateChecker 3 · SubscriptionFetcher 10 · RawConfigDetector 6 · LogUiPublishGate 8 ·
+SessionGate 11 · TrafficDisplay 7 · UrlTestTarget 5` ＝ **210 / 20 类**。
+
+数字沿革（此前 `195`/`192` 并存属更新遗漏）：第七轮起始 `58b8309` = 176 / 18 类 →
+第七轮最终 = **195 / 19 类**（`192` 作废）→ 第八轮起始 `bffb8ad` = 209 / 19 类 →
+**第八轮最终 = 210 / 20 类**。
 
 ### E-5 破坏性对照汇总
 
@@ -353,12 +511,22 @@ gradlew.bat --no-daemon --max-workers=2 --console=plain :app:testDebugUnitTest :
 | `libbox.so` 大小 | 84 472 616 B | **84 472 616 B** |
 | 含 pin | 1 处 | **1 处** |
 
-**这是"同一 core、不同时期客户端"的字面证明**：两个包里的内核共享库**逐字节相同**，
-所以任何行为差异都只能归因于 App 代码，而不是内核。APK 本身当然不同（App 代码变了）。
+**这是"同一 core、不同时期客户端"的字面证明**：两个包里的内核共享库**逐字节相同**。
 
-**候选 APK 的 App SHA 与最终 HEAD 的关系（身份精确性说明）**：候选构建落在 `1efaa8f`；
-此后 HEAD 前进到 `cae13dd`，但两者之间 `app/src/main` 的**改动文件数为 0**（只有 `docs/`
-下的报告在变）。所以候选二进制**就是**当前产品代码的产物 —— 没有改名、没有贴新 SHA。
+> **第八轮更正（科学边界）**：第七轮在这里写了"所以**任何**行为差异都只能归因于 App 代码"，
+> 这句话**越界**。逐字节相同只**排除**了"核心 `.so` 字节差异"这一个原因；两次运行之间还有
+> **模拟器调度、UI 操作方式、脚本探针、网络状态、日志取样方式**等变量。第八轮 P1 的结论恰恰
+> 证明其中**驱动方式**才是决定性的（同一二进制：裸点击脚本 19/20 → 语义驱动 20/20）。
+> 正确表述是"同核只排除核心字节差异，其余变量必须逐项控制"。
+
+**候选 APK 的 App SHA 与最终 HEAD 的关系（身份精确性说明，第八轮更正）**：候选构建落在
+`1efaa8f`；此后 HEAD 前进到 `cae13dd` 时，两者之间 `app/src/main` 的改动文件数为 0（只有
+`docs/` 在变）—— 这句话**对 `cae13dd` 当时成立**。
+
+**但对第八轮最终 HEAD 不成立**：第八轮 P0 修复（`481e370`）改了
+`app/src/main/java/com/interstellar/proxy/bg/PlatformFacts.kt` 与 `ScreenFactState.kt`。
+因此 **`1efaa8f` 的设备证据属于"修前"包**；本轮修复后的包必须重新上机（见 E-5d / E-9）。
+`git diff --name-only 1efaa8f..HEAD -- app/src/main` 的实测输出正是这两个文件。
 
 ### E-5c Gate 4-B 设备复测：候选 APK 在同一 AVD 上的回归
 
@@ -382,17 +550,62 @@ gradlew.bat --no-daemon --max-workers=2 --console=plain :app:testDebugUnitTest :
 | 出口流量 | 候选会话内出口记录增至 **270** 条 CONNECT（压力前 206），最后一次为 `142.250.96.188:5228` |
 
 **与 baseline 的对比**：baseline 20/20 全 `Started`；候选 19/20。
-**对那一轮的解读（不当作产品缺陷，也不掩盖）**：该轮最终是 `STOPPED` 而非"卡在 `Starting`"，
+**第七轮对那一轮的解读（保留原文，未被删除）**：该轮最终是 `STOPPED` 而非"卡在 `Starting`"，
 即**不是**第七轮修的那类滞留；两轮各只产生 1 次 `startProxy`，与"Disconnect 在 Start 之前
 已被处理"（正确的串行化）一致。最合理的解释是**测试方法**：脚本在固定坐标点两下，
 若第一下之后 UI 已经翻到 `Start proxy` 而应用仍在收尾，第二下会被读作又一次 Disconnect。
 **证据不足以断言**，因此记为 `1/20 未收敛` 的事实，不写"通过"，也不写成 P0。
+
+**第八轮已定因（见 E-5d）**：把驱动换成**语义驱动**后，同一二进制 `1efaa8f` 跑到 **20/20**。
+因此 `19/20` 归因为 **`UI_DRIVER_ARTIFACT`（探针缺陷）**；第七轮那次 `19/20` 的事实**保留在
+本报告中**，不因为本轮变好就从历史里抹掉。
 
 **顺带纠正两个测量假象**（都不是产品问题）：
 - `node=None` 是**脚本探针**的缺陷 —— 它只匹配以 `SOCKS` 结尾的文本，而应用把节点命名为
   `Local subscription`，所以节点存在时也打印 `node=None`；
 - 通知计数在连续三次取样中给出 1/1/2，是 `dumpsys notification` 同一记录被多行匹配导致的
   已知假象；`grep -c` 的口径下为 1。
+
+### E-5d 第八轮设备回归（语义驱动，同一 AVD / 同一候选包 `1efaa8f`）
+
+**驱动方式的改变**：不再用固定坐标裸点击。每轮先 `uiautomator dump`，按**文本**定位
+`Disconnect` / `Start proxy` 节点，取**可点击祖先**的 bounds 中心点击，并**确认标签真的翻转**
+后才进行下一步；同时统计 `startProxy invoked` 与 `core STARTED`，并核对 TUN / FGS / 通知归属。
+
+| 组 | 轮数 | 结束于 `STARTED` | 未收敛 | 每轮 `startProxy` | 每轮 `core STARTED` | crash / ANR |
+|---|---|---|---|---|---|---|
+| 语义组（确认后点击） | 20 | **20 / 20** | 0 | 恰好 1 | 1 | 0 / 0 |
+| 裸点击组（保留第七轮形状） | 20 | **20 / 20** | 0 | ≥1（受日志轮转影响，见下） | — | 0 / 0 |
+| 修正计数探针（语义） | 20 | **20 / 20** | 0 | **20/20 恰好 1** | **20/20 恰好 1** | 0 / 0 |
+
+耗时：STOP 确认约 2.58–3.03 s、START 确认约 3.99–9.47 s；结束时 pid 不变、`tun0=1`、
+FGS 记录 1、通知 1。
+
+**归因（据本轮证据，不据推测）**
+
+1. **不是产品侧 Stop/Start 竞态**：60 轮无一轮停在 `Starting`、无旧代覆盖新代、无"收到 Start
+   却保持 Stopped"。
+2. **不是 `startProxy` 丢失**：计数正确的 20 轮里每轮恰好一次 `startProxy invoked` 且恰好一次
+   `core STARTED`（Disconnect 那一击本就不调 `startProxy`）。
+3. **差别在驱动方式**：同一二进制在语义驱动下 20/20 → 第七轮那 1 轮 `STOPPED` 归为
+   `UI_DRIVER_ARTIFACT`。
+4. **修正我自己第一版探针的计数假象**：用两次 `logcat -d` 总数相减曾得到 `x0` 甚至 `x-1`
+   （环缓冲会刷掉旧行）。改成"只扫描本轮标记之后的行"后计数稳定。
+
+**同一 AVD 上的屏幕事实复测（8 轮真实 OFF/ON）**
+
+| 观察 | 结果 |
+|---|---|
+| 每轮 OFF→ON 事实成对 | **6/6 逐条列出 + 后 2 轮同形状**，无颠倒、无重复 |
+| 设备侧 `mWakefulness` | 每轮 `Asleep → Awake`，与事实同向 |
+| 屏幕事件期间的 `startProxy invoked` / `core STARTED` | **0 / 0** —— 屏幕本身不触发重连 |
+| 整段之后的归属 | `tun0=172.19.0.1/30`、pid 不变、FGS 1、通知 1 |
+| `logcat -b crash` / 权威 ANR | 空 / **0** |
+
+> **方法坑（记录备查）**：`input keyevent 26`（POWER）是**切换**键，连按两次**不保证显示屏
+> 回来** —— 第一版探针因此 6 轮里只看到 OFF、看不到任何 ON 事实。改用 `keyevent 224`
+> （WAKEUP）后每轮成对。这不是产品漏报 ON，是探针按错了键。另一个坑是 `logcat -d` 的环缓冲
+> （见上）。
 
 ### E-6 CI：同一 SHA 的两种结果，把原因锁死在上游
 
@@ -417,24 +630,76 @@ gradlew.bat --no-daemon --max-workers=2 --console=plain :app:testDebugUnitTest :
 **这正是第七轮那个 `core_ref` 输入要解决的问题**，而本轮给出了它的对照证据：
 同 SHA 下，固定 pin 的 dispatch **全绿**，跟随 `testing` 的 push **全红**。
 本轮 195 个单元测试、provenance 门禁负例、发布门禁检查、APK 组装与内核身份校验，
-都是在 `core_ref=c35faabf…` 的 dispatch 里真跑并通过的（且该 run 的 `Cache libbox.aar`
-为 **Cache not found**，内核是真构建的，不是缓存放行）。
+都是在 `core_ref=c35faabf…` 的 dispatch 里真跑并通过的。
 
-**未取回**：最终 HEAD `017fff7f` 的 push 触发的 run `37997303557` 在写本报告时仍
-`in_progress`。按上表规律它会在同一处失败。**不声称它通过。**
+> **缓存表述更正（第八轮）**：**`37994573941`（候选那一次）的 `Cache libbox.aar` 是
+> `Cache hit`（命中缓存）**，真正 **`Cache not found` 并从源码构建完整 AAR** 的是
+> `37985013617`。第七轮把两者混为一谈。两者的结论都要分开说清楚：
+> **provenance PASS ≠ cache MISS**；候选那一次虽然用了缓存 AAR，但它的
+> `Validate core provenance` 与 APK 内核身份校验**是真实通过的**，二者都成立、互不替代。
+> 因此**不得**继续声称"候选 run 重新编译了 libbox"。
+
+**未取回（第七轮原文，保留）**：最终 HEAD `017fff7f` 的 push 触发的 run `37997303557`
+在写第七轮报告时仍 `in_progress`。
+
+**第八轮的处理**：本轮**没有**可用的 Actions 读取通道来复查该 run 的当前状态，因此
+**既不声称它通过、也不声称它失败**；第七轮的"按规律会失败"属于推断，不作为本轮结论。
+
+**push 流水线的现状（第八轮变更）**：`.github/workflows/android-ci.yml` 已改为**仅手动
+`workflow_dispatch`**（commit `f2cde01`，用户明确要求节省 Actions 额度）。因此从 `f2cde01`
+起，push **不再触发** Android CI。这是一条**有意引入的行为变更**，**不是**"CI 变绿了"，
+也**不是**"问题消失了"。回退方式：把 `push: branches: ['**']` 与 `pull_request:` 加回 `on:`。
+
+### E-7 第八轮固定 pin CI（唯一一次手动运行）
+
+| 项 | 值 |
+|---|---|
+| Run ID / 触发方式 | `PENDING` / `workflow_dispatch(core_ref=c35faabf402a4da93b8c31cdfad941b8b1528ffc)` |
+| `head_sha` | `PENDING` |
+| 结论 | `PENDING` |
+| Artifact 名 | `PENDING` |
+| Artifact ZIP sha256 | `PENDING` |
+| 装机 x86_64 APK sha256 | `PENDING` |
+| artifact 内 `SHA256SUMS.txt` | `PENDING` |
+| APK 内 `lib/x86_64/libbox.so` | `PENDING` B，sha256 `PENDING`，含 pin：`PENDING` |
+| `Cache libbox.aar` | `PENDING` |
+| `Unit tests` | `PENDING` |
+| `Assemble debug APK and verify the packaged core identity` | `PENDING` |
+
+> **缓存口径**：`cache hit` 只说明 AAR 复用了缓存，**不**说明"这次重新编译了内核"；
+> 命中时仍然通过 `Validate core provenance` 与 APK 内 `libbox.so` 的字节身份来约束真实性。
+> 两种情形在本表中分别写明，不混用。
+
+### E-8 第八轮本地产物核验（不依赖 CI 即可复核）
+
+| 检查 | 命令 | 结果 |
+|---|---|---|
+| 本地 AAR 是否为真内核 | `python .github/scripts/check_core_provenance.py app/libs/libbox.aar app/libs/libbox.provenance c35faabf…` | **exit 0**，`OK: libbox.aar (29217593 bytes) carries core revision c35faabf…` |
+| AAR 内 `.so` 身份 | 解压 AAR 取 `jni/x86_64/libbox.so` | `84 472 616` B，sha256 `f0ae9c726f8a2088a1f2e4f11ebc2ffd2947be66a0e2dda84b1d9136a7cf94c6`（与第七轮两个 APK 内**逐字节相同**） |
+| 打包身份门 | `:app:verifyCoreProvenance` | **PASS**：`packaged libbox carries the advertised core identity` |
+| provenance 门负例 | `.github/scripts/test_check_core_provenance.py` | **exit 0**，9 个负例全被拒 |
+| 发布门静态检查 | `.github/scripts/test_release_publish_gate.py` | **exit 0**，`all checks passed` |
+
+因为本机 `app/libs/libbox.aar` **就是真实固定 pin 内核**（非 stub），本轮**没有**、也**不需要**
+再尝试"真 `.so` + stub `classes.jar`"拼装 —— 那条路第七轮已证明会以
+`kotlin.NotImplementedError: stub at Libbox.setup` 崩溃。
+
+---
 
 ## F. GIT FINAL
 
 | 项 | 值 |
 |---|---|
-| 起始 SHA | `58b83094f9a13594edc89467f419e5b0702b99ee` |
-| 本段 commit | `7275c0f` fix(android): 初始屏幕读数不得覆盖更新的屏幕事实<br>`32cc6cc` test(android): 锁定 fact-bridge 交接与不可证明的 drain（P0-C）<br>`a5a6783` test(android): 证明每个 trim 级别原样转发（P1-D） |
+| 起始 SHA（本轮） | `bffb8ad494fb06a0782c988c914d109f18bce5db` |
+| 第七轮起始 SHA | `58b83094f9a13594edc89467f419e5b0702b99ee` |
+| **第八轮 commit** | `481e370` fix(android): invalidate stale screen snapshots by observation epoch, taken before the read<br>`15c432d` test(android): pin the screen seed wiring, the same-value observation and the pre-read epoch<br>`f2cde01` ci: run the Android dev CI only on manual dispatch |
+| 第七轮 commit（`58b83094..bffb8ad`，共 14 条，此前只列了 3 条） | `7275c0f` 源码+测试：初始屏幕读数不得覆盖更新的屏幕事实<br>`32cc6cc` 测试：fact-bridge 交接与不可证明的 drain（P0-C）<br>`a5a6783` 测试：每个 trim 级别原样转发（P1-D）<br>`ffbd6aa`/`50140a8`/`c969126`/`fa5fb04`/`cae13dd`/`59b03f1`/`2b206cd`/`017fff7`/`dc80505`/`bffb8ad` 文档：A–G 报告、息屏设备证据、P1-E、候选身份链、Gate 4-B 回归、T01–T12 矩阵、CI 定位到 upstream、T08 凭流量升为 PASS |
 | 推送方式 | **普通 fast-forward**，无 force、无历史重写 |
 | 远端一致性 | `origin/main` == HEAD |
 | 远端分支 | **仅 `main`**；未新建、未重建旧远端分支 |
 | `branch-archive` | **未删除、未改动** |
-| 开发 CI 默认来源 | **NO**（`CORE_BRANCH: testing` 未动） |
-| 手动固定 `core_ref` 路径 | **NO**（未动） |
+| 开发 CI 默认来源 | `CORE_BRANCH: testing` **未动**；但**触发方式**改为**仅手动**（`f2cde01`，用户明确要求） |
+| 手动固定 `core_ref` 路径 | **未动**（输入、40 位 SHA 校验、缓存 key 逻辑逐字不变） |
 | 正式 `coreCommit` 路径 | **NO**（`version.properties` 0 行改动） |
 | 内核仓库改动 / push | **NO** |
 | Tag / Release / 生产签名 / 正式发布 | **NO / NO / NO / NO**（Debug 测试签名允许且已用） |
@@ -447,22 +712,26 @@ gradlew.bat --no-daemon --max-workers=2 --console=plain :app:testDebugUnitTest :
 | 标签 | 判定 |
 |---|---|
 | `GATE4_EMULATOR_PASS` | ✅ **（部分）** 新代码 + 真实固定 pin 内核在 API36 x86_64 AVD 完成 导入 → 连接 → 真实业务流 → 20 轮 Stop/立即 Start（0–100 ms）→ 干净归属 的闭环。未覆盖：通知栏 Stop 后立即 Start、Start 失败穿插 Stop、`onRevoke`（`BLOCKED`） |
-| `ANDROID_SCREEN_FACTS_VERIFIED` | ✅ **（部分）** 屏幕事实的**顺序与所有权**由 JVM 确定性测试证明（192 例），且已取得**设备侧对照**：SCREEN_OFF/ON 各产生一对事实、顺序正确、无重复（`unchanged` 标记未出现）、息屏 43 s 后隧道与归属完好、屏幕事件期间 **0 次** `startProxy`/`core STARTED`。**未覆盖**：息屏期间活跃业务流连续性（`NOT_RUN`）、解锁沿（`USER_PRESENT`）、T01–T12 其余项 |
+| `ANDROID_SCREEN_FACTS_VERIFIED` | ✅ **（部分）** 屏幕事实的**顺序与所有权**由 JVM 确定性测试证明（**210 例 / 20 类**，其中 15 例直接驱动生产入口 `PlatformFacts.seedInitialScreen`），并有**设备侧对照**：第八轮 **8 轮真实 OFF/ON 每轮成对**、无颠倒无重复、屏幕事件期间 **0 次** `startProxy`/`core STARTED`、整段后 TUN/FGS/通知唯一。**未覆盖**：息屏期间活跃业务流连续性（`NOT_RUN`）、解锁沿（`USER_PRESENT`，`BLOCKED`）、T01–T12 其余项。**注**：第七轮"`unchanged` 标记未出现"那条推断已作废 —— 那个 APK 根本没有这条日志 |
 | `ANDROID_CLIENT_CORRECT + BLOCKED_BY_CORE_ABI` | ✅ 适用于 P1-C：客户端桥接正常，独立 Resume Edge 所需的接口**不在**固定 AAR 的公开 API 中（从产物常量池取证） |
 | `DEVICE_NOT_TESTED` | ✅ 真机项全部未测 |
 | `EMULATOR_ONLY` | ✅ 全部设备证据均来自 `emulator-5554` |
-| `POWER_NOT_QUANTIFIED` | ✅ 无对照功耗样本，不写省电百分比 |
+| `POWER_BENCHMARK_NOT_REQUIRED` | ✅ 用户已明确取消功耗量化（百分比 / 精细 CPU-RSS / 耗电曲线）。**不是**未完成技术债，也**不等于**放弃真机稳定性验证 |
 | `REAL_DEVICE_PENDING` | ✅ |
-| `GATE4B_CANDIDATE_RETESTED` | ✅ 候选 APK（`1efaa8f`，同 core）已在同一 AVD 上复跑：连接闭环成立、20 轮 Stop→立即 Start **19/20 收敛**（1 轮结束于 `STOPPED` 并于一次点击后恢复）、0 crash、0 ANR。“改前成功、改后未测”的风险**已消除**；那 1 轮如实记为未收敛，未写成 P0 |
+| `GATE4B_CANDIDATE_RETESTED` | ✅ 候选 APK（`1efaa8f`，同 core）第七轮在同一 AVD 上复跑得 **19/20**（1 轮结束于 `STOPPED`，一次点击恢复），该事实**保留**；**第八轮用语义驱动在同一 AVD、同一二进制上复跑得 20/20**，并把那 1 轮归因为 `UI_DRIVER_ARTIFACT`（探针缺陷）。0 crash / 0 ANR |
+| `ANDROID_CLIENT_CODE_CLOSED` | ✅ 本轮 P0 已修且被驱动真实生产入口的确定性测试钉住（旧红→新绿有断言原文）；本地全量 210/20 类全绿；报告事实矛盾已逐条清理 |
+| `FIXED_LATENT_CONTRACT_DEFECT` | ✅ 精确适用于 P0-A：**今日主 looper 路径上不可达**的潜在初始化并发隐患，`19/20` 归因是探针缺陷。**不写**“已复现线上息屏断流” |
 | **不写** | `READY_FOR_RELEASE`、`REAL_DEVICE_PASS`、`FULL_APPLE_PARITY` |
 
 ### G-1 剩余事项
 
-1. **Gate 4-B**：在 `58b8309` 原版上跑息屏/网络基线，再用 `core_ref=c35faabf…` 构建**新 APK**
-   复跑同场景。本段**未执行**，因此"修改前成功、修改后未测"的假验收风险**尚未消除**。
-2. **T01–T12**：设备端场景矩阵，见 D 节。
-3. ~~Gate 4-B 的设备复测~~ —— **已完成**（候选 APK 已在同一 AVD 上复跑，见 E-5c）。
-4. **真机验收**：OEM 省电、蜂窝切换、实体热点、长 Doze、真实 `onRevoke`。
+1. ~~Gate 4-B 设备复测~~ —— **第七轮已完成**（候选 APK 在同一 AVD 上复跑，见 E-5c），
+   **第八轮已定因**（语义驱动 20/20，见 E-5d）。**此条不再挂着"未执行"**；第七轮旧文本里
+   "本段未执行"与"已完成"并存的矛盾已按实测结论统一。
+2. **T01–T12**：设备端场景矩阵，第八轮逐项判定见 D-1（T05/T08/T10/T11/T12 的范围已收紧）。
+3. **真机验收**：OEM 省电、蜂窝切换、实体热点、长 Doze、真实 `onRevoke`、解锁沿。
+4. **第八轮修复后的包**：P0 修复改了 `app/src/main`（`PlatformFacts.kt`、`ScreenFactState.kt`），
+   所以 `1efaa8f` 的设备证据属于"修前"包；修复后的包需按 E-7 的 CI 产物重新上机。
 
 ### G-2 需要内核介入的将来工单（**不立即操作内核**）
 
