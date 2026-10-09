@@ -381,13 +381,6 @@ jobs:
           echo "artifact_name=${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
           echo "artifact: ${ARTIFACT_NAME}"
 
-      - name: Generate checksums
-        run: |
-          set -euo pipefail
-          cd app/build/outputs/apk/release
-          sha256sum ./*.apk > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-
       # Machine-readable provenance so any downloaded APK can be traced back to
       # the exact app commit and core revision that produced it. No secrets.
       - name: Write build-info.json
@@ -399,11 +392,25 @@ jobs:
           VERSION_NAME="$(grep '^versionName=' version.properties | cut -d= -f2 | tr -d ' \r')"
           VERSION_CODE="$(grep '^versionCode=' version.properties | cut -d= -f2 | tr -d ' \r')"
           cd app/build/outputs/apk/release
+          # sha_for() reads the FINAL apk names, so it must run against the manifest the
+          # bundle step writes - not against one generated before the rename. See the
+          # bundle step: it recomputes SHA256SUMS.txt from the renamed files and proves
+          # it, precisely so this lookup cannot silently come back empty ("unknown").
           sha_for() { grep -F -m1 -- "-$1-" SHA256SUMS.txt | awk '{print $1}'; }
           APK_ARM64_SHA="$(sha_for arm64-v8a)"
           APK_X86_64_SHA="$(sha_for x86_64)"
           AAR_SHA="$(sha256sum "${GITHUB_WORKSPACE}/app/libs/libbox.aar" | awk '{print $1}')"
           AAR_SIZE="$(wc -c < "${GITHUB_WORKSPACE}/app/libs/libbox.aar" | tr -d ' ')"
+          # Every field below is either measured here or comes from the produced binary.
+          # An empty per-ABI hash would make build-info.json claim a provenance it does
+          # not have, so refuse instead of writing "".
+          for pair in "arm64-v8a:${APK_ARM64_SHA}" "x86_64:${APK_X86_64_SHA}"; do
+            if [ -z "${pair#*:}" ]; then
+              echo "::error::no SHA256 for ${pair%%:*} in SHA256SUMS.txt; build-info.json would be incomplete"
+              cat SHA256SUMS.txt
+              exit 1
+            fi
+          done
           cd "${GITHUB_WORKSPACE}"
           cat > build-info.json <<JSON
           {
@@ -443,6 +450,9 @@ jobs:
       - name: Assemble the flat release bundle
         env:
           SIG_STATE: ${{ steps.sig.outputs.state }}
+          VERSION: ${{ steps.naming.outputs.version }}
+          KIND: ${{ steps.naming.outputs.kind }}
+          EXPECT_SIGNATURE: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true) && 'signed' || 'unsigned' }}
         run: |
           set -euo pipefail
           rm -rf release-bundle
@@ -459,22 +469,37 @@ jobs:
             echo "::error::no release APKs to bundle"
             exit 1
           fi
-          cp SHA256SUMS.txt apksigner-verify.txt "${GITHUB_WORKSPACE}/release-bundle/"
-          cp "${GITHUB_WORKSPACE}/build-info.json" "${GITHUB_WORKSPACE}/release-bundle/"
+          # SHA256SUMS.txt is regenerated HERE, from the final renamed files.
+          #
+          # The earlier "Generate checksums" step produced it before the rename, so its
+          # entries named satelite-one-<abi>-release.apk - files that no longer exist by
+          # the time anything reads the manifest. It also used `sha256sum ./*.apk`, whose
+          # entries carry a `./` prefix that `sha256sum --check` matches by literal path.
+          # Both are the same defect: a manifest that does not describe the shipped files.
           cd "${GITHUB_WORKSPACE}/release-bundle"
+          sha256sum ./*.apk > SHA256SUMS.txt
+          # Strip the `./` so entries are bare filenames, matching the flat layout the
+          # verifier and the release step both assume.
+          sed -i 's|  \./|  |' SHA256SUMS.txt
           echo "=== release-bundle ($BUNDLED APK) ==="
           ls -la
-          # SHA256SUMS.txt must stay valid in the flat layout (sha256sum records the path
-          # it was given; in the build directory the APKs had no directory prefix, so the
-          # entries are already bare filenames - assert that instead of assuming it).
-          while read -r _ name; do
-            case "$name" in
-              */*) echo "::error::SHA256SUMS.txt entry is not a flat filename: $name"; exit 1 ;;
-            esac
-          done < SHA256SUMS.txt
-          # And prove it right here, so a mismatch fails the build job rather than the
-          # release job - the release job must never be the first place a bundle is checked.
+          cat SHA256SUMS.txt
+          cp "${GITHUB_WORKSPACE}/build-info.json" .
+          cp "${GITHUB_WORKSPACE}/app/build/outputs/apk/release/apksigner-verify.txt" .
+          # Prove it right here, so a mismatch fails the build job rather than the release
+          # job - the release job must never be the first place a bundle is checked.
           sha256sum --check SHA256SUMS.txt
+          # ... and run the same verifier the publish job will run, so a bundle that the
+          # release job would reject cannot look green here.
+          python3 "${GITHUB_WORKSPACE}/.github/scripts/verify_release_bundle.py" . \
+            --expect-signature "$EXPECT_SIGNATURE" \
+            --expect-version "$VERSION" \
+            --expect-kind "$KIND" \
+            --expect-app-commit "${APP_COMMIT_FULL:-$GITHUB_SHA}" \
+            --expect-core-commit "$CORE_COMMIT" \
+            --list-to bundle-files.txt
+          echo "=== bundle verifier agreed; publishable files ==="
+          cat bundle-files.txt
 
       - name: Upload the release bundle
         uses: actions/upload-artifact@v4
@@ -531,10 +556,11 @@ jobs:
         run: |
           set -euo pipefail
           ls -la release-bundle
+          VERSION="$(grep '^versionName=' version.properties | cut -d= -f2 | tr -d ' \r')"
           python3 .github/scripts/verify_release_bundle.py release-bundle \
             --expect-signature signed \
-            --expect-version "$(grep '^versionName=' version.properties | cut -d= -f2 | tr -d ' \r')" \
-            | tee bundle-files.txt
+            --expect-version "$VERSION" \
+            --list-to bundle-files.txt
           if [ ! -s bundle-files.txt ]; then
             echo "::error::the preflight produced no publishable file list"
             exit 1
@@ -543,6 +569,10 @@ jobs:
           cat bundle-files.txt
           # 与 build job 同一个测量脚本, 对**同一批实际文件**再测一次签名。
           mapfile -t APKS < <(grep '\.apk$' bundle-files.txt)
+          if [ "${#APKS[@]}" -ne 2 ]; then
+            echo "::error::expected exactly 2 per-ABI APKs in the verified set, got ${#APKS[@]}"
+            exit 1
+          fi
           bash .github/scripts/measure_apk_signature.sh signed "${APKS[@]}"
           echo "all ${#APKS[@]} APKs verify as signed with a non-debug certificate"
 

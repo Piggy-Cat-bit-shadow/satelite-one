@@ -334,8 +334,8 @@ def run_bundle_preflight(bundle_dir, expect_signature="signed", extra_args=()):
         expect_signature,
         *extra_args,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    return proc.returncode, proc.stdout, proc.stderr
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
 BUNDLE_VERSION = "0.5.10"
@@ -379,7 +379,9 @@ def write_bundle(root, *, abis=("arm64-v8a", "x86_64"), signature_state="signed-
 
     info = {
         "app_repository": "Piggy-Cat-bit-shadow/satelite-one",
-        "app_version": BUNDLE_VERSION,
+        # The version the metadata advertises must be the one in the filenames, otherwise
+        # the fixture would be testing a bundle that contradicts itself.
+        "app_version": apk_version,
         "app_version_code": 16,
         "app_commit": app_commit,
         "app_commit_full": app_commit,
@@ -543,11 +545,129 @@ def test_bundle_preflight_positive_and_negative():
         )
         check(code != 0 and "flat" in err, f"a nested bundle must FAIL, got {err.strip()[:120]}")
 
-        # The version in the filename must agree with the metadata.
+        # The version in the filename must agree with what this run builds. The fixture is
+        # internally consistent, so the mismatch can only be caught by the caller's
+        # expectation - which is exactly how CI passes it.
         code, _, err = run_bundle_preflight(
             write_bundle(os.path.join(tmp, "ver"), apk_version="9.9.9"),
+            extra_args=("--expect-version", BUNDLE_VERSION),
         )
-        check(code != 0, f"a version mismatch must FAIL, got exit={code}")
+        check(code != 0 and "carries version" in err, f"a version mismatch must FAIL, got exit={code}: {err.strip()[:160]}")
+
+
+def test_dot_slash_manifest_is_rejected():
+    """`sha256sum ./*.apk` writes `./name` entries, and `--check` matches them literally.
+
+    This is the exact defect the round-6 dry run hit: the build job's manifest carried
+    `./` prefixes, so `sha256sum --check` in the flat bundle could not find `./name`
+    and the job failed. It failed *loudly* only because the bundle step proves its own
+    manifest; without that proof the same manifest would have shipped and the publish
+    job would have compared hashes against names that do not exist.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = write_bundle(os.path.join(tmp, "dotslash"))
+        # Rewrite the manifest the way `sha256sum ./*.apk` would have.
+        sums_path = os.path.join(root, "SHA256SUMS.txt")
+        with open(sums_path, encoding="utf-8") as handle:
+            lines = [line for line in handle if line.strip()]
+        with open(sums_path, "w", encoding="utf-8") as handle:
+            for line in lines:
+                digest, name = line.split(None, 1)
+                handle.write(f"{digest}  ./{name.strip()}\n")
+
+        code, _, err = run_bundle_preflight(root)
+        check(
+            code != 0 and "not a flat filename" in err,
+            f"a ./ -prefixed manifest must FAIL, got exit={code}: {err.strip()[:160]}",
+        )
+
+
+def test_stale_manifest_is_rejected():
+    """A manifest that still names pre-rename files must not pass.
+
+    The build job used to generate SHA256SUMS.txt *before* renaming the APKs, so its
+    entries named `satelite-one-<abi>-release.apk` - files that do not exist once the
+    bundle is assembled. The verifier has to treat "manifest lists a file that is not
+    here" and "bundle file that is not in the manifest" as two separate failures.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = write_bundle(os.path.join(tmp, "stale"))
+        sums_path = os.path.join(root, "SHA256SUMS.txt")
+        with open(sums_path, encoding="utf-8") as handle:
+            lines = [line for line in handle if line.strip()]
+        with open(sums_path, "w", encoding="utf-8") as handle:
+            for line in lines:
+                digest, name = line.split(None, 1)
+                stale = name.strip().replace("-signed-by-user", "-release")
+                handle.write(f"{digest}  {stale}\n")
+
+        code, _, err = run_bundle_preflight(root)
+        check(
+            code != 0,
+            f"a stale/pre-rename manifest must FAIL, got exit={code}",
+        )
+
+
+def test_kind_must_lead_with_the_measured_state():
+    """`kind` embeds the signature state, and the two must not disagree.
+
+    The naming step builds `<sigstate>-<kind>` (`unsigned-dryrun`, `signed-v0.5.10`), so
+    a bundle whose filename says one thing and whose build-info.json says another is
+    self-contradictory and must be refused when the caller supplies the kind.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        # Filename claims unsigned-dryrun, metadata claims signed-by-user.
+        root = write_bundle(
+            os.path.join(tmp, "kindlie"),
+            signature_state="signed-by-user",
+            kind="unsigned-dryrun",
+        )
+        code, _, err = run_bundle_preflight(
+            root,
+            extra_args=("--expect-kind", "unsigned-dryrun"),
+        )
+        check(
+            code != 0 and "does not lead the filename kind" in err,
+            f"a kind/state contradiction must FAIL, got exit={code}: {err.strip()[:160]}",
+        )
+        # And the honest pairing: a bundle whose filename IS the kind it reports passes.
+        honest = write_bundle(
+            os.path.join(tmp, "kindhonest"),
+            signature_state="unsigned",
+            kind="unsigned-dryrun",
+        )
+        code, _, err = run_bundle_preflight(
+            honest,
+            expect_signature="unsigned",
+            extra_args=("--expect-kind", "unsigned-dryrun"),
+        )
+        check(code == 0, f"the honest kind/state pairing must PASS, got {err.strip()[:200]}")
+
+
+def test_expect_kind_survives_a_hyphenated_version():
+    """A version containing '-' must not be mistaken for part of the ABI.
+
+    The first cut of the verifier split the filename with a greedy regex; on
+    `satelite-one-0.5.10-4-arm64-v8a-unsigned-dryrun.apk` that produced a nonsense
+    version and rejected a correct bundle. The caller passes the version and kind it
+    actually used, so the parse must not guess.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = write_bundle(
+            os.path.join(tmp, "hyphen"),
+            apk_version="0.5.10-4",
+            kind="unsigned-dryrun",
+            signature_state="unsigned",
+        )
+        code, _, err = run_bundle_preflight(
+            root,
+            expect_signature="unsigned",
+            extra_args=("--expect-version", "0.5.10-4", "--expect-kind", "unsigned-dryrun"),
+        )
+        check(
+            code == 0,
+            f"a hyphenated version must be accepted, got exit={code}: {err.strip()[:200]}",
+        )
 
 
 def main():
@@ -556,6 +676,10 @@ def main():
     test_decision_table()
     test_measurement_fails_closed()
     test_bundle_preflight_positive_and_negative()
+    test_dot_slash_manifest_is_rejected()
+    test_stale_manifest_is_rejected()
+    test_kind_must_lead_with_the_measured_state()
+    test_expect_kind_survives_a_hyphenated_version()
 
     if failures:
         print(f"\n{len(failures)} release-gate check(s) failed")

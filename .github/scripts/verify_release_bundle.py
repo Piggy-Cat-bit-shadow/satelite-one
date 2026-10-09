@@ -99,6 +99,19 @@ def main():
     parser.add_argument("--expect-app-commit", default=None)
     parser.add_argument("--expect-core-commit", default=None)
     parser.add_argument("--expect-version", default=None)
+    # The naming step knows these directly. Passing them in beats inferring them from
+    # the filename: a version string may itself contain a '-', and a greedy filename
+    # regex then swallows part of the ABI into the version.
+    parser.add_argument(
+        "--expect-kind",
+        default=None,
+        help="the <kind> segment the naming step used, e.g. unsigned-dryrun",
+    )
+    parser.add_argument(
+        "--list-to",
+        default=None,
+        help="also write the publishable file list here, so a caller can diff it",
+    )
     args = parser.parse_args()
 
     bundle = os.path.abspath(args.bundle)
@@ -125,8 +138,6 @@ def main():
         fail(f"bundle contains no APK; contents: {entries}")
 
     by_abi = {}
-    version = None
-    kind = None
     for name in apks:
         match = APK_NAME.match(name)
         if not match:
@@ -134,12 +145,27 @@ def main():
                 f"{name} does not match satelite-one-<version>-<abi>-<kind>.apk; "
                 "refusing to guess what it is"
             )
+        # The ABI is the one segment the file name must state unambiguously, and the
+        # regex already anchors it. Resolve the version/kind by PREFIX/SUFFIX against what
+        # the caller knows, instead of a greedy split that a hyphenated version breaks.
         abi = match.group("abi")
         if abi in by_abi:
             fail(f"two APKs claim ABI {abi}: {by_abi[abi]} and {name}")
         by_abi[abi] = name
-        version = match.group("version")
-        kind = match.group("kind")
+        # Split the filename by the anchoring segments (prefix, ABI, suffix) instead of a
+        # greedy regex: a version string may itself contain a '-', and `<version>-<abi>`
+        # is unambiguous precisely because the ABI segment is known.
+        version_segment = name[len("satelite-one-") : name.rindex(f"-{abi}-")]
+        if args.expect_version is not None and version_segment != args.expect_version:
+            fail(
+                f"{name} carries version {version_segment!r} but this run builds "
+                f"{args.expect_version!r}"
+            )
+        if args.expect_kind is not None and not name.endswith(f"-{abi}-{args.expect_kind}.apk"):
+            fail(
+                f"{name} does not end with -{abi}-{args.expect_kind}.apk; the naming step "
+                f"reported kind={args.expect_kind!r}"
+            )
 
     missing = [abi for abi in EXPECTED_ABIS if abi not in by_abi]
     if missing:
@@ -174,11 +200,20 @@ def main():
         except json.JSONDecodeError as error:
             fail(f"build-info.json is not valid JSON: {error}")
 
-    if info.get("app_version") != version:
+    if args.expect_version is not None and info.get("app_version") != args.expect_version:
         fail(
-            f"build-info.json app_version={info.get('app_version')!r} does not match the "
-            f"APK filename version {version!r}"
+            f"build-info.json app_version={info.get('app_version')!r} but version.properties "
+            f"says {args.expect_version!r}"
         )
+    elif args.expect_version is None:
+        # Without the caller's version we can still require that the name and the metadata
+        # agree with each other.
+        for name in apks:
+            if not name.startswith(f"satelite-one-{info.get('app_version')}-"):
+                fail(
+                    f"{name} does not start with the build-info.json app_version "
+                    f"{info.get('app_version')!r}"
+                )
     for abi, name in sorted(by_abi.items()):
         key = "apk_" + abi.replace("-", "_") + "_sha256"
         if key not in info:
@@ -189,10 +224,14 @@ def main():
                 f"({(info[key] or '')[:16]}… vs {measured[name][:16]}…)"
             )
 
-    if info.get("signature_state") != kind:
+    # `kind` embeds the measured signature state as a prefix (unsigned-dryrun,
+    # signed-vX.Y.Z, ...), so the relation is "kind starts with the state" rather than
+    # equality - and it is only checked when the caller told us the kind.
+    state = info.get("signature_state")
+    if args.expect_kind is not None and not args.expect_kind.startswith(str(state)):
         fail(
-            f"build-info.json signature_state={info.get('signature_state')!r} does not "
-            f"match the APK filename kind {kind!r}"
+            f"build-info.json signature_state={state!r} does not lead the filename kind "
+            f"{args.expect_kind!r} the naming step reported"
         )
 
     for label, expected, key in (
@@ -204,11 +243,6 @@ def main():
         actual = info.get(key)
         if actual != expected:
             fail(f"build-info.json {key}={actual!r} but this run expects {label} {expected!r}")
-    if args.expect_version is not None and info.get("app_version") != args.expect_version:
-        fail(
-            f"build-info.json app_version={info.get('app_version')!r} but version.properties "
-            f"says {args.expect_version!r}"
-        )
     if info.get("core_ref") != "pinned":
         fail(f"build-info.json core_ref={info.get('core_ref')!r}, expected 'pinned'")
 
@@ -246,12 +280,16 @@ def main():
         name for name in OPTIONAL_FILES if name in entries
     ]
     print(
-        f"bundle OK: {len(apks)} APK(s), signature_state={state}, version={version}, "
-        f"core={core_commit[:12]}",
+        f"bundle OK: {len(apks)} APK(s), signature_state={state}, "
+        f"version={info.get('app_version')}, core={core_commit[:12]}",
         file=sys.stderr,
     )
-    for name in publishable:
-        print(os.path.join(bundle, name))
+    lines = [os.path.join(bundle, name) for name in publishable]
+    if args.list_to:
+        with open(args.list_to, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+    for line in lines:
+        print(line)
 
 
 if __name__ == "__main__":
