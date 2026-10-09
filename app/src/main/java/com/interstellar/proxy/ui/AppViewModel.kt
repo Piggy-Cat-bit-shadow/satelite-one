@@ -40,12 +40,17 @@ data class SpeedState(
     val uplinkTotal: Long = 0,
     val downlinkTotal: Long = 0,
     /**
-     * Whether the running config actually has the kernel's traffic manager.
+     * Whether the kernel actually has a traffic manager for the running config.
      *
-     * Auto-generated configs enable it (see MinimalConfigBuilder's empty
-     * `clash_api`). A user-supplied raw sing-box JSON is handed to the kernel
-     * byte-for-byte and may never enable it — in that case there are NO statistics,
-     * which is a different statement from "measured zero".
+     * For a libbox client this is true in practice: the manager is created when
+     * `needClashAPI || needAPIService || options.PlatformLogWriter != nil`, and
+     * libbox always satisfies the last branch (daemon/instance.go sets
+     * `PlatformLogWriter: s` in StartedService.newInstance, config-independently).
+     *
+     * The flag is still carried and honoured rather than assumed, because the core
+     * is the authority: if it ever reports that it has no statistics, rendering
+     * `0 kB/s` would claim a measurement that never happened. "Not measured" and
+     * "measured zero" are different statements.
      */
     val trafficAvailable: Boolean = false,
 )

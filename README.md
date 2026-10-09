@@ -63,11 +63,13 @@ UI 采用「航空航天玻璃 + 任务控制台」设计语言：深空底色�
 - **网络切换**：`DefaultNetworkMonitor` 跟踪物理网络，Wi-Fi ↔ 蜂窝切换后内核自动重连
 - **通知与快捷磁贴**：常驻通知显示实时上下行，磁贴一键连接/断开
 - **实时流量**：`CommandClient` 的 `Status`（1s 间隔）提供上下行速率与本次内核生命周期累计值
-- **流量统计的可用性边界**：统计来自内核的 `trafficcontrol.Manager`。自动生成的配置
-  用一个**空的** `experimental.clash_api: {}` enabled 它 —— 空对象不会监听任何端口
-  （内核只在 `external_controller` 非空时才 `net.Listen`）。用户直接导入的原始
-  sing-box JSON 则**逐字节透传、不做任何注入**，这类配置若未启用统计，App 显示
-  "统计不可用" 而不是伪装成 `0 kB/s`：未知 ≠ 0。
+- **流量统计的可用性边界**：统计来自内核的 `trafficcontrol.Manager`。libbox 客户端
+  **不需要**配置 `clash_api`：内核在 `needClashAPI || needAPIService ||
+  PlatformLogWriter != nil` 时创建它，而 libbox 恒满足最后一条（`daemon/instance.go`
+  在 `StartedService.newInstance` 里无条件传 `PlatformLogWriter: s`）。本客户端因此
+  不写 `clash_api`，也**绝不**配置 `external_controller`：那会真的开出一个控制端口。
+  用户直接导入的原始 sing-box JSON 则**逐字节透传、不做任何注入**；若内核报告没有
+  统计，App 显示"统计不可用"而不是伪装成 `0 kB/s` —— 未知 ≠ 0。
 
 ## 架构
 

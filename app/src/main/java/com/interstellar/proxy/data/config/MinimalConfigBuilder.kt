@@ -76,18 +76,16 @@ object MinimalConfigBuilder {
                 putJsonObject("cache_file") {
                     put("enabled", true)
                 }
-                // An EMPTY clash_api: this is the only way the kernel creates its
-                // shared trafficcontrol.Manager (box.go: `ClashAPI != nil` sets
-                // needClashAPI), which is what makes StatusMessage.TrafficAvailable
-                // and the per-connection byte counters real.
+                // NO clash_api here, not even an empty one — and that is deliberate.
                 //
-                // It deliberately carries no `external_controller`: clashapi's
-                // Server.Start() only calls net.Listen when external_controller is
-                // non-empty, so this enables statistics while opening ZERO ports.
-                // Do not "fix" this by adding 127.0.0.1:19090 — the app talks to the
-                // kernel over the libbox command socket and needs no HTTP controller,
-                // and an unauthenticated controller is attack surface we do not want.
-                putJsonObject("clash_api") {}
+                // The kernel creates its shared trafficcontrol.Manager when
+                // `needClashAPI || needAPIService || options.PlatformLogWriter != nil`,
+                // and libbox always takes the last branch: daemon/instance.go sets
+                // `PlatformLogWriter: s` in StartedService.newInstance, unconditionally
+                // and independently of the config. So statistics exist for a libbox
+                // client either way, and configuring clash_api purely to "enable" them
+                // would add an inert section (and, with an external_controller, a real
+                // listening control port) for no benefit.
             }
         }
         return json.toString()
