@@ -18,7 +18,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -38,8 +40,20 @@ fun LogsPage(viewModel: LogsViewModel) {
     val connected by viewModel.connected.collectAsState()
     val listState = rememberLazyListState()
 
+    // Is the user already parked at the newest line? Recomputed from layout, so
+    // it follows a manual scroll without any scroll-state machine.
+    val atBottom by remember {
+        derivedStateOf {
+            val info = listState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull()
+            last == null || last.index >= info.totalItemsCount - 2
+        }
+    }
+    // Auto-follow only while they are at the bottom: scrolling up to read history
+    // must never be yanked back down by the next arriving line. scrollToItem (not
+    // animate) because a per-batch animation piles up under a log burst.
     LaunchedEffect(logs.size) {
-        if (logs.isNotEmpty()) listState.animateScrollToItem(logs.size - 1)
+        if (logs.isNotEmpty() && atBottom) listState.scrollToItem(logs.size - 1)
     }
 
     Column(
@@ -66,7 +80,11 @@ fun LogsPage(viewModel: LogsViewModel) {
                         .clip(RoundedCornerShape(50))
                         .background(colors.bgDeep)
                         .clickable {
-                            val text = logs.joinToString("\n") { "[${levelName(it.level)}] ${it.message}" }
+                            // Fresh snapshot straight from the ring: the UI list is
+                            // coalesced and can lag the newest lines by up to one
+                            // refresh window, which must not truncate a debug copy.
+                            val text = viewModel.snapshot()
+                                .joinToString("\n") { "[${levelName(it.level)}] ${it.message}" }
                             if (text.isNotBlank()) {
                                 com.interstellar.proxy.InterstellarApplication.clipboard.setPrimaryClip(
                                     android.content.ClipData.newPlainText("logs", text.take(380_000)),
