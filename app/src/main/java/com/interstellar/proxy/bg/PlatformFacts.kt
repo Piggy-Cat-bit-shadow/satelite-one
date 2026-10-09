@@ -95,6 +95,15 @@ object PlatformFacts {
     val isScreenOn: Boolean get() = screen.current
 
     /**
+     * How many screen observations have been recorded, read-only.
+     *
+     * Exposed so a test can assert the epoch contract at the *seam* it is used at — "a
+     * broadcast in the middle of the startup read moves this, an agreeing snapshot does
+     * not" — without reaching into [ScreenFactState]'s private state or re-implementing it.
+     */
+    internal val observedScreenEpoch: Long get() = screen.observationEpoch()
+
+    /**
      * The session currently bound to a core, or null.
      *
      * Internal and read-only. It exists so tests can synchronize on the ownership
@@ -266,6 +275,49 @@ object PlatformFacts {
         }
     }
 
+    // ---- the initial screen reading ----
+
+    /**
+     * Test seam that fires **after the pre-read epoch is captured and before the platform
+     * value is read** — the exact instant at which "this reading is already stale" becomes
+     * possible.
+     *
+     * The interesting failure is an *interleaving*, and the production code deliberately
+     * contains no sleep, no handler and no timer to create one. So the seam is an explicit
+     * hook that only a test sets: the test runs the real [seedInitialScreen] and fires a
+     * broadcast from here, which demonstrates the stale read without inventing a second
+     * implementation to test instead. A test may equally fire it from inside
+     * `readInteractive`; that is the same window and `ScreenSeedWiringTest.S02` uses both.
+     * Null in production, so `install()` takes no extra step.
+     */
+    @Volatile
+    internal var screenSeedHook: (() -> Unit)? = null
+
+    /**
+     * The production screen-seed algorithm: **take the observation epoch, then read the
+     * platform, then apply the reading only if that epoch is still current.**
+     *
+     * The order of the first two steps is the defect this function exists to keep fixed.
+     * The earlier wiring read `PowerManager.isInteractive` and only then sampled the
+     * epoch — the key it compared was taken *after* the read it was meant to protect, so a
+     * broadcast landing in between was already folded into the key and the stale reading
+     * passed the guard. Taking the epoch first is what makes the guard mean "nothing has
+     * been observed since this reading began".
+     *
+     * This is intentionally the *only* production path that applies an initial screen
+     * reading, and it takes the reader as a parameter so a test can interleave a broadcast
+     * at the exact point where production is otherwise racily silent.
+     *
+     * @return true when the reading became the current fact (see
+     *   [ScreenFactState.seedSnapshot] for the two rejection cases).
+     */
+    internal fun seedInitialScreen(readInteractive: () -> Boolean): Boolean {
+        val observedBefore = screen.observationEpoch()
+        screenSeedHook?.invoke()
+        val interactive = readInteractive()
+        return screen.seedSnapshot(interactive, observedBefore)
+    }
+
     // ---- registration ----
 
     /**
@@ -315,18 +367,16 @@ object PlatformFacts {
         )
 
         // The screen may already be off when the process starts. Read the platform value
-        // and the version it corresponds to, then apply it only if nothing has observed
-        // the screen in between — so a SCREEN_OFF handled during this window wins instead
-        // of being overwritten by the staler reading.
+        // and apply it only if nothing observed the screen in between, so a SCREEN_OFF —
+        // or a repeat of the current value — that is handled during this window wins
+        // instead of being overwritten by the staler reading.
         //
         // Registration deliberately happens first: with no Handler the receiver dispatches
         // on the main looper, which `Application.onCreate` already occupies, so today the
-        // broadcast cannot interleave at all. The version check is what keeps that true
+        // broadcast cannot interleave at all. The epoch check is what keeps that true
         // rather than assumed if a handler is ever added or install() moves off-main.
-        val interactive = context.getSystemService<PowerManager>()?.isInteractive ?: true
-        val (_, versionWhenRead) = screen.sample()
-        val applied = screen.seedSnapshot(interactive, versionWhenRead)
-        debugFact("screen-seed", interactive, unchanged = !applied)
+        val applied = seedInitialScreen { context.getSystemService<PowerManager>()?.isInteractive ?: true }
+        debugFact("screen-seed", screen.current, unchanged = !applied)
 
         // App foreground/background, from the real Activity lifecycle.
         val tracker = ActivityForegroundTracker { foreground -> onForegroundChanged(foreground) }
