@@ -77,11 +77,22 @@ object PlatformFacts {
     @Volatile
     private var appForeground = false
 
-    @Volatile
-    private var screenOn = true
+    /**
+     * The screen fact, written by exactly one entry point ([onScreenChanged]).
+     *
+     * See [ScreenFactState] for why the initial `isInteractive` read had to stop being a
+     * second, unlocked writer.
+     */
+    private val screen = ScreenFactState()
+
+    /**
+     * One-way latch: registering the receiver and the lifecycle callbacks must not happen
+     * twice. See [InstallGuard].
+     */
+    private val installer = InstallGuard()
 
     val isAppForeground: Boolean get() = appForeground
-    val isScreenOn: Boolean get() = screenOn
+    val isScreenOn: Boolean get() = screen.current
 
     /**
      * The session currently bound to a core, or null.
@@ -148,9 +159,12 @@ object PlatformFacts {
     fun attach(sink: PlatformFactSink): Session = synchronized(lock) {
         val created = Session(++nextId, sink)
         current = created
-        val screen = screenOn
+        // Read under the same lock that mutations take, so it cannot be a value a
+        // concurrent fact has already superseded.
+        val screenNow = screen.current
         val foreground = appForeground
-        enqueue(created) { it.setScreenOn(screen) }
+        debugFact("attach", screenNow)
+        enqueue(created) { it.setScreenOn(screenNow) }
         enqueue(created) { it.setAppForeground(foreground) }
         created
     }
@@ -219,8 +233,11 @@ object PlatformFacts {
     }
 
     fun onScreenChanged(on: Boolean) = synchronized(lock) {
-        screenOn = on
-        debugFact("screen", on)
+        val changed = screen.onChanged(on)
+        // Log the fact even when it is unchanged: "Android told us ON and we were already
+        // ON" is itself evidence about the event stream, and suppressing it would make a
+        // repeated-broadcast investigation look like the event never arrived.
+        debugFact("screen", on, unchanged = !changed)
         current?.let { live -> enqueue(live) { sink -> sink.setScreenOn(on) } }
     }
 
@@ -235,16 +252,17 @@ object PlatformFacts {
     }
 
     /**
-     * Debug-build observation of the two booleans this class reports.
+     * Debug-build observation of the facts this class reports.
      *
      * A fact whose value cannot be seen is a fact nobody can check on a device, and the
      * foreground value has no other external surface. This is a log line — no control
      * port, no API, no stored state — and it is compiled out of release builds because
      * `BuildConfig.DEBUG` is a constant there, so it adds nothing to a shipped APK.
      */
-    private fun debugFact(name: String, value: Boolean) {
+    private fun debugFact(name: String, value: Boolean, unchanged: Boolean = false) {
         if (com.interstellar.proxy.BuildConfig.DEBUG) {
-            android.util.Log.d("InterstellarUI", "platform fact: $name=$value attached=${current != null}")
+            val suffix = if (unchanged) " (unchanged)" else ""
+            android.util.Log.d("InterstellarUI", "platform fact: $name=$value$suffix attached=${current != null}")
         }
     }
 
@@ -255,12 +273,30 @@ object PlatformFacts {
      * is intentionally unregistered only by process death: these are app-level
      * truths that outlive any single core session. What bounds a session is
      * [attach] / [detachAndDrain].
+     *
+     * Idempotent by construction ([InstallGuard]): the receiver and the lifecycle
+     * callbacks are registered exactly once, so a second call cannot double-count
+     * Activity starts or deliver every screen event twice.
      */
     fun install(context: Context) {
+        if (!installer.tryInstall()) {
+            android.util.Log.w(
+                "InterstellarUI",
+                "PlatformFacts.install() called again; the receiver and lifecycle " +
+                    "callbacks are already registered, so this call does nothing",
+            )
+            return
+        }
+
         // Screen + "user really returned". ServiceNotification separately watches
         // SCREEN_ON/OFF to decide whether to keep *its own* dynamic-notification
         // status stream — a different responsibility that must not be folded in
         // here (see the notification class).
+        //
+        // No Handler is passed, so Android dispatches on the main looper — the same
+        // thread `Application.onCreate` is already running on. That is what makes the
+        // seed below race-free today; [ScreenFactState] documents why the code no longer
+        // *depends* on that argument being true.
         context.registerReceiver(
             object : BroadcastReceiver() {
                 override fun onReceive(receiverContext: Context?, intent: Intent?) {
@@ -278,8 +314,19 @@ object PlatformFacts {
             },
         )
 
-        // The screen may already be off when the process starts.
-        screenOn = context.getSystemService<PowerManager>()?.isInteractive ?: true
+        // The screen may already be off when the process starts. Read the platform value
+        // and the version it corresponds to, then apply it only if nothing has observed
+        // the screen in between — so a SCREEN_OFF handled during this window wins instead
+        // of being overwritten by the staler reading.
+        //
+        // Registration deliberately happens first: with no Handler the receiver dispatches
+        // on the main looper, which `Application.onCreate` already occupies, so today the
+        // broadcast cannot interleave at all. The version check is what keeps that true
+        // rather than assumed if a handler is ever added or install() moves off-main.
+        val interactive = context.getSystemService<PowerManager>()?.isInteractive ?: true
+        val (_, versionWhenRead) = screen.sample()
+        val applied = screen.seedSnapshot(interactive, versionWhenRead)
+        debugFact("screen-seed", interactive, unchanged = !applied)
 
         // App foreground/background, from the real Activity lifecycle.
         val tracker = ActivityForegroundTracker { foreground -> onForegroundChanged(foreground) }
