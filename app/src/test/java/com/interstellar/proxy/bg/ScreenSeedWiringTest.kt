@@ -263,51 +263,118 @@ class ScreenSeedWiringTest {
 
     @Test
     fun `S08 concurrent observations and snapshots never let an older fact win`() {
-        // 200 rounds, real threads, and an invariant that does not need a sleep to be
-        // meaningful: a snapshot carrying a stale key must never become the fact, and a
-        // snapshot that *is* applied must be the one that a fresh reader would then see.
+        // 200 rounds of real threads. The invariant is about *outcomes*, not about which
+        // thread wins: a snapshot carrying a stale key must never become the fact, and a
+        // refused snapshot must have been refused because the epoch moved.
+        //
+        // The first version of this test fired both threads at one latch and then asserted
+        // that **both** outcomes had occurred across the 200 rounds ("otherwise the
+        // interleaving under test never happened"). CI proved that assertion wrong: a fast
+        // runner can have the observer thread win every single round, so no snapshot is
+        // ever applied and a correctly-behaving implementation fails the test with
+        // `no snapshot was ever applied in 200 rounds`. That is a flaky assertion, not a
+        // product bug - a data race must not be used as a scheduler coin-flip to decide
+        // whether a test may pass.
+        //
+        // Each round therefore drives both outcomes with an explicit handshake, so the
+        // accept path and the refuse path are each exercised deterministically:
+        //
+        //   seed the fact, take the key, then
+        //   (a) observer runs to completion -> a snapshot with the old key must be refused;
+        //   (b) re-read the key and seed again -> it must be applied.
         val rounds = 200
         val observations = AtomicInteger()
         val applied = AtomicInteger()
+        val refused = AtomicInteger()
         repeat(rounds) { round ->
             val state = ScreenFactState()
             state.onChanged(round % 2 == 0)
-            val observedBefore = state.observationEpoch()
+            val staleKey = state.observationEpoch()
             val value = round % 3 == 0
 
-            val go = CountDownLatch(1)
-            val threads = mutableListOf<Thread>()
-            // One observer and one seeder, released together, so both orders occur.
-            threads += Thread {
-                go.await(5, TimeUnit.SECONDS)
+            val observerDone = CountDownLatch(1)
+            val observer = Thread {
                 state.onChanged(!value)
                 observations.incrementAndGet()
+                observerDone.countDown()
             }
-            threads += Thread {
-                go.await(5, TimeUnit.SECONDS)
-                if (state.seedSnapshot(value, observedBefore)) applied.incrementAndGet()
-                else check(state.observationEpoch() != observedBefore) {
-                    "a refused snapshot must have been refused because the epoch moved"
-                }
+            observer.start()
+            check(observerDone.await(5, TimeUnit.SECONDS)) { "round $round: observer never ran" }
+            observer.join(5_000)
+            check(!observer.isAlive) { "round $round left the observer running" }
+
+            // (a) The key predates the observation by construction, so this must be refused.
+            val epochAfterObservation = state.observationEpoch()
+            check(epochAfterObservation > staleKey) { "round $round: the epoch did not move" }
+            val staleApplied = state.seedSnapshot(value, staleKey)
+            check(!staleApplied) {
+                "round $round: a snapshot taken before an observation was applied (value=$value)"
             }
-            threads.forEach { it.start() }
-            go.countDown()
-            threads.forEach { it.join(5_000) }
-            check(threads.none { it.isAlive }) { "round $round left a thread running" }
+            check(state.current != value) {
+                "round $round: the refused snapshot changed the fact anyway"
+            }
+            refused.incrementAndGet()
+
+            // (b) A key taken after it must be accepted whenever the values disagree, and a
+            // key that is still current must never be refused for any other reason - so
+            // after this call the fact *is* `value`, whatever it was before.
+            val freshKey = state.observationEpoch()
+            state.seedSnapshot(value, freshKey)
+            check(state.current == value) {
+                "round $round: a current snapshot did not become the fact"
+            }
+            applied.incrementAndGet()
 
             // Reading the value and its epoch as one pair must never disagree with either
-            // writer's intent: if the seed was refused, the observer's value is the fact.
+            // writer's intent.
             val (current, epoch) = state.sample()
-            check(epoch >= observedBefore) { "round $round went backwards in time" }
-            check(current != value || state.seedSnapshot(value, epoch) == false) {
+            check(epoch >= freshKey) { "round $round went backwards in time" }
+            check(state.seedSnapshot(value, epoch) == false || current == value) {
                 "round $round produced a self-inconsistent fact"
             }
         }
         check(observations.get() == rounds) { "not every round ran its observer" }
-        // Both outcomes must actually occur across 200 rounds; otherwise the interleaving
-        // under test never happened and the test would be vacuously green.
-        check(applied.get() > 0) { "no snapshot was ever applied in $rounds rounds" }
-        check(applied.get() < rounds) { "no snapshot was ever refused in $rounds rounds" }
+        check(refused.get() == rounds) { "not every round exercised the refusal path" }
+        check(applied.get() == rounds) { "not every round exercised the accept path" }
+
+        // The same invariant under genuinely unsynchronised racing, where either thread may
+        // win: whatever the outcome, a stale snapshot must never be what won.
+        val raced = AtomicInteger()
+        repeat(200) { round ->
+            val state = ScreenFactState()
+            state.onChanged(round % 2 == 0)
+            val key = state.observationEpoch()
+            val value = round % 3 == 0
+            val go = CountDownLatch(1)
+            val threads = listOf(
+                Thread {
+                    go.await(5, TimeUnit.SECONDS)
+                    state.onChanged(!value)
+                },
+                Thread {
+                    go.await(5, TimeUnit.SECONDS)
+                    val epochBefore = state.observationEpoch()
+                    if (state.seedSnapshot(value, key)) {
+                        // Accepted: nothing may have been observed between our key and the
+                        // write, so the epoch is unchanged and the fact is ours.
+                        check(epochBefore == key) {
+                            "round $round: a snapshot was applied after the epoch had moved"
+                        }
+                        raced.incrementAndGet()
+                    } else {
+                        // Refused: by construction the key was stale, or the values agreed.
+                        check(key != epochBefore || state.current == value) {
+                            "round $round: a snapshot was refused for no recorded reason"
+                        }
+                    }
+                },
+            )
+            threads.forEach { it.start() }
+            go.countDown()
+            threads.forEach { it.join(5_000) }
+            check(threads.none { it.isAlive }) { "round $round left a racing thread running" }
+        }
+        check(raced.get() in 0..200) { "unreachable: raced counter out of range" }
     }
 
     // ------------------------------------------------------------- S09/S10: ownership
