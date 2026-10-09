@@ -33,8 +33,19 @@ object DefaultNetworkMonitor {
         }
     }
 
-    suspend fun start() {
-        DefaultNetworkListener.start(this) { network ->
+    /**
+     * Register [owner] as a consumer of the tracked physical network.
+     *
+     * The listener is keyed by the OWNER, not by this singleton. With the singleton as
+     * the key the registration map held exactly one entry for the whole process, so a
+     * destroyed Service instance that ran its teardown after a successor had already
+     * started would remove that single entry and silently kill the successor's
+     * network tracking (DefaultNetworkListener unregisters only when its map empties).
+     * Keying by owner makes each Service's registration its own, and its teardown
+     * removes only its own entry.
+     */
+    suspend fun start(owner: Any) {
+        DefaultNetworkListener.start(owner) { network ->
             if (network != null && isVpn(network)) return@start
             defaultNetwork = network ?: physicalNetwork()
             checkDefaultInterfaceUpdate(defaultNetwork)
@@ -46,8 +57,9 @@ object DefaultNetworkMonitor {
         }
     }
 
-    suspend fun stop() {
-        DefaultNetworkListener.stop(this)
+    /** Release [owner]'s registration. A stale owner's call cannot drop a live one. */
+    suspend fun stop(owner: Any) {
+        DefaultNetworkListener.stop(owner)
     }
 
     suspend fun require(): Network {

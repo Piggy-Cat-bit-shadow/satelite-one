@@ -127,9 +127,14 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             selectedTag = Settings.selectedOutboundTag.takeIf { it.isNotBlank() },
         )
 
-    private suspend fun startCore() {
-        com.interstellar.proxy.core.AppLog.log("service", "启动内核 sing-box")
+    private suspend fun startCore(): CoreStartResult {
+        // A destroyed instance refuses to build a core at all (P0-A). Returning here
+        // means no CommandServer, no fact bridge and no socket ever come into being.
         val attempt = lifecycle.beginStart()
+            ?: return CoreStartResult.SUPERSEDED.also {
+                com.interstellar.proxy.core.AppLog.log("service", "service destroyed; refused to start a core")
+            }
+        com.interstellar.proxy.core.AppLog.log("service", "启动内核 sing-box (attempt $attempt)")
         val created = CoreEngines.create(platformInterface, this)
         try {
             created.startup()
@@ -156,7 +161,9 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             android.util.Log.i("InterstellarUI", "core start superseded by a stop; disposing the new core")
             runCatching { created.closePlatformEvents() }
             runCatching { created.shutdown() }
+            return CoreStartResult.SUPERSEDED
         }
+        return CoreStartResult.PUBLISHED
     }
 
     /**
@@ -216,7 +223,7 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             runCatching { pfd.close() }
             fileDescriptor = null
         }
-        DefaultNetworkMonitor.stop()
+        DefaultNetworkMonitor.stop(this)
         runCatching { running?.shutdown() }
     }
 
@@ -233,7 +240,7 @@ class BoxService(private val service: Service, private val platformInterface: Pl
                 return
             }
 
-            DefaultNetworkMonitor.start()
+            DefaultNetworkMonitor.start(this)
 
             try {
                 core?.applyConfig(content, buildOverrides())
@@ -299,7 +306,9 @@ class BoxService(private val service: Service, private val platformInterface: Pl
     }
 
     override fun onCoreTraffic(upPerSecond: Long, downPerSecond: Long) {
-        notification.updateTraffic(upPerSecond, downPerSecond)
+        // The native callback carries no client token of its own; the notification
+        // resolves it against the live generation and refuses it once closed.
+        notification.updateCoreTraffic(upPerSecond, downPerSecond)
     }
 
     fun serviceReload() {
@@ -390,6 +399,13 @@ class BoxService(private val service: Service, private val platformInterface: Pl
     @OptIn(DelicateCoroutinesApi::class)
     @Suppress("SameReturnValue")
     internal fun onStartCommand(): Int {
+        // A destroyed instance is terminal (P0-A). Android can deliver onStartCommand
+        // for a Service it is recreating, but that is a NEW instance - this one must
+        // not restart, re-attach, re-register its receiver or re-post a notification.
+        if (lifecycle.isClosed) {
+            android.util.Log.i("InterstellarUI", "onStartCommand on a destroyed service instance; refusing")
+            return Service.START_NOT_STICKY
+        }
         when (status.value) {
             Status.Starting, Status.Started -> return Service.START_NOT_STICKY
 
@@ -420,12 +436,16 @@ class BoxService(private val service: Service, private val platformInterface: Pl
         }
 
         GlobalScope.launch(Dispatchers.IO) {
-            try {
+            val started = try {
                 startCore()
             } catch (e: Exception) {
                 stopAndAlert(Alert.StartCommandServer, e.message)
                 return@launch
             }
+            // P0-D: a superseded start is terminal. Continuing would apply a config to a
+            // core that was never published, show "Started" for a service that is going
+            // away, and re-post a notification from a dead generation.
+            if (started != CoreStartResult.PUBLISHED) return@launch
             // A stop that landed while startCore() was in flight must win. The check
             // below is not enough on its own: startCore() has already assigned `core`
             // and attached the fact bridge by now, so simply returning here would
@@ -447,21 +467,26 @@ class BoxService(private val service: Service, private val platformInterface: Pl
     @OptIn(DelicateCoroutinesApi::class)
     internal fun onDestroy() {
         binder.close()
-        // System-initiated destruction arrives with no preceding stopService(): a
-        // process teardown, a revoked VPN, an OEM kill. Whatever is still held must
-        // still converge, and through the SAME idempotent release every other path
-        // uses - not a second, drifting cleanup.
+        // Terminal, and deliberately UNCONDITIONAL. The old guard below only tidied up
+        // when `core`/`factSession`/`fileDescriptor` were already set - but the window
+        // that matters is exactly the one where all three are still null, with
+        // startCore() sitting inside created.startup(). Closing the lifecycle here
+        // invalidates that attempt and refuses every later one, so it cannot publish a
+        // core behind a destroyed Service (P0-A).
+        lifecycle.close()
         if (receiverRegistered) {
             runCatching { service.unregisterReceiver(receiver) }
             receiverRegistered = false
         }
         runCatching { notification.close() }
-        if (core != null || factSession != null || fileDescriptor != null) {
-            // GlobalScope is deliberate rather than incidental: every Android-owned
-            // scope may already be dying with this Service, and the native teardown
-            // (fact drain, then CommandServer shutdown) must still reach completion.
-            GlobalScope.launch(Dispatchers.IO) { releaseCore() }
-        }
+        // Also unconditional: releaseCore() is idempotent, mutex-serialized, and only
+        // touches fields this instance owns. It cannot damage a successor, because the
+        // process-global DefaultNetworkMonitor is now released by owner key rather than
+        // by the singleton (see its stop()).
+        // GlobalScope is deliberate rather than incidental: every Android-owned scope
+        // may already be dying with this Service, and the native teardown (fact drain,
+        // then CommandServer shutdown) must still reach completion.
+        GlobalScope.launch(Dispatchers.IO) { releaseCore() }
     }
 
     internal fun onRevoke() {
@@ -513,6 +538,15 @@ class BoxService(private val service: Service, private val platformInterface: Pl
     }
 }
 
+/** Outcome of one core start attempt. See `BoxService.startCore`. */
+internal enum class CoreStartResult {
+    /** The core was published and the caller may proceed to `startService()`. */
+    PUBLISHED,
+
+    /** A stop or destroy won the race; nothing was published and the caller must stop. */
+    SUPERSEDED,
+}
+
 /**
  * Ownership gate for "which core generation may be published".
  *
@@ -531,12 +565,40 @@ internal class CoreLifecycle {
     private val lock = Any()
     private var generation = 0L
     private var published: Long? = null
+    private var closed = false
 
-    /** Begin a start attempt. The returned token authorizes exactly one [publish]. */
-    fun beginStart(): Long = synchronized(lock) { ++generation }
+    /**
+     * Begin a start attempt, or **null** when this owner is already closed.
+     *
+     * Refusing here — before any native object is created — is what keeps a destroyed
+     * Service from building a core it could later publish. Checking a flag after
+     * `startup()` would still leave the CommandServer and the fact bridge alive.
+     */
+    fun beginStart(): Long? = synchronized(lock) {
+        if (closed) return null
+        ++generation
+    }
 
-    /** Invalidate every in-flight start attempt. Called by teardown, before release. */
-    fun invalidate(): Long = synchronized(lock) { ++generation }
+    /** Invalidate in-flight attempts without closing: a normal stop may still restart. */
+    fun invalidate() = synchronized(lock) { ++generation }
+
+    /**
+     * Terminal. A destroyed Service instance must never start, restart, re-attach or
+     * re-post a notification, so this both invalidates what is in flight and refuses
+     * everything that follows.
+     */
+    fun close() = synchronized(lock) {
+        // Two halves, each load-bearing and each separately tested:
+        //  - the generation bump invalidates every attempt already in flight, so a
+        //    start() that is inside startup() can no longer publish;
+        //  - the closed flag refuses every attempt that has not begun yet.
+        // Removing either one re-opens a distinct hole, so neither is decoration.
+        closed = true
+        ++generation
+    }
+
+    /** True once [close] ran. Distinct from [isPublished]: both can be true at once. */
+    val isClosed: Boolean get() = synchronized(lock) { closed }
 
     /**
      * Run [block] only if [attempt] is still the youngest generation.
@@ -546,6 +608,12 @@ internal class CoreLifecycle {
      * a core without its bridge (or the reverse).
      */
     fun publish(attempt: Long, block: () -> Unit): Boolean = synchronized(lock) {
+        // Only the generation is consulted here, and that is sufficient by
+        // construction: [close] bumps the generation, so every attempt taken before a
+        // destroy is stale by the time it tries to publish, and [beginStart] refuses to
+        // issue an attempt after one. A `closed` test here would be unreachable code
+        // pretending to be the protection - the generation bump is the protection, and
+        // the test suite injects its removal to prove that.
         if (attempt != generation) return false
         block()
         published = attempt
