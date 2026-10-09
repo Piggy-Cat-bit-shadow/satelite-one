@@ -425,6 +425,60 @@ class PlatformFactsTest {
         settle()
     }
 
+
+    // ---- P1-D: the trim level is forwarded, not interpreted ----
+
+    @Test
+    fun `every Android trim level arrives unmodified, in order`() {
+        // The round's P1-D question, as an assertion: the app forwards Android's raw
+        // onTrimMemory(level) and does NOT decide for itself which levels are "severe".
+        //
+        // The specific misreading this pins down: treating 20 (UI_HIDDEN - the app merely
+        // went to the background) as memory pressure, or adopting Apple's 50 MiB
+        // NetworkExtension budget as an Android threshold. Neither exists here, and the
+        // levels that would expose them are exactly 20, 5 and 10.
+        //
+        // 5/10/15/20/40/60/80 are the documented TRIM_MEMORY_* values; 0 and 999 are
+        // unknown values, which must pass through just as literally - a level the app does
+        // not recognise is still a fact Android reported, and inventing an interpretation
+        // is the one thing this class must never do.
+        val levels = listOf(5, 10, 15, 20, 40, 60, 80, 0, 999, -1)
+
+        val sink = RecordingSink()
+        PlatformFacts.attach(sink)
+        awaitAtLeast(sink, 2)          // the initial screen/foreground report
+        sink.events.clear()
+
+        for (level in levels) PlatformFacts.onMemoryTrim(level)
+        val expected = levels.map { "trim:$it" }
+        val deadline = System.currentTimeMillis() + 5_000
+        while (sink.events.size < expected.size && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5)
+        }
+
+        check(sink.events.toList() == expected) {
+            "trim levels must arrive verbatim and in FIFO order.\n  expected=$expected\n  actual  =${sink.events}"
+        }
+    }
+
+    @Test
+    fun `no trim is delivered after the session is detached`() {
+        // The companion property: the levels above are facts *for a session*. Once that
+        // session is gone they must not reach it - a trim delivered to a closed bridge is
+        // the use-after-close this class's ownership gate exists to prevent.
+        val sink = RecordingSink()
+        val session = PlatformFacts.attach(sink)
+        awaitAtLeast(sink, 2)
+        runBlocking { PlatformFacts.detachAndDrain(session) }
+        sink.events.clear()
+
+        PlatformFacts.onMemoryTrim(5)
+        PlatformFacts.onMemoryTrim(80)
+        settle()
+
+        check(sink.events.isEmpty()) { "a detached sink received a trim: ${sink.events}" }
+    }
+
     @Test
     fun `a stale token cannot unbind a newer session`() {
         val first = RecordingSink()
