@@ -118,4 +118,57 @@ class NotificationPublishGateTest {
         check(!r2.gate.publish(gen2) { r2.posted += "slipped-through" })
         check(r2.posted.isEmpty())
     }
+
+    // ---- P0-B: one session, one token ----
+
+    @Test
+    fun `a text refresh does not open a second generation`() {
+        // show(Starting) followed by show(Started) must stay in the same session. The old
+        // call site opened unconditionally on every show(), so the second call minted a
+        // new token - and the *previous* client's token stopped being current, while any
+        // callback still in flight would then be judged against a token that had moved on.
+        val r = Recorder()
+        val starting = r.gate.beginOrRefreshSession()
+        val started = r.gate.beginOrRefreshSession()
+        check(started == starting) {
+            "a text refresh must not open a new generation: $starting -> $started"
+        }
+        check(r.gate.publish(starting) { r.posted += "traffic" }) {
+            "the single session token must still be able to publish"
+        }
+        check(r.posted.toList() == listOf("traffic"))
+    }
+
+    @Test
+    fun `a restart after close does open a new generation, and the old token stays dead`() {
+        val r = Recorder()
+        val first = r.gate.beginOrRefreshSession()
+        r.gate.close()
+        val second = r.gate.beginOrRefreshSession()
+        check(second != first) { "a Stop->Start must open a new generation" }
+        check(r.gate.publish(second) { r.posted += "new" })
+        check(!r.gate.publish(first) { r.posted += "old" }) {
+            "the previous session's token must stay dead"
+        }
+        check(r.posted.toList() == listOf("new")) { "got ${r.posted}" }
+    }
+
+    @Test
+    fun `a late traffic callback from the previous client is refused by the successor`() {
+        // The P0-B hazard, stated as a test: client A is mid-callback when the user hits
+        // Stop and immediately reconnects, so B owns the live token by the time A's
+        // callback runs. A must be refused - the old shared-handler shape read the live
+        // `generation` field and would have been authorised as B.
+        val r = Recorder()
+        val tokenA = r.gate.beginOrRefreshSession()
+        r.gate.close()                      // Stop
+        val tokenB = r.gate.beginOrRefreshSession()   // immediate reconnect
+        check(tokenB != tokenA)
+        // A's callback finally runs, carrying its own (dead) token.
+        check(!r.gate.publish(tokenA) { r.posted += "stale-A" }) {
+            "a previous client's callback must not publish under the successor"
+        }
+        check(r.gate.publish(tokenB) { r.posted += "B" })
+        check(r.posted.toList() == listOf("B")) { "got ${r.posted}" }
+    }
 }

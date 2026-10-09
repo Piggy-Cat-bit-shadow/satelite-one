@@ -30,8 +30,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.withContext
 
 class ServiceNotification(private val status: MutableLiveData<Status>, private val service: Service) :
-    BroadcastReceiver(),
-    CommandClient.Handler {
+    BroadcastReceiver() {
     companion object {
         private const val notificationId = 1
         private const val notificationChannel = "service"
@@ -115,10 +114,13 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
 
     fun show(profileName: String, @StringRes contentTextId: Int) {
         synchronized(lifecycleLock) {
-            generation = gate.open()
+            // show(Starting) followed by show(Started) is the SAME session refreshing its
+            // text; only a Stop->Start opens a new generation. The rule is in the gate so
+            // it is unit-tested rather than trusted.
+            generation = gate.beginOrRefreshSession()
             // A restart (pendingRestart Stop→Start) reuses this instance after close()
             // cancelled the previous scope, so a fresh session is mandatory here.
-            if (session == null) session = newSession()
+            if (session == null) session = newSession(generation)
             showingTraffic = false
         }
         staticTitle = profileName.takeIf { it.isNotBlank() } ?: service.getString(R.string.app_name)
@@ -159,9 +161,30 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
     }
 
     /** The live generation's client. Must be called before [close] invalidates it. */
+    /**
+     * The live generation token, or null when the gate is closed.
+     *
+     * For the one traffic source that has no client of its own: the core's native
+     * `onCoreTraffic` callback. It belongs to whichever core is running *now*, so it
+     * publishes under the current generation - and a closed gate refuses it, which is
+     * what keeps a late native callback from re-posting after Stop.
+     */
+    private fun currentGeneration(): Int? = synchronized(lifecycleLock) {
+        if (gate.isOpen(generation)) generation else null
+    }
+
+    /**
+     * Traffic reported by the running core's native callback rather than by this
+     * notification's own Status stream (`PlatformInterfaceWrapper.onCoreTraffic`).
+     */
+    fun updateCoreTraffic(upPerSecond: Long, downPerSecond: Long) {
+        val token = currentGeneration() ?: return
+        updateTraffic(token, upPerSecond, downPerSecond)
+    }
+
     private fun currentClient(): CommandClient? = synchronized(lifecycleLock) {
         if (!gate.isOpen(generation)) return null
-        session?.client ?: newSession().let { created ->
+        session?.client ?: newSession(generation).let { created ->
             // Store the Session (scope + client), not the client alone: the scope is what
             // close() must cancel, and keeping only the client would leak the scope.
             session = created
@@ -169,12 +192,41 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
         }
     }
 
-    private fun newSession(): Session {
+    private fun newSession(token: Int): Session {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         return Session(
             scope,
-            CommandClient(scope, CommandClient.ConnectionType.Status, this, localOnly = true),
+            // The handler is per-session, never `this`. See GenerationHandler.
+            CommandClient(scope, CommandClient.ConnectionType.Status, GenerationHandler(token), localOnly = true),
         )
+    }
+
+    /**
+     * One notification generation's callback surface.
+     *
+     * The client is given THIS object rather than the ServiceNotification, so every
+     * callback carries the generation it was created for. An old client whose traffic
+     * callback lands after a Stop therefore presents its own dead token and is refused
+     * by the gate. Using the shared instance instead let a late callback read the live
+     * `generation` field and be authorised by the *successor's* identity, which is how
+     * a stale update could re-post a notification under a session it did not belong to.
+     *
+     * `onConnected` / `onDisconnected` / `onConnectionError` are deliberately not
+     * overridden: this notification is driven by the status + traffic stream, it keeps
+     * no connection state, and an old client's connect/disconnect callback therefore has
+     * nothing to corrupt.
+     */
+    private inner class GenerationHandler(private val token: Int) : CommandClient.Handler {
+        override fun updateStatus(status: StatusMessage) {
+            if (!status.trafficAvailable) {
+                // No kernel traffic manager for this config (a raw JSON that never enables
+                // one). Reposting "0 B/s" every second would advertise a measurement that
+                // does not exist, so fall back to the static line.
+                restoreStaticContent(token)
+                return
+            }
+            updateTraffic(token, status.uplink, status.downlink)
+        }
     }
 
     suspend fun start() {
@@ -217,27 +269,18 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
         receiverRegistered = false
     }
 
-    override fun updateStatus(status: StatusMessage) {
-        if (!status.trafficAvailable) {
-            // No kernel traffic manager for this config (a raw JSON that never
-            // enables one). Reposting "0 B/s ↑ 0 B/s ↓" every second would advertise
-            // a measurement that does not exist, so fall back to the static line.
-            restoreStaticContent()
-            return
-        }
-        updateTraffic(status.uplink, status.downlink)
-    }
-
     /**
      * A kernel without a traffic manager has no rates at all; reposting "0 B/s ↑
      * 0 B/s ↓" every second would advertise a measurement that does not exist.
      * Falls back to the static line exactly once per transition.
      */
-    private fun restoreStaticContent() {
+    private fun restoreStaticContent(token: Int) {
         if (!Settings.dynamicNotification || !checkPermission()) return
         val title = staticTitle ?: return
         val text = staticText ?: return
-        gate.publish(generation) {
+        // Under the CALLER's token, not the current generation: a callback from a closed
+        // generation must find its own gate shut.
+        gate.publish(token) {
             if (!showingTraffic) return@publish
             showingTraffic = false
             InterstellarApplication.notificationManager.notify(
@@ -248,7 +291,7 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
     }
 
     /** Engine-agnostic traffic line. */
-    fun updateTraffic(upPerSecond: Long, downPerSecond: Long) {
+    private fun updateTraffic(token: Int, upPerSecond: Long, downPerSecond: Long) {
         if (!Settings.dynamicNotification || !checkPermission()) return
         val content =
             Libbox.formatBytes(upPerSecond) + "/s ↑\t" + Libbox.formatBytes(downPerSecond) + "/s ↓"
@@ -257,7 +300,7 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
         // (and close's own cancel removes it) or does nothing at all. That is what
         // removes the old window in which close could cancel between the check and the
         // post, leaving a notification that outlived the foreground service.
-        gate.publish(generation) {
+        gate.publish(token) {
             showingTraffic = true
             InterstellarApplication.notificationManager.notify(
                 notificationId,
@@ -326,10 +369,27 @@ internal class NotificationPublishGate {
     private var generation = 0
     private var open = false
 
-    /** Begin a generation and return its token. */
+    /** Begin a generation unconditionally and return its token. */
     fun open(): Int = synchronized(lock) {
         open = true
         ++generation
+        generation
+    }
+
+    /**
+     * The token a `show()` publishes under: the existing generation when this session is
+     * already open (a `show(Starting) -> show(Started)` text refresh), or a fresh one
+     * when the previous generation was closed (a real Stop -> Start).
+     *
+     * The rule lives here rather than at the call site so it is provable in a plain JVM
+     * test: opening unconditionally on every `show()` minted a second token for a session
+     * that never stopped, which made the previous client's token current again by accident.
+     */
+    fun beginOrRefreshSession(): Int = synchronized(lock) {
+        if (!open) {
+            open = true
+            ++generation
+        }
         generation
     }
 
