@@ -3,7 +3,8 @@
 > 仓库：`Piggy-Cat-bit-shadow/satelite-one`　分支：`main`　（**唯一**被修改的仓库）
 > 施工模式：AUTONOMOUS FINISH · EVIDENCE FIRST · MINIMAL PRODUCT DIFF · **NO RELEASE**
 > 开工核验 SHA（= 第七轮最终 HEAD = 当时 `origin/main`）：`bffb8ad494fb06a0782c988c914d109f18bce5db`
-> **产品代码定版 SHA（= 送 CI、并被模拟器验收的那个二进制）**：`ae89388daf284a42fc627eaa90e9fb8cd0480188`
+> **产品代码定版 SHA（= 进入固定内核 CI、并被模拟器验收的那个二进制）**：`ae89388daf284a42fc627eaa90e9fb8cd0480188`
+> **本次轻量收口开始时的仓库 HEAD**：`6ea83f884b16b706ffdc69e8d333900a89885310`（`main`，远端一致）。
 > **仓库 HEAD**：本报告本身是最后一个 commit 的内容，因此它无法在自己的文本里写出自己的 SHA
 > 而不产生“提交完还要再改一次”的循环。所以这里给的是**命令**而不是猜的数字：
 > `git rev-parse HEAD` 与 `git rev-parse origin/main`（两者相等）。要确认“送 CI 的二进制就是最终
@@ -15,14 +16,20 @@
 > **不写** `READY_FOR_RELEASE` / `REAL_DEVICE_PASS` / `FULL_APPLE_PARITY`
 > 详细证据另见仓库内已同步更正的 `docs/android-screen-power-parity-final-report.md`。
 
-本轮 5 个 commit：
+本轮的提交分两段，**不把总数写死**（纯文档提交每做一次就变一次）：
 
 ```
-ae89388 test(android): make S08 drive both outcomes, instead of hoping the scheduler does
-54a3eb0 docs(android): reconcile the round-7 report with round-8 evidence, item by item
-f2cde01 ci: run the Android dev CI only on manual dispatch
-15c432d test(android): pin the screen seed wiring, the same-value observation and the pre-read epoch
+# 阶段提交（源码 / 测试 / CI / 文档），共 5 条：
 481e370 fix(android): invalidate stale screen snapshots by observation epoch, taken before the read
+15c432d test(android): pin the screen seed wiring, the same-value observation and the pre-read epoch
+f2cde01 ci: run the Android dev CI only on manual dispatch
+54a3eb0 docs(android): reconcile the round-7 report with round-8 evidence, item by item
+ae89388 test(android): make S08 drive both outcomes, instead of hoping the scheduler does
+
+# 随后两个纯文档提交（把 CI 实测与设备实测写进报告）：
+e0284cc / 6ea83f8
+
+# 截至 6ea83f8 共 7 条。之后是否还有纯文档提交，看 git log。
 ```
 
 > **一次 CI 抓到真问题**：最终代码上的第一次 dispatch（run `38005659283` / #53）在
@@ -130,7 +137,10 @@ internal fun seedInitialScreen(readInteractive: () -> Boolean): Boolean {
 - 守卫量改为 `observationEpoch`：**任意真实屏幕广播都自增**（含同值）。
 - `onChanged` 仍返回“电平是否跳变”，`(unchanged)` 日志语义与“一次观测一次下发”的交付契约不变。
 - `version` 不再承重、**已删除** —— 本轮净减一个并发状态量，而不是为保留旧测试多留一个计数。
-- 锁顺序审计：`PlatformFacts.lock` 与 `ScreenFactState` 内锁**顺序调用、不嵌套**，无反向嵌套；
+- 锁顺序（**第八轮二次更正**，此前写的“不嵌套”是错的）：`attach()` 与 `onScreenChanged()` 在持有
+  **外层 `PlatformFacts.lock`** 时进入 `ScreenFactState` 的内部同步方法，**存在嵌套**；`seedInitialScreen()`
+  不持外层锁。已确认的获取方向是**外层 → 内层**，所检查路径**未发现反向获取顺序**，因此没有已确认的
+  锁倒置死锁；这**不等于**声称无嵌套，也不等于对所有可能路径做过形式化证明。
   `attach()` 的初始状态、`onScreenChanged()`、`seedInitialScreen()` 共用同一事实来源，无影子 `screenOn`。
 - **没有**为制造竞态去改 receiver 的线程模型、加 `Thread.sleep`、或给 Android 加常驻后台工作。
 
@@ -235,7 +245,7 @@ RawConfigDetector 6 · LogUiPublishGate 8 · SessionGate 11 · TrafficDisplay 7 
 |---|---|
 | Run | **`38006795028`（run #54）**，`workflow_dispatch`，`core_ref=c35faabf402a4da93b8c31cdfad941b8b1528ffc` |
 | `head_sha` | **`ae89388daf284a42fc627eaa90e9fb8cd0480188`**（= 最终产品 SHA，精确匹配） |
-| 结论 | **success**，25 个步骤全部 success；唯一 skipped 是 `Build libbox.aar …@testing`（缓存命中） |
+| 结论 | **success**（25 个步骤中 **24 success + 1 expected skipped**）——被跳过的正是 `Build libbox.aar …@testing`，因 **cache hit** 正常跳过；`Unit tests`、`Assemble debug APK`、`Validate core provenance` 等 app 侧步骤**全部真实执行并通过** |
 | 日志原文 | `core_ref override in effect; this run does NOT track testing HEAD` / `resolved core = c35faabf…` / `Cache restored from key: libbox-Piggy-Cat-bit-shadow/sing-box-testing-c35faabf…` / `OK: libbox.aar (117407756 bytes) carries core revision c35faabf…` / `BUILD SUCCESSFUL` |
 | Artifact | `satelite-one-debug-ae89388…`，id `11651178888`，`104 735 665` B |
 | Artifact ZIP sha256 | `bf738e4bde50956efcd70317beb10b916adb60dd449a2f19d42f90e7df1bf4f6` —— 与 GitHub API 报的 `digest` **逐字相同** |
@@ -415,8 +425,10 @@ cp: cannot stat 'libbox.aar': No such file or directory
 | 项 | 值 |
 |---|---|
 | 起始 SHA | `bffb8ad494fb06a0782c988c914d109f18bce5db` |
-| 最终 SHA | **`ae89388daf284a42fc627eaa90e9fb8cd0480188`** |
-| 本轮 commit（5 条） | `481e370` 源码 / `15c432d` 测试 / `f2cde01` CI / `54a3eb0` 文档 / `ae89388` 测试（修 flaky） |
+| 产品代码定版 SHA（送 CI / 上机验收的那个二进制） | **`ae89388daf284a42fc627eaa90e9fb8cd0480188`** |
+| 本次轻量收口开始时仓库 HEAD | `6ea83f884b16b706ffdc69e8d333900a89885310`（`main`，远端一致） |
+| 阶段 commit（5 条） | `481e370` 源码 / `15c432d` 测试 / `f2cde01` CI / `54a3eb0` 文档 / `ae89388` 测试（修 flaky） |
+| 随后纯文档 commit | `e0284cc`、`6ea83f8`（本次轻量收口又追加一条纯文档修正） |
 | 推送方式 | **两次普通 fast-forward**（`bffb8ad..54a3eb0`、`54a3eb0..ae89388`），无 force、无 rebase、无历史重写 |
 | 本地 = 远端 | `HEAD == origin/main` ✅ |
 | 远端分支 | **仅 `main`** |
@@ -454,10 +466,10 @@ cp: cannot stat 'libbox.aar': No such file or directory
 | 标签 | 适用范围 |
 |---|---|
 | ✅ **`ANDROID_CLIENT_CODE_CLOSED`** | 本轮 P0（取样时序 + 守卫量）已修，并被**驱动真实生产入口**的确定性测试钉住；旧红→新绿有断言原文与日志；`A04b` 的语义矛盾已改写；全量 210/20 类全绿 |
-| ✅ **`PINNED_CI_VERIFIED`** | 最终产品 SHA `ae89388…` 上的 `workflow_dispatch(core_ref=c35faabf…)` **全绿**（25 步，无 skipped）；artifact/ZIP/APK/`libbox.so` 身份链与 pin 逐项相符；**如实注明该 run 为 cache hit** |
+| ✅ **`PINNED_CI_VERIFIED`** | 最终产品代码 SHA `ae89388…` 上的 `workflow_dispatch(core_ref=c35faabf…)` **全绿**（25 步 = 24 success + 1 expected skipped，被跳过的是缓存命中的内核构建）；artifact/ZIP/APK/`libbox.so` 身份链与 pin 逐项相符；**如实注明该 run 为 cache hit** |
 | ✅ **`EMULATOR_REGRESSION_VERIFIED`**（仅已测项） | 最终 CI APK：安装 → 授权 → `core STARTED` → `tun0`；屏幕事实 8 轮成对；Stop→Start 20/20（另 20+20 轮）；退后台隧道存活；0 crash / 0 ANR |
 | ✅ **`FIXED_LATENT_CONTRACT_DEFECT`** | 精确适用于 P0-A：今日主 looper 路径上**不可达**的潜在并发隐患。**不写**“已复现线上息屏断流” |
-| ✅ **`UI_DRIVER_ARTIFACT`** | 第七轮 `19/20` 的归因（同一二进制换语义驱动即 20/20）；原 `19/20` 事实保留 |
+| ✅ **`UI_DRIVER_ARTIFACT`** | 第七轮 `19/20` 的归因：**新测试强烈支持这是驱动脚本因素**（同一二进制换成语义驱动即 20/20）；但**那一次具体是哪一下没送达并未被反向还原**，所以这是强支持的归因，不是绝对证明。原 `19/20` 事实保留 |
 | ✅ **`POWER_BENCHMARK_NOT_REQUIRED`** | 用户明确取消功耗量化；不是未完成技术债 |
 | ⚠️ **`REAL_DEVICE_PENDING`** | 长息屏持续流、OEM Doze、蜂窝、热点、`onRevoke`、解锁沿 |
 | ⚠️ **`NO_RELEASE`** | `RELEASE_NOT_TRIGGERED`：未创建 Tag / Release，未使用生产签名 |
@@ -475,7 +487,7 @@ cp: cannot stat 'libbox.aar': No such file or directory
 
 - **做完的**：P0 修复 + 真实生产入口测试 + 旧红新绿；`19/20` 归因；全量本地测试与门禁脚本；
   一次固定 pin 手动 CI 并取回真实 APK；该 APK 的设备回归；A–G 报告 20 条矛盾逐条清理；
-  5 个 commit 普通 push、远端回读一致。
+  5 个阶段 commit 加随后两条纯文档 commit，全部普通 push、远端回读一致（总数不写死）。
 - **做不到的客观原因**：真机（无设备）、Doze/解锁沿/息屏注入触摸（AVD 无锁屏、充电态、显示控制器
   丢弃注入触摸）、其它 App 的隧道路径流量（本窗口内无此类流量，且 Chrome 路径无法证明可达）。
 - **额外代价的取舍**：第二次 CI（强制 cache miss 以证明内核可重建）**未做**，因为会额外消耗

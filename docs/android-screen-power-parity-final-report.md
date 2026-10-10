@@ -268,9 +268,16 @@ RED 的取得方式可复核：用 `round8/mutate.py` 把**生产源码**字节�
 更新，丢掉它才是正确结果；保留旧断言等于保留它所庇护的洞。
 `ScreenSeedWiringTest.S03` / `S12b` 是该洞的破坏性对照。
 
-**注意结论范围**：`PlatformFacts` 的 `lock` 与 `ScreenFactState` 的内锁是**顺序调用、不嵌套**，
-锁顺序审计无反向嵌套；`attach()` 的初始状态、`onScreenChanged()`、`seedInitialScreen()` 共用
-同一个事实来源，没有影子 `screenOn` 状态。
+**注意结论范围（第八轮二次更正）**：此前这里写的"顺序调用、不嵌套"**是错的**。逐行核对
+`PlatformFacts` 的实际调用：`onScreenChanged()`（`synchronized(lock)` 内调用 `screen.onChanged`）、
+`attach()`（`synchronized(lock)` 内读 `screen.current`）、`isScreenOn` / `observedScreenEpoch`
+访问器都是**在持有外层 `PlatformFacts.lock` 的同时**进入 `ScreenFactState` 的内部同步方法，
+所以**存在嵌套**；只有 `seedInitialScreen()` 不持外层锁，单独取内锁。
+
+准确表述：**已确认的获取方向是外层 `PlatformFacts.lock` → 内层 `ScreenFactState` lock；在所检查
+路径上未发现反向获取顺序，因此没有已确认的锁倒置死锁。** 但这只是**对所检查路径的审计**，
+既不能声称"无嵌套"，也不宣称对所有可能路径做过形式化证明。`attach()` 的初始状态、
+`onScreenChanged()`、`seedInitialScreen()` 共用同一个事实来源，没有影子 `screenOn` 状态。
 
 ---
 
@@ -492,7 +499,7 @@ java.lang.IllegalStateException: no snapshot was ever applied in 200 rounds
 > 自我纠正：最初我把"每轮只有 1 次 `startProxy`"误读为"第二次点击丢失"。核对 stop 路径日志后
 > 确认每轮**本应**只有 1 次（第一次点击是 Disconnect，不调 `startProxy`）。记录在此以免被当成缺陷。
 >
-> **第八轮更正（方法层面）**：这一段（以及 @@REFE-13@@ 的候选复测）用的是"两次固定坐标裸点击、
+> **第八轮更正（方法层面）**：这一段（以及 E-8 的候选复测）用的是"两次固定坐标裸点击、
 > 点击之间不取样"的脚本。用 `logcat -d` 做**行数相减**来数 `startProxy` 的次数本身是不可靠的
 > —— `logcat -d` 只返回环缓冲**剩余**内容（当时 main 缓冲 2 MiB，实测一分钟就被系统刷掉），
 > 长周期里会算出 0 甚至**负增量**。第八轮改为"只扫描本轮标记之后的行"，并同时统计
@@ -670,7 +677,7 @@ FGS 记录 1、通知 1。
 
 | run | event | SHA | 结论 | 失败步骤 | Unit tests |
 |---|---|---|---|---|---|
-| `37994573941` | **workflow_dispatch**（`core_ref=c35faabf…`） | `1efaa8fe` | **success** | — | **success** |
+| `37994573941` | **workflow_dispatch**（`core_ref=c35faabf…`）**，该 run 为 cache hit** | `1efaa8fe` | **success** | — | **success** |
 | `37994563503` | push（跟随 `testing` HEAD） | `1efaa8fe` | **failure** | `Build libbox.aar from …@testing` | **skipped** |
 | `37993838252` | workflow_dispatch（`core_ref=c35faabf…`） | `c9691263` | **success** | — | success |
 | `37994714715` | push | `fa5fb045` | failure | `Build libbox.aar from …@testing` | skipped |
@@ -715,7 +722,7 @@ FGS 记录 1、通知 1。
 |---|---|
 | Run ID / 触发方式 | `38006795028`（run #54） / `workflow_dispatch(core_ref=c35faabf402a4da93b8c31cdfad941b8b1528ffc)` |
 | `head_sha` | `ae89388daf284a42fc627eaa90e9fb8cd0480188`（= 本轮最终产品 SHA） |
-| 结论 | **success**（全部 25 个步骤，无 skipped） |
+| 结论 | **success**（25 个步骤中 **24 success + 1 expected skipped**；被跳过的正是 `Build libbox.aar …@testing`，因 **cache hit** 而正常跳过） |
 | Artifact 名 | `satelite-one-debug-ae89388daf284a42fc627eaa90e9fb8cd0480188`，id `11651178888`，`104735665` B |
 | Artifact ZIP sha256 | `bf738e4bde50956efcd70317beb10b916adb60dd449a2f19d42f90e7df1bf4f6`（与 API 报 `digest` **逐字相同**） |
 | 装机 x86_64 APK sha256 | `a66dc4df793cbb8ae0a72af20effbff90b00693e8d4fd476ab885effe73adc7f`，`54472386` B |
@@ -734,7 +741,7 @@ FGS 记录 1、通知 1。
 > 检查、APK 组装与打包内核身份校验**全部真实通过**。
 > **没有证明什么**：内核本身的可构建性（走了缓存）、以及代码在设备上的运行行为（见 E-9）。
 
-### E-12 第八轮修复后的包在真机级设备上的回归（最终 CI APK）
+### E-12 第八轮修复后的包在 Android 16 / x86_64 模拟器上的验证（最终 CI APK）
 
 被测包 **就是 E-11 的 CI 产物**（App `ae89388daf284a42fc627eaa90e9fb8cd0480188`，x86_64 sha256 `a66dc4df793cbb8ae0a72af20effbff90b00693e8d4fd476ab885effe73adc7f`），不是本地重编的包。
 
@@ -761,7 +768,7 @@ FGS 记录 1、通知 1。
 > `1efaa8f` 上做归因，一次在本轮最终 CI APK 上做验收），两次都是 20/20；数字分别来自各自的
 > 日志文件，未合并、未只报好的一次。
 
-> **与 `1efaa8f` 的关系**：`1efaa8f` 是**修前**包，其设备证据见 @@REFE-13@@/E-9；本节的包是
+> **与 `1efaa8f` 的关系**：`1efaa8f` 是**修前**包，其设备证据见 E-8（第七轮候选回归）与 E-9（第八轮语义驱动回归）；本节的包是
 > **修后**包（含 P0 修复），两者不可混同。
 
 ### E-13 第八轮本地产物核验（不依赖 CI 即可复核）
@@ -844,7 +851,7 @@ python .github/scripts/check_core_provenance.py app/libs/libbox.aar app/libs/lib
 
 ### G-1 剩余事项
 
-1. ~~Gate 4-B 设备复测~~ —— **第七轮已完成**（候选 APK 在同一 AVD 上复跑，见 @@REFE-13@@），
+1. ~~Gate 4-B 设备复测~~ —— **第七轮已完成**（候选 APK 在同一 AVD 上复跑，见 E-8），
    **第八轮已定因**（语义驱动 20/20，见 E-9）。**此条不再挂着"未执行"**；第七轮旧文本里
    "本段未执行"与"已完成"并存的矛盾已按实测结论统一。
 2. **T01–T12**：设备端场景矩阵，第八轮逐项判定见 D-1（T05/T08/T10/T11/T12 的范围已收紧）。
