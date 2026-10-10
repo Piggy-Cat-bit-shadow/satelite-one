@@ -3,7 +3,11 @@
 > 仓库：`Piggy-Cat-bit-shadow/satelite-one`　分支：`main`　（**唯一**被修改的仓库）
 > 施工模式：AUTONOMOUS FINISH · EVIDENCE FIRST · MINIMAL PRODUCT DIFF · **NO RELEASE**
 > 开工核验 SHA（= 第七轮最终 HEAD = 当时 `origin/main`）：`bffb8ad494fb06a0782c988c914d109f18bce5db`
-> **本轮最终 HEAD（= `origin/main`）**：`ae89388daf284a42fc627eaa90e9fb8cd0480188`
+> **产品代码定版 SHA（= 送 CI、并被模拟器验收的那个二进制）**：`ae89388daf284a42fc627eaa90e9fb8cd0480188`
+> **仓库 HEAD**：本报告本身是最后一个 commit 的内容，因此它无法在自己的文本里写出自己的 SHA
+> 而不产生“提交完还要再改一次”的循环。所以这里给的是**命令**而不是猜的数字：
+> `git rev-parse HEAD` 与 `git rev-parse origin/main`（两者相等）。要确认“送 CI 的二进制就是最终
+> 产品代码”，跑 `git diff --name-only ae89388..HEAD -- app/src/main` —— 输出为**空**。
 > 固定内核：`c35faabf402a4da93b8c31cdfad941b8b1528ffc`（**未改动**）
 > 版本：`versionCode=16` / `versionName=0.5.10`（**未改动**）
 > 结论：**`ANDROID_CLIENT_CODE_CLOSED` + `PINNED_CI_VERIFIED` + `EMULATOR_REGRESSION_VERIFIED`（仅已测项）
