@@ -2,7 +2,7 @@
 
 > 施工对象：`Piggy-Cat-bit-shadow/satelite-one`（**唯一**被修改的仓库），分支 `main`
 > 报告结构：**A–G 保留第七轮 Gate 4 与 Power 的原有证据**；第八轮在同一结构内**逐条更正
-> 矛盾**并追加实测（新增小节标 `C-1b` / `E-5d` / `E-7` / `E-8`）。
+> 矛盾**并追加实测（新增小节标 `C-1b` / `E-9` / `E-11` / `E-13`）。
 > 第七轮起始 SHA：`58b83094f9a13594edc89467f419e5b0702b99ee`
 > **第八轮起始 SHA（= 第七轮最终 HEAD）**：`bffb8ad494fb06a0782c988c914d109f18bce5db`
 > **第八轮最终 HEAD**：见 F 节（`git rev-parse HEAD` 的实测值；本行刻意不预填 SHA，
@@ -12,7 +12,7 @@
 > 本报告只写有证据的结论，范围标签见 G 节。所有 SHA / 时间 / 计数都是实际读出的值。
 >
 > **阅读提示（哪些内容属于哪一轮）**：A–B、C-2…C-5、D-0、E-1…E-3 是第七轮的证据，未改动
-> 或只做了带标记的更正；C-1 / C-1b / D-0b / D-1 / E-4…E-8 / F / G 含第八轮的更正与新增。
+> 或只做了带标记的更正；C-1 / C-1b / D-0b / D-1 / E-4…E-13 / F / G 含第八轮的更正与新增。
 > 标着 **`PENDING`** 的表格行表示对应的 CI 运行尚未返回 —— **未返回就是不写结论**。
 
 ---
@@ -413,7 +413,66 @@ FGS/通知唯一。
 | FGS / 通知 | `isForeground=true` / **恰好 1** 条 NotificationRecord |
 | 出口流量证据 | 本地测试出口记录 **165** 条真实 CONNECT，含 `www.gstatic.com:443`、`1.1.1.1:443`、`142.250.141.188:5228` |
 
-### E-3 P0 核心场景：Stop → 极短间隔 Start ×20
+### E-3 本轮新增/改写的测试与**旧红→新绿**（控制点与断言原文）
+新类 `ScreenSeedWiringTest`（15 例）与 `ScreenFactOrderingTest.A04b` 驱动的是**真实生产入口**
+`PlatformFacts.seedInitialScreen`，不是为测试重写的模型 —— 这正是第七轮"JVM 绿但生产接线顺序
+不受测试约束"的缺口所在。
+
+| 编号 | 场景 | 控制点 | 判定 |
+|---|---|---|---|
+| S01 | pre-read epoch 才是门钥匙 | `ScreenFactState.seedSnapshot` 的守卫量语义 | **绿**（RED 见下表） |
+| S02 | 读取平台期间来了广播 → 该读数已过期 | `seedInitialScreen` 的"先取 epoch → 再读平台"顺序；两个插入点（`readInteractive` 内 + 测试接缝） | **修前红**，见下表 |
+| S03 | 同值广播必须使更旧的快照失效 | `onChanged` 是否在**同值**时也自增 epoch | **修前红**，见下表 |
+| S03b | 混合重复/跳变的观测流每次都计数 | epoch 计的是**观测**而不是**跳变** | 绿 |
+| S04 | 启动即息屏 | `seedInitialScreen(false)` + `attach()` 首报 | 绿（走真实 `PlatformFacts`） |
+| S05 | 启动即亮屏且不谎报跳变 | 同值快照返回 false 且不动 epoch | 绿 |
+| S06 | OFF→ON→OFF→ON 事件流 | 顺序收敛到最新事实 | 绿 |
+| S07 | 100 次同值广播 | epoch 精确 +100；旧快照被拒 | **修前红**，见下表 |
+| S07b | 重复观测在交付侧仍恰好下发一次 | `onScreenChanged` 的投递契约（不吞新观测） | 绿 |
+| S08 | 200 轮并发观测 + 快照 | 被拒必因 epoch 变化；被接受必自洽；**两条路径各 200/200 确定性走到** | 绿（第一版是 flaky 断言，被 CI 抓出后改为显式握手，见下） |
+| S09 | Session 交接期间屏幕切换 | 只向新会话报最终事实，不碰旧会话 | 绿 |
+| S10 | 无 core 附着时收到 OFF，随后 attach | 初始状态准确且不被旧快照覆写 | **修前红**，见下表 |
+| S11 | `install()` 的幂等闩 | 体只跑一次、不永久占位 | 绿 |
+| S12a | 旧形状（读后才取钥匙）的自证 | 用旧顺序**证明它会应用过期读数** | 破坏性对照成立 |
+| S12b | 旧形状（跳变计数守卫）的自证 | 用跳变计数**证明它接受过期快照** | 破坏性对照成立 |
+
+**旧红（RED）的取得方式与断言原文**：用 `round8/mutate.py` 把**生产源码字节级**改回旧形状
+（`onChanged` 只在跳变时自增 + `seedInitialScreen` 改回"先读平台、后取 epoch"），跑**全量**
+`:app:testDebugUnitTest`：
+
+```
+RED  : 210 tests completed, 5 failed        （round8/red_phaseAB.log）
+```
+
+| 失败用例 | 修前断言原文 |
+|---|---|
+| `ScreenSeedWiringTest.S02` | `a reading superseded by a broadcast was still applied` |
+| `ScreenSeedWiringTest.S10` | `the startup reading was applied over an OFF observed before it returned` |
+| `ScreenSeedWiringTest.S03` | `a repeated observation must still advance the epoch` |
+| `ScreenSeedWiringTest.S07` | `100 observations must advance the epoch by exactly 100, got 1` |
+| `ScreenFactOrderingTest.A04b` | `it is still an observation, so the epoch moves` |
+
+恢复修复版后全量 **210 / 0 failed**（`round8/final_green.log`），并按 sha256 逐字节校验恢复
+（`ScreenFactState.kt` `46784b3ce38edcd3…`、`PlatformFacts.kt` 与提交内容 blob 相同）。
+
+**`A04b` 是改写语义而不是放松断言**：它原来断言"同值观测**不得**自增版本"，理由是"无关的重复
+广播会让仍然当前的读数看起来过期而被静默丢弃"。这个理由方向反了 —— 重复广播**就是**比该读数
+更新，丢掉它才是正确结果；保留旧断言等于保留它所庇护的洞。
+
+**S08 的 flaky 断言（由 CI 抓出，已修）**：第一版把观测线程与 seed 线程交给同一个 latch，再断言
+"两种结果都出现过"；快速 runner 上观测线程每轮都赢，于是出现
+
+```
+java.lang.IllegalStateException: no snapshot was ever applied in 200 rounds
+  at ScreenSeedWiringTest.S08 ...(ScreenSeedWiringTest.kt:309)
+```
+
+**这不是产品缺陷，而是把竞态当掷硬币**。改为显式握手：先让观测跑完 → 证明带旧 epoch 的快照
+**必被拒**；再重取 epoch → 证明它**必被应用**（两条路径各 200/200 轮确定性走到），另加一段真正
+不同步的竞争，断言"被应用 ⇒ epoch 未变 / 被拒 ⇒ epoch 已变或取值相同"。修后本地 6/6 次运行全绿
+（1 次全量 + 5 次只跑本类的复测）。
+
+### E-4 P0 核心场景：Stop → 极短间隔 Start ×20
 
 两次 `input tap` 之间**不做任何 UI 取样**，间隔覆盖 `0/10/15/20/25/30/40/50/60/75/80/90/100` ms；
 每轮等状态**稳定**后判定。
@@ -433,13 +492,13 @@ FGS/通知唯一。
 > 自我纠正：最初我把"每轮只有 1 次 `startProxy`"误读为"第二次点击丢失"。核对 stop 路径日志后
 > 确认每轮**本应**只有 1 次（第一次点击是 Disconnect，不调 `startProxy`）。记录在此以免被当成缺陷。
 >
-> **第八轮更正（方法层面）**：这一段（以及 E-5c 的候选复测）用的是"两次固定坐标裸点击、
+> **第八轮更正（方法层面）**：这一段（以及 @@REFE-13@@ 的候选复测）用的是"两次固定坐标裸点击、
 > 点击之间不取样"的脚本。用 `logcat -d` 做**行数相减**来数 `startProxy` 的次数本身是不可靠的
 > —— `logcat -d` 只返回环缓冲**剩余**内容（当时 main 缓冲 2 MiB，实测一分钟就被系统刷掉），
 > 长周期里会算出 0 甚至**负增量**。第八轮改为"只扫描本轮标记之后的行"，并同时统计
 > `core STARTED`，才对得上。
 
-### E-4 JVM 原样命令与结果
+### E-5 JVM 原样命令与结果
 
 ```
 gradlew.bat --no-daemon --max-workers=2 --console=plain :app:testDebugUnitTest :app:compileDebugKotlin
@@ -482,14 +541,14 @@ SessionGate 11 · TrafficDisplay 7 · UrlTestTarget 5` ＝ **210 / 20 类**。
 第七轮最终 = **195 / 19 类**（`192` 作废）→ 第八轮起始 `bffb8ad` = 209 / 19 类 →
 **第八轮最终 = 210 / 20 类**。
 
-### E-5 破坏性对照汇总
+### E-6 破坏性对照汇总
 
 | 对照 | 结果 |
 |---|---|
 | 删除 `ScreenFactState` 的版本守卫 | `A01` **变红**（断言原文：`the stale isInteractive seed overwrote the newer SCREEN_OFF fact`）；恢复后全绿 |
 | 上一轮本地拼装 AAR 上机 | **变红**：`kotlin.NotImplementedError: stub at Libbox.setup` → 证明该 AAR 不可用，也正是本轮改用 CI 真实 APK 的理由 |
 
-### E-5b 候选 APK 的身份链（Gate 4-B 的"改后"包）
+### E-7 候选 APK 的身份链（Gate 4-B 的"改后"包）
 
 | 项 | 值 |
 |---|---|
@@ -525,10 +584,10 @@ SessionGate 11 · TrafficDisplay 7 · UrlTestTarget 5` ＝ **210 / 20 类**。
 
 **但对第八轮最终 HEAD 不成立**：第八轮 P0 修复（`481e370`）改了
 `app/src/main/java/com/interstellar/proxy/bg/PlatformFacts.kt` 与 `ScreenFactState.kt`。
-因此 **`1efaa8f` 的设备证据属于"修前"包**；本轮修复后的包必须重新上机（见 E-5d / E-9）。
+因此 **`1efaa8f` 的设备证据属于"修前"包**；本轮修复后的包必须重新上机（见 E-9 / E-9）。
 `git diff --name-only 1efaa8f..HEAD -- app/src/main` 的实测输出正是这两个文件。
 
-### E-5c Gate 4-B 设备复测：候选 APK 在同一 AVD 上的回归
+### E-8 Gate 4-B 设备复测：候选 APK 在同一 AVD 上的回归
 
 **方法**：先卸载旧包（round-6 本地测试签名的那份，与 CI debug key 签名不兼容 →
 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`），装上候选 APK，重走 UI 导入 → VPN 授权 → 连接，
@@ -556,7 +615,7 @@ SessionGate 11 · TrafficDisplay 7 · UrlTestTarget 5` ＝ **210 / 20 类**。
 若第一下之后 UI 已经翻到 `Start proxy` 而应用仍在收尾，第二下会被读作又一次 Disconnect。
 **证据不足以断言**，因此记为 `1/20 未收敛` 的事实，不写"通过"，也不写成 P0。
 
-**第八轮已定因（见 E-5d）**：把驱动换成**语义驱动**后，同一二进制 `1efaa8f` 跑到 **20/20**。
+**第八轮已定因（见 E-9）**：把驱动换成**语义驱动**后，同一二进制 `1efaa8f` 跑到 **20/20**。
 因此 `19/20` 归因为 **`UI_DRIVER_ARTIFACT`（探针缺陷）**；第七轮那次 `19/20` 的事实**保留在
 本报告中**，不因为本轮变好就从历史里抹掉。
 
@@ -566,7 +625,7 @@ SessionGate 11 · TrafficDisplay 7 · UrlTestTarget 5` ＝ **210 / 20 类**。
 - 通知计数在连续三次取样中给出 1/1/2，是 `dumpsys notification` 同一记录被多行匹配导致的
   已知假象；`grep -c` 的口径下为 1。
 
-### E-5d 第八轮设备回归（语义驱动，同一 AVD / 同一候选包 `1efaa8f`）
+### E-9 第八轮设备回归（语义驱动，同一 AVD / 同一候选包 `1efaa8f`）
 
 **驱动方式的改变**：不再用固定坐标裸点击。每轮先 `uiautomator dump`，按**文本**定位
 `Disconnect` / `Start proxy` 节点，取**可点击祖先**的 bounds 中心点击，并**确认标签真的翻转**
@@ -607,7 +666,7 @@ FGS 记录 1、通知 1。
 > （WAKEUP）后每轮成对。这不是产品漏报 ON，是探针按错了键。另一个坑是 `logcat -d` 的环缓冲
 > （见上）。
 
-### E-6 CI：同一 SHA 的两种结果，把原因锁死在上游
+### E-10 CI：同一 SHA 的两种结果，把原因锁死在上游
 
 | run | event | SHA | 结论 | 失败步骤 | Unit tests |
 |---|---|---|---|---|---|
@@ -650,27 +709,62 @@ FGS 记录 1、通知 1。
 起，push **不再触发** Android CI。这是一条**有意引入的行为变更**，**不是**"CI 变绿了"，
 也**不是**"问题消失了"。回退方式：把 `push: branches: ['**']` 与 `pull_request:` 加回 `on:`。
 
-### E-7 第八轮固定 pin CI（唯一一次手动运行）
+### E-11 第八轮固定 pin CI（唯一一次手动运行）
 
 | 项 | 值 |
 |---|---|
-| Run ID / 触发方式 | `PENDING` / `workflow_dispatch(core_ref=c35faabf402a4da93b8c31cdfad941b8b1528ffc)` |
-| `head_sha` | `PENDING` |
-| 结论 | `PENDING` |
-| Artifact 名 | `PENDING` |
-| Artifact ZIP sha256 | `PENDING` |
-| 装机 x86_64 APK sha256 | `PENDING` |
-| artifact 内 `SHA256SUMS.txt` | `PENDING` |
-| APK 内 `lib/x86_64/libbox.so` | `PENDING` B，sha256 `PENDING`，含 pin：`PENDING` |
-| `Cache libbox.aar` | `PENDING` |
-| `Unit tests` | `PENDING` |
-| `Assemble debug APK and verify the packaged core identity` | `PENDING` |
+| Run ID / 触发方式 | `38006795028`（run #54） / `workflow_dispatch(core_ref=c35faabf402a4da93b8c31cdfad941b8b1528ffc)` |
+| `head_sha` | `ae89388daf284a42fc627eaa90e9fb8cd0480188`（= 本轮最终产品 SHA） |
+| 结论 | **success**（全部 25 个步骤，无 skipped） |
+| Artifact 名 | `satelite-one-debug-ae89388daf284a42fc627eaa90e9fb8cd0480188`，id `11651178888`，`104735665` B |
+| Artifact ZIP sha256 | `bf738e4bde50956efcd70317beb10b916adb60dd449a2f19d42f90e7df1bf4f6`（与 API 报 `digest` **逐字相同**） |
+| 装机 x86_64 APK sha256 | `a66dc4df793cbb8ae0a72af20effbff90b00693e8d4fd476ab885effe73adc7f`，`54472386` B |
+| artifact 内 `SHA256SUMS.txt` | `a66dc4df…  ./satelite-one-x86_64-debug.apk` → **一致** |
+| APK 内 `lib/x86_64/libbox.so` | `84472616` B，sha256 `f0ae9c726f8a2088a1f2e4f11ebc2ffd2947be66a0e2dda84b1d9136a7cf94c6`，含 pin：`1` 处 |
+| `Cache libbox.aar` | **`cache hit`**（key `libbox-Piggy-Cat-bit-shadow/sing-box-testing-c35faabf402a4da93b8c31cdfad941b8b1528ffc`）；`Build libbox.aar …@testing` 因此 **skipped** |
+| `Unit tests` | **success**（日志：`210 tests completed (from the test XML count)`） |
+| `Assemble debug APK and verify the packaged core identity` | **success** —— `verifyCoreProvenance: OK — packaged libbox carries the advertised core identity 'c35faabf402a4da93b8c31cdfad941b8b1528ffc'` |
 
 > **缓存口径**：`cache hit` 只说明 AAR 复用了缓存，**不**说明"这次重新编译了内核"；
 > 命中时仍然通过 `Validate core provenance` 与 APK 内 `libbox.so` 的字节身份来约束真实性。
-> 两种情形在本表中分别写明，不混用。
+> 两种情形在本表中分别写明，不混用。**本轮这一次是 `cache hit`**，所以本报告**不**声称
+> "这次从源码构建了内核"；真正从源码构建 AAR 的是第七轮的 `37985013617`。
+>
+> **这一次运行证明了什么**：最终产品 SHA 上的 Android 单测、provenance 门禁负例、发布门禁
+> 检查、APK 组装与打包内核身份校验**全部真实通过**。
+> **没有证明什么**：内核本身的可构建性（走了缓存）、以及代码在设备上的运行行为（见 E-9）。
 
-### E-8 第八轮本地产物核验（不依赖 CI 即可复核）
+### E-12 第八轮修复后的包在真机级设备上的回归（最终 CI APK）
+
+被测包 **就是 E-11 的 CI 产物**（App `ae89388daf284a42fc627eaa90e9fb8cd0480188`，x86_64 sha256 `a66dc4df793cbb8ae0a72af20effbff90b00693e8d4fd476ab885effe73adc7f`），不是本地重编的包。
+
+| 项 | 结果 |
+|---|---|
+| 安装 | 与旧本地测试签名冲突（`INSTALL_FAILED_UPDATE_INCOMPATIBLE`）→ 仅对**专用测试包** `com.interstellar.proxy.debug` 卸载后重装，`Success`；`versionName=0.5.10` |
+| 启动 / `Libbox.setup` | pid 存活、`logcat -b crash` **空**、无 `NotImplementedError`（真实 bindings） |
+| VPN 授权 | 走真实系统对话框（`Connection request` → OK） |
+| 连接闭环 | `startProxy invoked` → `config ok length=1191` → `I/Vpn: Established by com.interstellar.proxy.debug on tun0` → `core STARTED` |
+| `tun0` | `inet 172.19.0.1/30` |
+| 节点 | 走真实存储导入本地测试节点（`Local subscription` / `1 nodes`），**未使用任何真实订阅或凭据** |
+| 屏幕事实 OFF/ON | **6/6 轮成对**（`screen=false` 之后 `screen=true`），设备侧 `mWakefulness` 每轮
+`Asleep → Awake`；屏幕事件期间 `startProxy invoked` = **0**、`core STARTED` = **0** |
+| Stop→Start 收敛（语义驱动，20 轮） | **20 / 20** 结束于 `STARTED`；**每轮恰好 1 次** `startProxy invoked`
+与 **1 次** `core STARTED`；单轮 STOP 确认约 2.6–2.9 s、START 确认约 4.0–9.5 s
+（日志：`round8/gate4c_both_20.log`、`round8/probe_cycle.log`） |
+| 退后台（屏幕点亮）120 s 窗口 | `foreground=false`、`screen` 未变、`tun0` 仍在、pid 不变、
+`startProxy invoked` = 0；**该窗口内隧道路径没有任何 ACCEPT**（出口日志增长 0 B）。因此只能
+证明"退后台不触发重连、隧道存活"，**不能**证明"有流量穿过"——这一子项按 D-0b 的口径标 `NOT_RUN` |
+| crash / ANR | `logcat -b crash` **空**；权威 ANR 行 **0**（`ANR in` / `not responding`） |
+| 结束归属 | pid 存活、`tun0=1`、FGS 记录 1 |
+
+> **口径说明（必须写清）**：上表 F-3 的 20 轮与本节 20 轮是**两次独立运行**（一次在候选包
+> `1efaa8f` 上做归因，一次在本轮最终 CI APK 上做验收），两次都是 20/20；数字分别来自各自的
+> 日志文件，未合并、未只报好的一次。
+
+> **与 `1efaa8f` 的关系**：`1efaa8f` 是**修前**包，其设备证据见 @@REFE-13@@/E-9；本节的包是
+> **修后**包（含 P0 修复），两者不可混同。
+
+### E-13 第八轮本地产物核验（不依赖 CI 即可复核）
 
 | 检查 | 命令 | 结果 |
 |---|---|---|
@@ -686,13 +780,38 @@ FGS 记录 1、通知 1。
 
 ---
 
+### E-14 CI 静态门禁与本地产物核验（不依赖设备即可复核）
+
+```
+python .github/scripts/test_check_core_provenance.py   → exit 0
+   "OK: the provenance gate rejects every mismatch case"（9 个负例全被拒）
+python .github/scripts/test_release_publish_gate.py     → exit 0
+   "release publish gate: all checks passed"
+python .github/scripts/check_core_provenance.py app/libs/libbox.aar app/libs/libbox.provenance c35faabf…  → exit 0
+```
+
+| 检查 | 命令 | 结果 |
+|---|---|---|
+| 本地 AAR 是否为真内核 | `check_core_provenance.py app/libs/libbox.aar app/libs/libbox.provenance c35faabf…` | **exit 0**，`OK: libbox.aar (29217593 bytes) carries core revision c35faabf…` |
+| AAR 内 `.so` 身份 | 解压 AAR 取 `jni/x86_64/libbox.so` | `84 472 616` B，sha256 `f0ae9c726f8a2088a1f2e4f11ebc2ffd2947be66a0e2dda84b1d9136a7cf94c6`（与第七轮两个 APK 内**逐字节相同**） |
+| 打包身份门 | `:app:verifyCoreProvenance` | **PASS**：`packaged libbox carries the advertised core identity` |
+| provenance 门负例 | `test_check_core_provenance.py` | **exit 0**，9 个负例全被拒 |
+| 发布门静态检查 | `test_release_publish_gate.py` | **exit 0**，`all checks passed` |
+
+因为本机 `app/libs/libbox.aar` **就是真实固定 pin 内核**（非 stub），本轮**没有**、也**不需要**
+再尝试"真 `.so` + stub `classes.jar`"拼装 —— 那条路第七轮已证明会以
+`kotlin.NotImplementedError: stub at Libbox.setup` 崩溃。
+
+---
+
 ## F. GIT FINAL
 
 | 项 | 值 |
 |---|---|
 | 起始 SHA（本轮） | `bffb8ad494fb06a0782c988c914d109f18bce5db` |
 | 第七轮起始 SHA | `58b83094f9a13594edc89467f419e5b0702b99ee` |
-| **第八轮 commit** | `481e370` fix(android): invalidate stale screen snapshots by observation epoch, taken before the read<br>`15c432d` test(android): pin the screen seed wiring, the same-value observation and the pre-read epoch<br>`f2cde01` ci: run the Android dev CI only on manual dispatch |
+| **第八轮 commit** | `481e370` fix(android): invalidate stale screen snapshots by observation epoch, taken before the read<br>`15c432d` test(android): pin the screen seed wiring, the same-value observation and the pre-read epoch<br>`f2cde01` ci: run the Android dev CI only on manual dispatch<br>`54a3eb0` docs(android): reconcile the round-7 report with round-8 evidence, item by item<br>`ae89388` test(android): make S08 drive both outcomes, instead of hoping the scheduler does |
+| 第八轮最终 HEAD | `ae89388daf284a42fc627eaa90e9fb8cd0480188`（= `origin/main`） |
 | 第七轮 commit（`58b83094..bffb8ad`，共 14 条，此前只列了 3 条） | `7275c0f` 源码+测试：初始屏幕读数不得覆盖更新的屏幕事实<br>`32cc6cc` 测试：fact-bridge 交接与不可证明的 drain（P0-C）<br>`a5a6783` 测试：每个 trim 级别原样转发（P1-D）<br>`ffbd6aa`/`50140a8`/`c969126`/`fa5fb04`/`cae13dd`/`59b03f1`/`2b206cd`/`017fff7`/`dc80505`/`bffb8ad` 文档：A–G 报告、息屏设备证据、P1-E、候选身份链、Gate 4-B 回归、T01–T12 矩阵、CI 定位到 upstream、T08 凭流量升为 PASS |
 | 推送方式 | **普通 fast-forward**，无 force、无历史重写 |
 | 远端一致性 | `origin/main` == HEAD |
@@ -725,13 +844,13 @@ FGS 记录 1、通知 1。
 
 ### G-1 剩余事项
 
-1. ~~Gate 4-B 设备复测~~ —— **第七轮已完成**（候选 APK 在同一 AVD 上复跑，见 E-5c），
-   **第八轮已定因**（语义驱动 20/20，见 E-5d）。**此条不再挂着"未执行"**；第七轮旧文本里
+1. ~~Gate 4-B 设备复测~~ —— **第七轮已完成**（候选 APK 在同一 AVD 上复跑，见 @@REFE-13@@），
+   **第八轮已定因**（语义驱动 20/20，见 E-9）。**此条不再挂着"未执行"**；第七轮旧文本里
    "本段未执行"与"已完成"并存的矛盾已按实测结论统一。
 2. **T01–T12**：设备端场景矩阵，第八轮逐项判定见 D-1（T05/T08/T10/T11/T12 的范围已收紧）。
 3. **真机验收**：OEM 省电、蜂窝切换、实体热点、长 Doze、真实 `onRevoke`、解锁沿。
 4. **第八轮修复后的包**：P0 修复改了 `app/src/main`（`PlatformFacts.kt`、`ScreenFactState.kt`），
-   所以 `1efaa8f` 的设备证据属于"修前"包；修复后的包需按 E-7 的 CI 产物重新上机。
+   所以 `1efaa8f` 的设备证据属于"修前"包；修复后的包需按 E-11 的 CI 产物重新上机。
 
 ### G-2 需要内核介入的将来工单（**不立即操作内核**）
 
