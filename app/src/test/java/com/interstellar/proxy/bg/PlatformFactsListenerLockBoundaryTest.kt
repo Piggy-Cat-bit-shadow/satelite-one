@@ -348,6 +348,126 @@ class PlatformFactsListenerLockBoundaryTest {
             PlatformFacts.removeForegroundListener(listener)
         }
     }
+
+    /**
+     * A listener that records the same fact must not wait for itself, and must not strand the next one.
+     *
+     * Two properties, and both are about the same mechanism. `addForegroundListener` is reached from
+     * `connect()`, a subscriber's replay handler IS a listener, and the UI's listener is that
+     * subscriber - so a notification can arrive from inside a notification, on the same thread, with
+     * the outer one still on the stack.
+     *
+     *  1. The reentrant dispatch skips [awaitForegroundTurn] and delivers depth-first. Waiting would
+     *     be a self-deadlock: the predecessor ticket belongs to the dispatch this thread is already
+     *     inside, so the turn it waits for can only be granted by the frame it is blocking.
+     *  2. The OUTER dispatch must not then undo what the nested one published. The watermark is the
+     *     highest delivered ticket, and the nested ticket is strictly higher than the outer one, so
+     *     the outer's own publication has to be monotonic. A plain assignment moved it backwards and
+     *     left the NEXT notification waiting forever for a turn that had already been delivered -
+     *     measured: ticket 0 published 0, the nested ticket 1 had already published 0, the outer
+     *     re-published 0, and ticket 2 spun in `awaitForegroundTurn` waiting for 1.
+     *
+     * Property 2 is asserted by recording one more fact after the reentrant one and requiring that it
+     * arrives. That is the defect's real symptom: not a wrong value, but a notification that never
+     * comes, which in the app is a UI client that silently stops updating.
+     *
+     * # Why the record happens on the test's own thread
+     *
+     * Deliberately NOT a background thread joined with a timeout. That shape was tried first and had
+     * to be abandoned: when it detected a regression it threw while the recorded thread was still
+     * spinning in `awaitForegroundTurn`, and `tearDown` - which records a fact of its own - then took
+     * a later ticket and waited for the abandoned one, hanging the whole class instead of reporting
+     * one failure. `Thread.yield()` cannot be interrupted and the watermark is global, so there is no
+     * safe way to abandon a spinning thread. Keeping the nesting on the test thread means no such
+     * thread can exist.
+     *
+     * The cost is stated plainly: a regression shows up as a hang (caught by the build timeout) rather
+     * than a clean assertion failure. Everything asserted here is deterministic on correct code, so
+     * this test cannot flake.
+     *
+     * # What an earlier version got wrong
+     *
+     * It compared the whole recorded-order list against an exact expectation and read absolute ticket
+     * numbers out of the two private counters. Two things defeated that: subscribing replays the
+     * canonical value, so the listener records one entry before the notification under test even
+     * starts; and `PlatformFacts` is a singleton shared with every other test in this JVM, so tickets
+     * are not at known values. The assertions here are about the sequence of events within this
+     * listener and about the watermark relative to the ticket this test captured, never about
+     * absolute counter values.
+     */
+    @Test
+    fun `a listener may record the same fact without deadlocking on its own turn`() {
+        val order = CopyOnWriteArrayList<String>()
+        val lastDelivered = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        val fields = PlatformFacts::class.java
+        fun watermark(): Long =
+            fields.getDeclaredField("foregroundDelivered").apply { isAccessible = true }
+                .getLong(PlatformFacts)
+        fun sequence(): Long =
+            fields.getDeclaredField("foregroundSequence").apply { isAccessible = true }
+                .getLong(PlatformFacts)
+
+        val listener: (Boolean) -> Unit = { value ->
+            if (value) {
+                order += "outer-start"
+                val outerTicket = sequence() - 1
+                // Record the same fact from inside a listener: this is `connect()` ->
+                // `addForegroundListener()`, and the replay it performs, in miniature. Recording is
+                // synchronous, so this returns only if the reentrant dispatch did not wait for the
+                // frame below it on the stack - and if it did wait, this thread spins forever.
+                PlatformFacts.onForegroundChanged(false)
+                order += "outer-end"
+                // The next notification takes ticket outerTicket + 1 and waits for `outerTicket`.
+                // Publishing it here is what keeps that notification from waiting forever on a turn
+                // that has already been delivered.
+                val published = watermark()
+                check(published >= outerTicket) {
+                    "after the nested record returned, the outer dispatch had published " +
+                        "foregroundDelivered=$published but its own ticket was $outerTicket; the next " +
+                        "notification would wait forever for a turn that has already been delivered"
+                }
+            } else {
+                order += "nested"
+                lastDelivered.set(true)
+            }
+        }
+        PlatformFacts.addForegroundListener(listener)
+        // Subscribing replays the canonical value, which the listener above records as a "nested"
+        // entry because that value is currently false. Only the entries added by the record below are
+        // the notification under test, so the seeded replay is measured off rather than asserted
+        // over - an earlier version compared the whole list and failed on its own fixture.
+        val seeded = order.size
+        try {
+            PlatformFacts.onForegroundChanged(true)
+
+            // Depth-first: the nested fact is delivered while the outer listener is still running.
+            // This is the property that distinguishes reentrant delivery from a deferral, and the
+            // deferral is exactly what would deadlock.
+            check(order.drop(seeded) == listOf("outer-start", "nested", "outer-end")) {
+                "the reentrant notification was not delivered depth-first; observed " +
+                    "${order.drop(seeded)} (the subscribe-time replay contributes the first $seeded " +
+                    "entries). A reentrant dispatch that defers its own delivery past the listener " +
+                    "that recorded it is the self-deadlock this path exists to avoid."
+            }
+            // Property 2. This is the assertion that catches a non-monotonic publish: with the
+            // watermark moved backwards, this record spins on `Thread.yield()` in
+            // `awaitForegroundTurn` and never reaches the line below.
+            lastDelivered.set(false)
+            PlatformFacts.onForegroundChanged(false)
+            check(lastDelivered.get()) {
+                "the notification recorded AFTER the reentrant one never reached its listener. That is " +
+                    "the watermark having moved backwards: the nested dispatch published " +
+                    "${order.size} ticket(s) into the future and the outer dispatch then re-published " +
+                    "its own, lower ticket, so this notification waits for a turn that has already " +
+                    "been delivered. In the app the symptom is a UI client that stops updating."
+            }
+        } finally {
+            PlatformFacts.removeForegroundListener(listener)
+        }
+    }
+
+
     @Test
     fun `a listener may mutate the listener list without failing the notification`() {
         // The copy exists for this, and it is not the same thing as releasing the lock: iterating the

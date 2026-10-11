@@ -378,34 +378,45 @@ object PlatformFacts {
      * its callers cannot rely on.
      */
     private fun dispatchForegroundListeners(foreground: Boolean) {
-        val delivery = synchronized(lock) {
-            val next = ForegroundDelivery(foregroundSequence++, foreground)
-            foregroundListeners.toList() to next
-        }
-        val (listeners, ticket) = delivery
-        // Captured before the flag is set: a nested notification must not advance the delivery
-        // watermark past tickets its own thread has not delivered, or an unrelated thread would skip
-        // its turn and the order this function exists to guarantee would be lost.
+        // A reentrant notification is nested inside a listener of an earlier one, on this same thread.
+        // It is NOT a position in the delivery order of its own: its listeners run while the outer
+        // frame is still on the stack, so there is no instant at which "this ticket has been delivered"
+        // is true and observable - by the time it is true the outer ticket is done as well.
+        //
+        // Giving it a ticket anyway is what broke the ordering. The nested frame had to publish
+        // something or the next notification would wait for a boundary that never arrived, and
+        // publishing its own predecessor made the outer frame's publication move the watermark
+        // BACKWARDS (measured: ticket 0 published 0, nested ticket 1 published 0, ticket 0 re-published
+        // 0, and ticket 2 then spun in `awaitForegroundTurn` waiting for 1 - a notification that never
+        // arrives, which in the app is a UI client that silently stops updating).
+        //
+        // So only outermost frames take a ticket. They are the only boundaries the watermark has to
+        // describe, the numbers stay contiguous, and `foregroundDelivered != ticket - 1` keeps meaning
+        // exactly "my predecessor's whole frame, nested frames included, has finished".
         val reentrant = insideListener.get()
+        val listeners = synchronized(lock) { foregroundListeners.toList() }
+        val ticket: ForegroundDelivery?
         if (reentrant) {
-            // The notification is arriving from inside a listener of an earlier one. It must not wait
-            // for its turn, because its turn comes after the dispatch that is currently running -
-            // which is this call. Deliver it now; it is strictly newer than everything already
-            // delivered, so ordering still holds.
-            foregroundDelivered = maxOf(foregroundDelivered, ticket.sequence - 1)
+            // Deliver inline, in order, without a position of its own. This is strictly newer than
+            // everything already delivered, so depth-first delivery preserves the record order.
+            ticket = null
         } else {
-            awaitForegroundTurn(ticket.sequence)
+            val next = synchronized(lock) { ForegroundDelivery(foregroundSequence++, foreground) }
+            ticket = next
+            awaitForegroundTurn(next.sequence)
         }
         insideListener.set(true)
         try {
             listeners.forEach { listener ->
-                runCatching { listener(ticket.foreground) }
+                runCatching { listener(foreground) }
             }
         } finally {
             insideListener.set(reentrant)
         }
-        if (!reentrant) {
-            foregroundDelivered = ticket.sequence
+        if (ticket != null) {
+            // Monotonic as well: the watermark records how far delivery has provably got, and a value
+            // that can move backwards strands every notification that follows it.
+            foregroundDelivered = maxOf(foregroundDelivered, ticket.sequence)
         }
     }
 
