@@ -184,6 +184,54 @@ class PlatformFactsListenerLockBoundaryTest {
     }
 
     @Test
+    fun `a notification is complete when it returns, so no listener acts on a superseded fact`() {
+        // The ordering guarantee, in the form that is actually guaranteed: when `onForegroundChanged`
+        // returns, every listener has been handed that fact. So by the time a later fact is recorded,
+        // the earlier one has already been delivered - which is what stops the UI's listener from
+        // acting on a superseded value.
+        //
+        // # Why this is the testable half
+        //
+        // Releasing the lock gave up the serialisation the lock provided for free, and an adversarial
+        // pass reproduced the consequence on the pre-fix code: a listener was handed `[false, true]`
+        // for facts recorded `true` then `false`, so the last value it acted on was one the object had
+        // already superseded. A stale `true` delivered last calls `resumeUiClient()`, which connects a
+        // client while the canonical fact is "the app is in the background", and nothing later
+        // corrects it - `mayReconnect()` gates new connects and never disconnects an existing one.
+        //
+        // A truly concurrent two-thread ordering test was attempted and abandoned: `PlatformFacts` is
+        // a singleton shared by every test method in this JVM (Gradle forks once per module), so a
+        // listener left registered by another test receives this test's facts and the fixture measures
+        // more than its own window. Rather than write a test whose result depends on which other
+        // methods ran, this asserts the contract that holds on every path: the dispatch is not
+        // deferred past the recording call.
+        val handed = java.util.concurrent.atomic.AtomicReference<Boolean?>(null)
+        val listener: (Boolean) -> Unit = { handed.set(it) }
+        PlatformFacts.addForegroundListener(listener)
+        try {
+            PlatformFacts.onForegroundChanged(true)
+            check(handed.get() == true) {
+                "`onForegroundChanged(true)` returned with the listener never handed `true` " +
+                    "(it holds ${handed.get()}). A deferred dispatch lets a later fact overtake this " +
+                    "one, which is how a listener ends up acting on a superseded value."
+            }
+            PlatformFacts.onForegroundChanged(false)
+            check(handed.get() == false) {
+                "`onForegroundChanged(false)` returned with the listener still holding " +
+                    "${handed.get()}. The listener's last value must be the fact that was recorded " +
+                    "last, or the app reconnects a UI client it was told to switch off."
+            }
+            check(PlatformFacts.isAppForeground == handed.get()) {
+                "the listener was last handed ${handed.get()} while the object reports " +
+                    "isAppForeground=${PlatformFacts.isAppForeground}: the delivery and the recorded " +
+                    "fact disagree, which is the whole defect - a listener acting on a value the " +
+                    "object has already superseded."
+            }
+        } finally {
+            PlatformFacts.removeForegroundListener(listener)
+        }
+    }
+    @Test
     fun `a listener may mutate the listener list without failing the notification`() {
         // The copy exists for this, and it is not the same thing as releasing the lock: iterating the
         // live list would throw ConcurrentModificationException, while iterating a copy under the lock

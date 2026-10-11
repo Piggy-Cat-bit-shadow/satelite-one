@@ -84,6 +84,46 @@ class AppViewModelWiringTest {
         )
     }
 
+    /**
+     * The statements inside the braced block that opens at the first occurrence of [opening].
+     *
+     * # Why the extent matters, and why substring searches were not enough
+     *
+     * Index comparisons against a whole function body cannot tell "inside the guard" from "after it".
+     * An adversarial debug pass restored the P0-A defect by inserting two lines before the
+     * suspended-verdict early return - an unconditional `commandClient.connect()` and
+     * `registerStoppedReceiver()` - and every assertion in this file stayed green across all 196
+     * tests: the inserted call sits before the poll, so a `lastIndexOf("commandClient.connect()")`
+     * lands on the poll's call instead, and the presence checks are satisfied by the gated block that
+     * is still there and still correct.
+     *
+     * A guard whose extent is not checked is a guard that can be walked around. So the gate is now
+     * extracted as a block and the assertions are made about what is INSIDE it.
+     */
+    private fun blockAfter(body: String, opening: String): String {
+        val start = body.indexOf(opening)
+        assertTrue(
+            "the block `$opening` is gone from the function under test, so the wiring this test binds " +
+                "has moved or been renamed and the guard it checks is no longer being verified",
+            start >= 0,
+        )
+        val open = body.indexOf('{', start)
+        assertTrue("`$opening` has no block", open >= 0)
+        var depth = 0
+        var i = open
+        while (i < body.length) {
+            when (body[i]) {
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) return body.substring(open + 1, i)
+                }
+            }
+            i++
+        }
+        throw AssertionError("unbalanced braces after `$opening`")
+    }
+
     // --- the 400 ms fuse: a deliberate disconnect must not be reported as a socket loss ---------------
 
     @Test
@@ -198,32 +238,41 @@ class AppViewModelWiringTest {
                 "defect, narrowed but not fixed.",
             verdict > subscribe,
         )
-        // The verdict must actually gate the establish calls, not merely be computed. If a call sat
-        // outside the gate, the read would be decorative and the defect unchanged.
+        // The verdict must actually gate the establish calls, and the assertion is about what is
+        // INSIDE the gate rather than about positions in the function. Index comparisons cannot tell
+        // "inside the guard" from "after it", and an adversarial pass proved that by restoring the
+        // P0-A defect - two lines inserted before the early return, an unconditional
+        // `commandClient.connect()` and `registerStoppedReceiver()` - with every assertion here green
+        // across all 196 tests. The inserted call sits before the poll, so a
+        // `lastIndexOf("commandClient.connect()")` landed on the poll's call and never saw it.
         //
-        // Two traps this assertion has already fallen into, both recorded because the extraction is
+        // Two further traps this assertion has already fallen into, recorded because the extraction is
         // by substring and the production function is heavily commented:
         //
-        //  * `"if (wantsClient)"` without the brace also matches the negated early return below, so
-        //    the "gate" was located at `if (!wantsClient) return` and the test failed against correct
+        //  * `"if (wantsClient)"` without the brace also matches the negated early return, so the
+        //    "gate" was located at `if (!wantsClient) return` and the test failed against correct
         //    code. Hence the brace: it distinguishes a conditional from its negation.
         //  * `indexOf("commandClient.connect()")` matches the DOCUMENTATION first - the gate comment
-        //    names the call while explaining why it is gated - so the establish position landed
-        //    inside a comment, before the gate. Hence `lastIndexOf`, which is the last real call site
-        //    in the function. Under the P0-A mutation (the gate removed, the call left unconditional)
-        //    the call is before the block and the assertion is RED; it is the last occurrence either
-        //    way, so the assertion is comparing the same site before and after.
-        val gate = body.indexOf("if (wantsClient) {")
+        //    names the call while explaining why it is gated - so the establish position landed inside
+        //    a comment, before the gate. Extracting the block sidesteps both: a comment is outside the
+        //    braces.
+        val gate = blockAfter(body, "if (wantsClient) {")
         assertTrue(
-            "`connect()` computes the verdict but does not gate the establish call on it, so the " +
-                "client is still established unconditionally after the subscription replayed a " +
-                "background state.",
-            gate >= 0,
+            "`connect()` no longer establishes the client inside the verdict gate. The canonical " +
+                "foreground replay that `subscribeForeground()` performs is then undone by a connect " +
+                "that runs regardless of the verdict: backgrounding the app no longer stops the UI " +
+                "CommandClient, which is the P0-A defect.",
+            gate.contains("commandClient.connect()"),
+        )
+        assertTrue(
+            "`connect()` no longer registers the SERVICE_STOPPED receiver inside the verdict gate, so " +
+                "a suspended entry arms a receiver for a client it deliberately did not create.",
+            gate.contains("registerStoppedReceiver()"),
         )
         // The gate must be fed by the LIFETIME, not by a constant. Presence alone is not the guard:
-        // `val wantsClient = true` keeps every positional assertion above satisfied while restoring
-        // the P0-A defect exactly, and the first version of this test was green against precisely
-        // that mutation. A wiring test that passes when the verdict is stubbed out is not binding the
+        // `val wantsClient = true` keeps every other assertion satisfied while restoring the P0-A
+        // defect exactly, and an earlier version of this test was green against precisely that
+        // mutation. A wiring test that passes when the verdict is stubbed out is not binding the
         // verdict.
         assertInBody(
             "fun connect()",
@@ -232,13 +281,7 @@ class AppViewModelWiringTest {
                 "without consulting whether the UI client is supposed to exist, which is the P0-A " +
                 "defect with a gate-shaped disguise.",
         )
-        val establish = body.lastIndexOf("commandClient.connect()")
-        assertTrue("`connect()` no longer establishes the client", establish >= 0)
-        assertTrue(
-            "`connect()` establishes the client outside the verdict gate, which is the P0-A defect: " +
-                "the canonical replay said the app is in the background and connect() built a client.",
-            gate < establish,
-        )
+        assertTrue("`connect()` no longer establishes the client", body.contains("commandClient.connect()"))
     }
 
     /**

@@ -99,6 +99,29 @@ object PlatformFacts {
     private val foregroundListeners = mutableListOf<(Boolean) -> Unit>()
 
     /**
+     * The delivery order, so a listener never acts on a superseded fact.
+     *
+     * [foregroundSequence] is taken under [lock], which is what makes it the RECORD order; each
+     * notification then waits for its predecessors in [foregroundDelivered] before it runs. Both are
+     * volatile because they are read across threads without the lock — deliberately, since the whole
+     * point of the dispatch is that it does not hold the lock.
+     */
+    @Volatile
+    private var foregroundSequence = 0L
+
+    @Volatile
+    private var foregroundDelivered = 0L
+
+    /**
+     * True on a thread that is already running a listener.
+     *
+     * A listener may record this same fact - `connect()` reaches [addForegroundListener], and a
+     * subscriber's replay handler is a listener - so the notification path has to be re-entrant
+     * without waiting for a turn that would only come from the dispatch this thread is inside.
+     */
+    private val insideListener = ThreadLocal.withInitial { false }
+
+    /**
      * One-way latch: registering the receiver and the lifecycle callbacks must not happen
      * twice. See [InstallGuard].
      */
@@ -287,7 +310,8 @@ object PlatformFacts {
     }
 
     /**
-     * Runs the foreground listeners on a copy, after releasing [lock].
+     * Runs the foreground listeners on a copy, after releasing [lock], in the order the facts were
+     * recorded.
      *
      * # Why the lock is released first
      *
@@ -309,13 +333,87 @@ object PlatformFacts {
      * The copy is still required, for a different reason than the lock: a listener is allowed to
      * register or unregister another listener, and iterating the live list would then throw
      * `ConcurrentModificationException`. Copy under the lock, invoke outside it.
+     *
+     * # Why it also has to keep the record order
+     *
+     * Releasing the lock gave up something the lock was providing for free. Two facts recorded in
+     * order on two threads — `true` then `false` — could reach the listeners as `false` then `true`,
+     * so the LAST value a listener acted on was a value the object had already superseded. That is
+     * not a cosmetic ordering nit: the UI's listener turns it into side effects, and a stale `true`
+     * delivered last calls `resumeUiClient()`, which connects a client while the canonical fact is
+     * "the app is in the background", with nothing later to correct it — `mayReconnect()` gates new
+     * connects and never disconnects an existing client.
+     *
+     * Each notification therefore takes a sequence number under [lock] and delivers in turn, so the
+     * delivery order is the record order by construction rather than by timing. A re-entrant
+     * notification from inside a listener does not wait — see [insideListener] — because waiting
+     * there would be a self-deadlock, and by the time a listener is running the earlier fact has
+     * already been delivered to every listener that existed then.
+     *
+     * # What removal does and does not promise
+     *
+     * [removeForegroundListener] is not a barrier. The list is copied when a notification begins, so
+     * a listener removed while a dispatch is in flight or queued can still receive that value; it
+     * receives nothing recorded after the copy. That is the ordinary listener contract and it is what
+     * the notification is: a snapshot of one fact to the subscribers that existed when it was
+     * recorded. The invariant that matters for correctness is the ORDER of what does arrive, and
+     * that is now guaranteed.
+     *
+     * Today every writer of this fact is main-thread, so none of the interleavings above are
+     * reachable in the shipped app. The reason to close them anyway is that the primitive is
+     * documented — and used — as thread-safe, and a property it only has on one thread is a property
+     * its callers cannot rely on.
      */
     private fun dispatchForegroundListeners(foreground: Boolean) {
-        val listeners = synchronized(lock) { foregroundListeners.toList() }
-        listeners.forEach { listener ->
-            runCatching { listener(foreground) }
+        val delivery = synchronized(lock) {
+            val next = ForegroundDelivery(foregroundSequence++, foreground)
+            foregroundListeners.toList() to next
+        }
+        val (listeners, ticket) = delivery
+        // Captured before the flag is set: a nested notification must not advance the delivery
+        // watermark past tickets its own thread has not delivered, or an unrelated thread would skip
+        // its turn and the order this function exists to guarantee would be lost.
+        val reentrant = insideListener.get()
+        if (reentrant) {
+            // The notification is arriving from inside a listener of an earlier one. It must not wait
+            // for its turn, because its turn comes after the dispatch that is currently running -
+            // which is this call. Deliver it now; it is strictly newer than everything already
+            // delivered, so ordering still holds.
+            foregroundDelivered = maxOf(foregroundDelivered, ticket.sequence - 1)
+        } else {
+            awaitForegroundTurn(ticket.sequence)
+        }
+        insideListener.set(true)
+        try {
+            listeners.forEach { listener ->
+                runCatching { listener(ticket.foreground) }
+            }
+        } finally {
+            insideListener.set(reentrant)
+        }
+        if (!reentrant) {
+            foregroundDelivered = ticket.sequence
         }
     }
+
+    /**
+     * Blocks until every earlier notification has been delivered.
+     *
+     * Bounded by yielding rather than by a timeout: the wait is for a listener body, which is
+     * arbitrary code, so a deadline would turn a slow listener into a silently reordered fact. The
+     * wait is always finite today because a listener is only ever called from a thread that will make
+     * progress, but note the shape plainly: a listener that blocks forever now blocks later
+     * notifications as well, which is the price of the ordering guarantee and the reason the ordering
+     * exists in the first place — the alternative is delivering a superseded fact.
+     */
+    private fun awaitForegroundTurn(ticket: Long) {
+        while (foregroundDelivered < ticket - 1) {
+            Thread.yield()
+        }
+    }
+
+    /** One recorded fact and its place in the delivery order. */
+    private class ForegroundDelivery(val sequence: Long, val foreground: Boolean)
 
     /**
      * Subscribe to the app foreground fact.
