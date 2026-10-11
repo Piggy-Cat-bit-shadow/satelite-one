@@ -1,5 +1,6 @@
 package com.interstellar.proxy.ui
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -85,6 +86,18 @@ class AppViewModelWiringTest {
     }
 
     /**
+     * [body] with line comments and block comments removed, so positions and counts are about CODE.
+     *
+     * This is not cosmetic. `connect()`'s own documentation names `commandClient.connect()` while
+     * explaining why it is gated, so a substring search finds the mention first; and a scan that
+     * counts or positions occurrences is otherwise satisfied by prose. The production function is
+     * heavily commented and commented *about this exact call*, which is what makes the strip load
+     * bearing rather than tidy.
+     */
+    private fun code(body: String): String =
+        body.replace(Regex("(?s)/\\*.*?\\*/"), " ").replace(Regex("//[^\n]*"), " ")
+
+    /**
      * The statements inside the braced block that opens at the first occurrence of [opening].
      *
      * # Why the extent matters, and why substring searches were not enough
@@ -97,8 +110,15 @@ class AppViewModelWiringTest {
      * lands on the poll's call instead, and the presence checks are satisfied by the gated block that
      * is still there and still correct.
      *
-     * A guard whose extent is not checked is a guard that can be walked around. So the gate is now
+     * A guard whose extent is not checked is a guard that can be walked around. So the gate is
      * extracted as a block and the assertions are made about what is INSIDE it.
+     *
+     * The block extraction alone does NOT close that hole, and this comment used to claim it did.
+     * Extraction answers "is the gate still correct?", never "is the gate the only way in?", so an
+     * ADDED unconditional call above the gate leaves the extraction green and the defect restored.
+     * Re-measured: the whole 248-test suite passed with the P0-A defect back in place that way. What
+     * closes it is the occurrence count in `connect is gated by the lifetime verdict read after the
+     * subscription`, which is only meaningful on comment-stripped source ([code]).
      */
     private fun blockAfter(body: String, opening: String): String {
         val start = body.indexOf(opening)
@@ -282,6 +302,36 @@ class AppViewModelWiringTest {
                 "defect with a gate-shaped disguise.",
         )
         assertTrue("`connect()` no longer establishes the client", body.contains("commandClient.connect()"))
+        // The gate must also be the ONLY way in, which the assertions above cannot see: they check
+        // that the gate still CONTAINS a connect call, never that no connect call exists OUTSIDE it.
+        //
+        // An adversarial pass proved that gap is reachable, not theoretical. Adding one unconditional
+        // `commandClient.connect()` (plus `registerStoppedReceiver()`) above the gate leaves the gate
+        // intact and every other assertion here green - all 248 tests passed - while restoring the
+        // P0-A defect exactly: a backgrounded entry, whose canonical replay has just suspended the
+        // client, builds one anyway.
+        //
+        // The invariant that closes it is about the path that RUNS WHEN THE VERDICT REFUSES, so the
+        // scan is scoped to the statements before the poll. The poll's own `commandClient.connect()`
+        // is deliberately excluded: that one is guarded by `mayReconnect()`, and counting it would
+        // make a correct `connect()` fail this check.
+        val stripped = code(body)
+        val beforePoll = stripped.substring(0, stripped.indexOf("pollJob = viewModelScope.launch"))
+        val gatedCode = code(blockAfter(body, "if (wantsClient) {"))
+        val establishing = Regex("commandClient\\.connect\\(\\)|registerStoppedReceiver\\(\\)")
+        assertEquals(
+            "`connect()` establishes the client somewhere other than inside the `if (wantsClient)` " +
+                "gate, on the path that runs when the verdict has just refused it. A backgrounded " +
+                "entry then builds the client the canonical lifetime said must not exist - the P0-A " +
+                "defect, whether the stray call was moved above the gate or added alongside it.",
+            establishing.findAll(beforePoll).count(),
+            establishing.findAll(gatedCode).count(),
+        )
+        assertTrue(
+            "`connect()` starts the reconnect poll before the suspended-verdict early return, so a " +
+                "backgrounded app keeps a 2 s poll running against a lifetime that must not reconnect.",
+            body.indexOf("if (!wantsClient) return") < body.indexOf("pollJob = viewModelScope.launch"),
+        )
     }
 
     /**

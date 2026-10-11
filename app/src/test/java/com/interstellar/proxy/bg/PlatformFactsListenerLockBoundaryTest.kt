@@ -2,7 +2,10 @@ package com.interstellar.proxy.bg
 
 import org.junit.After
 import org.junit.Test
+import java.io.File
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * The foreground listeners must run with `PlatformFacts.lock` released.
@@ -47,6 +50,120 @@ class PlatformFactsListenerLockBoundaryTest {
         // Leave deterministic facts for the next test, the same as PlatformFactsTest does.
         PlatformFacts.onScreenChanged(true)
         PlatformFacts.onForegroundChanged(false)
+    }
+
+    /**
+     * The delivery order must cover the FIRST fact pair, and it did not.
+     *
+     * `foregroundDelivered` used to start at `0L` while `awaitForegroundTurn` waited for
+     * `foregroundDelivered < ticket - 1`. Ticket `0` needs `-1` and so never waited (correct), but
+     * ticket `1` needed `0` - a value already present before anything had been delivered - so it ran
+     * its listener while ticket `0`'s listener was still on the stack. Two facts recorded `true`
+     * then `false` therefore reached the listener as `false` then `true`: the last value it acted on
+     * was one the object had already superseded, which is exactly the hazard the ordering exists to
+     * remove, and it was reachable on the very first pair after every process start.
+     *
+     * # Why the state is forced, and why it is forced AFTER subscribing
+     *
+     * `PlatformFacts` is a singleton, so the off-by-one only exists while the watermark still holds
+     * its initial value; once any other test has recorded a fact the same probe passes against the
+     * broken code. Rewinding the two private fields reproduces the pre-delivery state wherever this
+     * runs, so the check means the same thing regardless of test order.
+     *
+     * The rewind has to happen *after* `addForegroundListener`, which records a foreground fact of
+     * its own by replaying the canonical value. Doing it before subscription does not merely weaken
+     * the test, it silently voids it: the replay advances the watermark to `0`, which is exactly the
+     * value the old code initialised it to, so the broken build passes. That mistake was made and
+     * measured here, which is why the order is called out rather than left implicit.
+     *
+     * Measured against the shipped code: the second `onForegroundChanged` returns after ~0 ms and the
+     * ordering assertion fails. After the fix it waits for its predecessor (~350 ms).
+     */
+    @Test
+    fun `the delivery order covers the first fact pair`() {
+        val sequenceField = PlatformFacts::class.java.getDeclaredField("foregroundSequence")
+        val deliveredField = PlatformFacts::class.java.getDeclaredField("foregroundDelivered")
+        sequenceField.isAccessible = true
+        deliveredField.isAccessible = true
+
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val inFirstNotification = CountDownLatch(1)
+        val stallMs = 400L
+        val order = CopyOnWriteArrayList<Boolean>()
+
+        val listener: (Boolean) -> Unit = { value ->
+            order += value
+            // Invocation 1 is the canonical replay that addForegroundListener always performs; the
+            // notification under test is invocation 2.
+            if (calls.incrementAndGet() == 2) {
+                inFirstNotification.countDown()
+                Thread.sleep(stallMs)
+            }
+        }
+        PlatformFacts.addForegroundListener(listener)
+        try {
+            // A process that has recorded nothing yet: ticket 0 is next and nothing is delivered.
+            // This is the state every cold start passes through, and the state the off-by-one got
+            // wrong. Set here, after the subscription's own replay has already taken its ticket.
+            sequenceField.setLong(PlatformFacts, 0L)
+            deliveredField.setLong(PlatformFacts, -1L)
+
+            val first = Thread { PlatformFacts.onForegroundChanged(true) }
+            first.start()
+            check(inFirstNotification.await(5, TimeUnit.SECONDS)) {
+                "the first recorded fact never reached its listener, so this test cannot measure the " +
+                    "ordering it exists for"
+            }
+            Thread.sleep(50)
+
+            val started = System.currentTimeMillis()
+            PlatformFacts.onForegroundChanged(false)
+            val elapsed = System.currentTimeMillis() - started
+            first.join()
+
+            check(elapsed >= stallMs - 150) {
+                "two facts recorded in order (true then false) were not delivered in that order: the " +
+                    "second notification returned after only ${elapsed}ms while the first was still " +
+                    "inside its listener (${stallMs}ms of work). The listener's LAST value is then one " +
+                    "the object has already superseded, and the UI's listener turns that into " +
+                    "resumeUiClient() - connecting a client while the canonical fact is 'background'."
+            }
+            // The fact that was recorded last must be the value the listener was handed last.
+            check(order.isNotEmpty() && order.last() == false) {
+                "the listener acted last on ${order.last()} although the last recorded fact was false; " +
+                    "delivery order = $order"
+            }
+        } finally {
+            PlatformFacts.removeForegroundListener(listener)
+        }
+    }
+
+    /**
+     * The watermark's declared initial value, checked at the source.
+     *
+     * The behavioural test above cannot reach this, and that is not an oversight to paper over: the
+     * defect is an *initial value*, and any test that runs after the object has handled a single fact
+     * observes a watermark that has already been written. Rewinding the field does not help either —
+     * both the broken and the fixed predicate wait once the watermark is `-1`, so the two are
+     * indistinguishable from then on. Only the declaration discriminates, so the declaration is what
+     * is asserted.
+     *
+     * `0L` restores the shipped defect exactly: ticket 1 then compares its predecessor `0` against a
+     * watermark already holding `0`, concludes "delivered", and runs its listener while ticket 0's is
+     * still on the stack.
+     */
+    @Test
+    fun `the delivery watermark is initialised below the first ticket`() {
+        val declared = Regex("private var foregroundDelivered = (-?\\d+)L")
+            .find(File("src/main/java/com/interstellar/proxy/bg/PlatformFacts.kt").readText())
+            ?.groupValues?.get(1)?.toLong()
+        check(declared == -1L) {
+            "foregroundDelivered is declared as $declared, not -1. Tickets start at 0, so the first " +
+                "fact's predecessor is -1; a watermark of 0 says that predecessor has already been " +
+                "delivered, and the second recorded fact can then reach the listeners before the " +
+                "first has finished - a listener acting on a superseded value on the first pair of " +
+                "facts after every process start."
+        }
     }
 
     /**

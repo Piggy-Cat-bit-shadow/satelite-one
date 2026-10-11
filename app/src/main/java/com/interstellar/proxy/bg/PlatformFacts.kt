@@ -109,8 +109,21 @@ object PlatformFacts {
     @Volatile
     private var foregroundSequence = 0L
 
+    /**
+     * The highest ticket whose notification has completely finished. **`-1` means "nothing has been
+     * delivered yet"**, which is a state the first ticket needs to be distinguishable from ticket `0`
+     * having been delivered — see [awaitForegroundTurn].
+     *
+     * This used to start at `0L`, which conflated those two states and left the *first* pair of facts
+     * unordered: ticket `0` does not wait (`-1 < -1` is false, correctly), but ticket `1` then compared
+     * `foregroundDelivered` (`0`) against its predecessor (`0`), saw "already delivered", and ran its
+     * listener while ticket `0`'s listener was still on the stack. Two facts recorded `true` then
+     * `false` reached the listener as `false` then `true`, so the last value it acted on was one the
+     * object had already superseded — the exact hazard this ordering exists to remove, reachable on
+     * the first pair after every process start and therefore on the pair that matters most.
+     */
     @Volatile
-    private var foregroundDelivered = 0L
+    private var foregroundDelivered = -1L
 
     /**
      * True on a thread that is already running a listener.
@@ -405,9 +418,12 @@ object PlatformFacts {
      * progress, but note the shape plainly: a listener that blocks forever now blocks later
      * notifications as well, which is the price of the ordering guarantee and the reason the ordering
      * exists in the first place — the alternative is delivering a superseded fact.
+     *
+     * Ticket `0` does not wait: its predecessor is `-1`, which is the "nothing delivered" sentinel, so
+     * the comparison has to be an equality rather than `<` to keep that case from spinning.
      */
     private fun awaitForegroundTurn(ticket: Long) {
-        while (foregroundDelivered < ticket - 1) {
+        while (foregroundDelivered != ticket - 1) {
             Thread.yield()
         }
     }
