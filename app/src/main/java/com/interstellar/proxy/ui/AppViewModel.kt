@@ -289,6 +289,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private var autoTested = false
     @Volatile private var probing = false
 
+    /**
+     * When the UI's command-socket client should be on, and whether its failure may drive UI
+     * status. The rules live in that class so they are provable in a plain JVM test; the side
+     * effects stay here. See [UiClientLifetime] for why backgrounding must not be allowed to
+     * look like a socket drop.
+     */
+    private val uiLifetime = UiClientLifetime()
+
     /** Set by onConnected while probing: the headless command socket is up. */
     @Volatile private var probeSocketUp = false
 
@@ -324,12 +332,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             override fun onDisconnected() {
+                // An intentional suspend fires this callback too - CommandClient.disconnect()
+                // notifies handlers on the deliberate path, un-gated, because it IS deliberate.
+                // Treating it as a socket drop is what would kill the tunnel 400 ms after the
+                // user pressed Home, so the deliberate case must be excluded here rather than
+                // papered over at the call site.
                 autoTested = false
-                if (!probing) applySocketDrop()
+                if (uiLifetime.mayReportSocketLoss(probing)) applySocketDrop()
             }
 
             override fun onConnectionError(kind: CommandClient.ConnectionErrorKind, message: String) {
-                if (!probing) applySocketDrop()
+                if (uiLifetime.mayReportSocketLoss(probing)) applySocketDrop()
             }
 
             override fun updateStatus(status: StatusMessage) {
@@ -414,7 +427,59 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         refreshStaticGroups()
     }
 
+    /**
+     * The UI's subscription to the app foreground fact.
+     *
+     * Registered with `PlatformFacts`, which is the single writer of that fact, rather than derived
+     * here from a Compose lifecycle effect. Deriving it here would be a second writer of one fact,
+     * and it would get a specific case wrong: a configuration change - a theme switch, a UI-mode
+     * change, a display-size or font-scale change - stops and restarts the Activity, so a Compose
+     * ON_STOP/ON_START pair would suspend and resume the UI client, and re-create the composition,
+     * for a transition in which the app never left the foreground. The tracker behind `PlatformFacts`
+     * is the component that knows the difference
+     * (`ActivityForegroundTracker.onActivityStopped(isChangingConfigurations)`), so the edge is taken
+     * from there.
+     *
+     * The canonical value is delivered immediately on subscribe, so a cold start and a re-subscribe
+     * both converge without guessing, and the guard in `UiClientLifetime` is what stops that
+     * immediate delivery from being read as a transition.
+     */
+    private val foregroundListener: (Boolean) -> Unit = { foreground ->
+        if (foreground) resumeUiClient() else suspendUiClient()
+    }
+
+    /**
+     * Idempotent. connect() is re-entered on every resume, and the registry has no de-duplication,
+     * so an unconditional subscribe added a copy per resume while disconnect() removes only one -
+     * leaving stale copies that both outlive their ViewModel and let a foreground edge run connect()'s
+     * side effects on a dead instance (registering a SERVICE_STOPPED receiver that is never
+     * unregistered). The flag makes subscribe/unsubscribe a balanced pair.
+     */
+    private var foregroundSubscribed = false
+
+    private fun subscribeForeground() {
+        if (foregroundSubscribed) return
+        foregroundSubscribed = true
+        com.interstellar.proxy.bg.PlatformFacts.addForegroundListener(foregroundListener)
+    }
+
+    private fun unsubscribeForeground() {
+        if (!foregroundSubscribed) return
+        foregroundSubscribed = false
+        com.interstellar.proxy.bg.PlatformFacts.removeForegroundListener(foregroundListener)
+    }
+
     fun connect() {
+        uiLifetime.onClientConnected()
+        subscribeForeground()
+        // Establish the client HERE, not only from the poll below.
+        //
+        // The poll only fires when the status is Starting or Stopped, so on a resume with the core
+        // already Started nothing would ever re-open the socket: the UI would render the last known
+        // speed/history/groups as if they were live, and the 400 ms dead-core detector
+        // (`applySocketDrop` -> `armStartingWatchdog`) could never fire again because it is driven by
+        // this client's callbacks. That is a silent, permanent freeze rather than a visible failure,
+        // which is why it is connected unconditionally on every entry to `connect()`.
         commandClient.connect()
         registerStoppedReceiver()
         // poll-reconnect: the box may start/stop at any time, and a failed
@@ -423,6 +488,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         pollJob = viewModelScope.launch {
             while (isActive) {
                 delay(2000)
+                // A suspended client must not be resurrected by its own poll: the loop
+                // would re-connect within 2 s of the user backgrounding the app.
+                if (!uiLifetime.mayReconnect()) continue
                 if (_status.value == Status.Starting || _status.value == Status.Stopped) {
                     commandClient.connect()
                 }
@@ -436,7 +504,63 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         startingWatchdog?.cancel()
         startingWatchdog = null
         unregisterStoppedReceiver()
+        // Set before the client is disconnected: that call fires onDisconnected() synchronously, and
+        // without this the handler re-arms the watchdog this function just cancelled.
+        uiLifetime.onTearingDown()
+        unsubscribeForeground()
         commandClient.disconnect()
+    }
+
+    /**
+     * App UI went to the background: stop the UI telemetry/control-plane client, its
+     * reconnect polling and its chart sampling, and nothing else.
+     *
+     * Deliberately does NOT go through [disconnect], because that also cancels
+     * [startingWatchdog] and unregisters the SERVICE_STOPPED receiver — while backgrounded
+     * that broadcast is the only way [Status] converges, so losing it would strand the UI on
+     * a stale status. It also deliberately leaves `status`, `speed` and `history` untouched:
+     * a backgrounded app has not learned anything new about the core, so the last known
+     * values stay on screen and nothing is fabricated.
+     *
+     * Idempotent: the second background edge does nothing.
+     */
+    fun suspendUiClient() {
+        // A headless url-test drives this same client and signals readiness only through
+        // onConnected(); switching it off mid-probe would make the probe time out. The probe is
+        // short-lived and the UI is gone anyway, so it keeps the socket.
+        // The reconnect poll belongs to the UI, not to the core and not to a probe, so it stops on
+        // every background edge - including one taken during a headless url-test, where the probe
+        // keeps the socket but the UI must not keep polling.
+        pollJob?.cancel()
+        pollJob = null
+        if (!uiLifetime.onBackground(probing)) return
+        pollJob = null
+        commandClient.disconnect()
+    }
+
+    /**
+     * Re-apply a suspend that was owed because the app went to the background during a headless
+     * url-test.
+     *
+     * The probe's finally clears `probing`; without this call the background edge would have been
+     * consumed by the probe and the UI client would have kept running in the background for good -
+     * the ON_STOP edge fires once and nothing would re-apply it.
+     */
+    fun reapplyOwedSuspend() {
+        if (!uiLifetime.owesSuspend) return
+        suspendUiClient()
+    }
+
+    /**
+     * App UI came back to the foreground: restore the UI client and re-align with the core.
+     *
+     * Idempotent: a repeat foreground edge while already online does nothing, and an edge that
+     * arrives after a real [connect] does not open a second session.
+     */
+    fun resumeUiClient() {
+
+        if (!uiLifetime.onForeground()) return
+        connect()
     }
 
     private fun registerStoppedReceiver() {
@@ -783,6 +907,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             awaitUrlTestSettled()
         } finally {
             probeSocketUp = false
+            // Clear the probe flag and re-apply any owed suspend FIRST, before anything suspendable.
+            //
+            // This used to sit after a `delay(250)` further down, which made it skippable: on
+            // `viewModelScope` cancellation the delay throws out of the `finally`, so neither
+            // `probing = false` nor the re-apply ran, and the background edge the probe had consumed
+            // stayed lost. Nothing here suspends, so the sequence cannot be interrupted.
+            probing = false
+            reapplyOwedSuspend()
             val takenOver = _status.value == Status.Starting || _status.value == Status.Started
             if (!takenOver) {
                 com.interstellar.proxy.bg.BoxService.stop()
@@ -790,7 +922,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 if (previous != null) ConfigStore.writeActiveConfig(previous)
                 else SubscriptionRepository.regenerateActiveConfig()
             }
-            probing = false
         }
     }
 

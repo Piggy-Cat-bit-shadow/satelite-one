@@ -86,6 +86,15 @@ object PlatformFacts {
     private val screen = ScreenFactState()
 
     /**
+     * UI-layer consumers of the app foreground fact.
+     *
+     * A list rather than a single callback because the fact has more than one legitimate consumer
+     * (the core's device policy, and the UI's own control plane) and they must all be fed from the
+     * same edge. Notified under [lock] via a copy, so registering from inside a callback is safe.
+     */
+    private val foregroundListeners = mutableListOf<(Boolean) -> Unit>()
+
+    /**
      * One-way latch: registering the receiver and the lifecycle callbacks must not happen
      * twice. See [InstallGuard].
      */
@@ -254,6 +263,33 @@ object PlatformFacts {
         appForeground = foreground
         debugFact("foreground", foreground)
         current?.let { live -> enqueue(live) { sink -> sink.setAppForeground(foreground) } }
+        // UI-layer observers are notified from HERE, and only here.
+        //
+        // The tracker above is the one component that knows a stop caused by a configuration change
+        // is not a background transition (ActivityForegroundTracker.onActivityStopped(
+        // isChangingConfigurations)). A consumer that derives its own edge from a Compose lifecycle
+        // - an ON_STOP effect - does not know that, so it would treat a theme switch, a UI-mode
+        // change, a display-size change or a font-scale change as the app going to the background.
+        // That is a second writer of one fact, which is what this layer exists to prevent.
+        foregroundListeners.toList().forEach { listener ->
+            runCatching { listener(foreground) }
+        }
+    }
+
+    /**
+     * Subscribe to the app foreground fact.
+     *
+     * The canonical value is delivered immediately, so a subscriber never has to guess and can
+     * never fabricate a transition from a stale seed.
+     */
+    fun addForegroundListener(listener: (Boolean) -> Unit) = synchronized(lock) {
+        foregroundListeners.add(listener)
+        val canonical = appForeground
+        runCatching { listener(canonical) }
+    }
+
+    fun removeForegroundListener(listener: (Boolean) -> Unit) = synchronized(lock) {
+        foregroundListeners.remove(listener)
     }
 
     fun onUserPresent() = synchronized(lock) {
