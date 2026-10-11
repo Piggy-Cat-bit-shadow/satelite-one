@@ -472,16 +472,42 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun connect() {
         uiLifetime.onClientConnected()
         subscribeForeground()
-        // Establish the client HERE, not only from the poll below.
+        // THE GATE. Everything below is decided by the canonical lifetime verdict, read AFTER the
+        // subscription, because `subscribeForeground()` replays the canonical foreground value
+        // synchronously: a `false` replay calls `suspendUiClient()`, which marks the lifetime
+        // suspended and disconnects the client before `connect()` has even returned.
         //
-        // The poll only fires when the status is Starting or Stopped, so on a resume with the core
-        // already Started nothing would ever re-open the socket: the UI would render the last known
-        // speed/history/groups as if they were live, and the 400 ms dead-core detector
-        // (`applySocketDrop` -> `armStartingWatchdog`) could never fire again because it is driven by
-        // this client's callbacks. That is a silent, permanent freeze rather than a visible failure,
-        // which is why it is connected unconditionally on every entry to `connect()`.
-        commandClient.connect()
-        registerStoppedReceiver()
+        // Without this gate the replay was undone immediately. The sequence was:
+        //
+        //   connect() -> subscribeForeground() -> addForegroundListener()
+        //     -> canonical replay false -> suspendUiClient() -> lifetime = suspended, client off
+        //   -> back in connect() -> commandClient.connect()   <-- unconditionally
+        //
+        // so the canonical state said "the app is in the background and must not have a UI client"
+        // and `connect()` built one anyway. The poll's own `mayReconnect()` gate did not save it
+        // either: the poll is the *second* path, and the first one had already connected.
+        //
+        // Note what this is NOT. Moving `commandClient.connect()` above `subscribeForeground()`
+        // would only narrow the window; it does not answer the question, and the replay would then
+        // suspend a client that had just been created. The verdict decides, not the ordering.
+        val wantsClient = uiLifetime.wantsClient()
+        if (wantsClient) {
+            // Establish the client HERE, not only from the poll below.
+            //
+            // The poll only fires when the status is Starting or Stopped, so on a resume with the core
+            // already Started nothing would ever re-open the socket: the UI would render the last known
+            // speed/history/groups as if they were live, and the 400 ms dead-core detector
+            // (`applySocketDrop` -> `armStartingWatchdog`) could never fire again because it is driven by
+            // this client's callbacks. That is a silent, permanent freeze rather than a visible failure,
+            // which is why the client is established immediately whenever the verdict allows it.
+            commandClient.connect()
+            registerStoppedReceiver()
+        }
+        // Backgrounded at entry: there is no UI client to serve and no poll to run. The client is
+        // deliberately not created, and no reconnect poll is started - a poll here would be the very
+        // resurrection the lifetime gate exists to prevent. `resumeUiClient()` re-enters `connect()`
+        // when the foreground edge arrives, which is what brings both back.
+        if (!wantsClient) return
         // poll-reconnect: the box may start/stop at any time, and a failed
         // connect (server not up yet) must be retried to reflect the state
         pollJob?.cancel()

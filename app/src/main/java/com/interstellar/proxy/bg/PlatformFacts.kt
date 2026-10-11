@@ -90,7 +90,11 @@ object PlatformFacts {
      *
      * A list rather than a single callback because the fact has more than one legitimate consumer
      * (the core's device policy, and the UI's own control plane) and they must all be fed from the
-     * same edge. Notified under [lock] via a copy, so registering from inside a callback is safe.
+     * same edge.
+     *
+     * **Never invoked while [lock] is held** — see [dispatchForegroundListeners]. The copy taken
+     * here is what makes mutating the list from inside a callback safe; the lock is released before
+     * the callbacks run, and those are two different problems that the old comment ran together.
      */
     private val foregroundListeners = mutableListOf<(Boolean) -> Unit>()
 
@@ -259,10 +263,12 @@ object PlatformFacts {
         current?.let { live -> enqueue(live) { sink -> sink.setScreenOn(on) } }
     }
 
-    fun onForegroundChanged(foreground: Boolean) = synchronized(lock) {
-        appForeground = foreground
-        debugFact("foreground", foreground)
-        current?.let { live -> enqueue(live) { sink -> sink.setAppForeground(foreground) } }
+    fun onForegroundChanged(foreground: Boolean) {
+        synchronized(lock) {
+            appForeground = foreground
+            debugFact("foreground", foreground)
+            current?.let { live -> enqueue(live) { sink -> sink.setAppForeground(foreground) } }
+        }
         // UI-layer observers are notified from HERE, and only here.
         //
         // The tracker above is the one component that knows a stop caused by a configuration change
@@ -271,7 +277,42 @@ object PlatformFacts {
         // - an ON_STOP effect - does not know that, so it would treat a theme switch, a UI-mode
         // change, a display-size change or a font-scale change as the app going to the background.
         // That is a second writer of one fact, which is what this layer exists to prevent.
-        foregroundListeners.toList().forEach { listener ->
+        //
+        // OUTSIDE the block above, and that placement is the whole point of this function's shape. It
+        // used to be an expression body - `= synchronized(lock) { ... }` - so everything in the braces
+        // ran under the lock, notifications included, and the dispatch below re-entered a lock this
+        // call was still holding. `dispatchForegroundListeners` documents why that is wrong; the
+        // braces here are what make its own acquisition a fresh one.
+        dispatchForegroundListeners(foreground)
+    }
+
+    /**
+     * Runs the foreground listeners on a copy, after releasing [lock].
+     *
+     * # Why the lock is released first
+     *
+     * A listener is not a leaf. The UI's one calls `resumeUiClient()` / `suspendUiClient()`, which
+     * reach `connect()` / `disconnect()`, which call [addForegroundListener] and
+     * [removeForegroundListener] — back into this object, from inside the notification. The JVM lock
+     * is reentrant, so that never deadlocked and never looked wrong; it did something worse. The
+     * nested `addForegroundListener` delivered the canonical value *reentrantly*, from inside the
+     * outer listener, so one edge could produce a second one, and whether it did depended on whether
+     * a client happened to be subscribed at that moment. A notification path whose behaviour depends
+     * on the lock being held is a behaviour nobody can reason about from the call site.
+     *
+     * Holding the lock across a listener also puts an arbitrary listener body inside this object's
+     * lock order. That is the shape the core side already paid for and banned in
+     * `runtimecoord.PlatformEvents` ("It is NEVER held across a target call ... the shape of the
+     * ABBA deadlock this fork has already paid for"), and the reasoning transfers unchanged: decide
+     * under the lock, act after releasing it.
+     *
+     * The copy is still required, for a different reason than the lock: a listener is allowed to
+     * register or unregister another listener, and iterating the live list would then throw
+     * `ConcurrentModificationException`. Copy under the lock, invoke outside it.
+     */
+    private fun dispatchForegroundListeners(foreground: Boolean) {
+        val listeners = synchronized(lock) { foregroundListeners.toList() }
+        listeners.forEach { listener ->
             runCatching { listener(foreground) }
         }
     }
@@ -281,10 +322,20 @@ object PlatformFacts {
      *
      * The canonical value is delivered immediately, so a subscriber never has to guess and can
      * never fabricate a transition from a stale seed.
+     *
+     * The registration happens under [lock] and the immediate replay happens **outside** it, for the
+     * same reason [dispatchForegroundListeners] documents: this is called from `connect()`, which is
+     * itself reachable from inside a listener, and the subscriber's own replay handler re-enters this
+     * object. Delivering the canonical value while holding the lock made that nesting deliver a second
+     * edge from inside the first. Note the consequence, which is the point of the split: the listener
+     * may be invoked before this function returns, so a caller must read its own verdict *after*
+     * subscribing rather than assuming the subscribe was inert.
      */
-    fun addForegroundListener(listener: (Boolean) -> Unit) = synchronized(lock) {
-        foregroundListeners.add(listener)
-        val canonical = appForeground
+    fun addForegroundListener(listener: (Boolean) -> Unit) {
+        val canonical = synchronized(lock) {
+            foregroundListeners.add(listener)
+            appForeground
+        }
         runCatching { listener(canonical) }
     }
 
