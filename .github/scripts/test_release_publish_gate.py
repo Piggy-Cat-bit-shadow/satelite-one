@@ -44,12 +44,16 @@ import re
 import subprocess
 import sys
 import tempfile
+import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 WORKFLOW = os.path.join(REPO, ".github", "workflows", "release-apk.yml")
 MEASURE = os.path.join(REPO, ".github", "scripts", "measure_apk_signature.sh")
 VERIFY_BUNDLE = os.path.join(REPO, ".github", "scripts", "verify_release_bundle.py")
+# The same naming contract the verifier enforces, so the fixture can tell which ABI an
+# APK claims without importing the script under test.
+APK_NAME = re.compile(r"^satelite-one-(?P<version>.+)-(?P<abi>arm64-v8a|x86_64)-(?P<kind>.+)\.apk$")
 
 failures = []
 
@@ -382,12 +386,48 @@ APP_COMMIT = "a" * 40
 CORE_COMMIT = "c35faabf402a4da93b8c31cdfad941b8b1528ffc"
 
 
+def fake_apk(path, entries):
+    """Write a real zip archive, so the verifier can actually open it.
+
+    The fixture used to write a few bytes with a PK header, which was enough while the
+    verifier only hashed whole files. It now opens each APK and reads its engine, and an
+    artifact with no engine is the very defect under test - so a fixture that cannot
+    express "this APK contains lib/<abi>/libbox.so" could only ever prove the rejection
+    half. `entries` maps an archive path to its bytes.
+    """
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, payload in entries.items():
+            archive.writestr(name, payload)
+
+
+def apk_entries_for(name, engine_payload, abi):
+    """The entries a well-formed split APK has: its own engine, nothing else native."""
+    if abi is None:
+        return {"AndroidManifest.xml": b"manifest"}
+    return {"AndroidManifest.xml": b"manifest", f"lib/{abi}/libbox.so": engine_payload}
+
+
+def abi_of_apk_name(name):
+    match = APK_NAME.match(name)
+    return match.group("abi") if match else None
+
+
 def write_bundle(root, *, abis=("arm64-v8a", "x86_64"), signature_state="signed-by-user",
                  extra_apk=None, tamper=None, omit=None, sums_override=None,
                  info_override=None, nested=False, apk_version=BUNDLE_VERSION,
                  app_commit=APP_COMMIT, core_commit=CORE_COMMIT, core_ref="pinned",
-                 kind=None, stray=None):
-    """Materialise a release bundle. Every knob is a documented attack on the gate."""
+                 kind=None, stray=None, engine_payload=b"\x7fELF-fake-engine",
+                 engine_tamper=None, engine_abi=None, engine_map_override=None,
+                 drop_engine_map=False):
+    """Materialise a release bundle. Every knob is a documented attack on the gate.
+
+    `engine_tamper` names an APK whose packaged engine gets one byte flipped INSIDE the
+    zip (rewriting the archive so it stays readable), which is how N4 is expressed: the
+    artifact is structurally valid and its whole-file checksum is recomputed, but the
+    engine it carries is no longer the AAR's.
+    `engine_abi` overrides which ABI's engine an APK is given, which is N2: an arm64
+    APK holding only an x86_64 engine.
+    """
     os.makedirs(root, exist_ok=True)
     kind = kind if kind is not None else signature_state
     names = [f"satelite-one-{apk_version}-{abi}-{kind}.apk" for abi in abis]
@@ -399,12 +439,41 @@ def write_bundle(root, *, abis=("arm64-v8a", "x86_64"), signature_state="signed-
     target_dir = os.path.join(root, "nested") if nested else root
     os.makedirs(target_dir, exist_ok=True)
 
+    # The engine map is keyed by the ABI the APK CLAIMS. When a test asks for a
+    # mismatched engine (N2) the map must still describe the honest artifact, or the
+    # rejection would come from the map instead of from the APK's contents, and the
+    # test would pass for the wrong reason.
+    engine_map = {abi: hashlib.sha256(engine_payload).hexdigest() for abi in abis}
+    if engine_map_override is not None:
+        engine_map.update(engine_map_override)
+
     digests = {}
     for name in names:
         path = os.path.join(target_dir, name)
-        with open(path, "wb") as handle:
-            handle.write(b"PK\x03\x04 fake apk payload " + name.encode())
+        claimed = abi_of_apk_name(name)
+        # `fake apk payload <name>` is kept in the manifest entry so the bytes still
+        # differ per APK, which several checks depend on.
+        entries = apk_entries_for(name, engine_payload, claimed)
+        entries["AndroidManifest.xml"] = b"manifest " + name.encode()
+        if engine_abi is not None and claimed is not None:
+            entries.pop(f"lib/{claimed}/libbox.so", None)
+            entries[f"lib/{engine_abi}/libbox.so"] = engine_payload
+        fake_apk(path, entries)
         digests[name] = digest_of(path)
+
+    if engine_tamper:
+        # Flip a byte in the ENGINE entry, then rebuild the archive so it stays valid.
+        target = os.path.join(target_dir, engine_tamper)
+        abi = abi_of_apk_name(engine_tamper)
+        with zipfile.ZipFile(target) as archive:
+            entries = {n: archive.read(n) for n in archive.namelist()}
+        entry = f"lib/{abi}/libbox.so"
+        payload = bytearray(entries[entry])
+        payload[8] ^= 0xFF
+        entries[entry] = bytes(payload)
+        fake_apk(target, entries)
+        digests[engine_tamper] = digest_of(target)
+
     if tamper:
         # Flip one byte AFTER the manifest was computed: this is R04.
         with open(os.path.join(target_dir, tamper), "r+b") as handle:
@@ -431,6 +500,10 @@ def write_bundle(root, *, abis=("arm64-v8a", "x86_64"), signature_state="signed-
         "core_branch_hint": "testing",
         "core_aar_sha256": "b" * 64,
         "core_aar_size": 123,
+        # The per-ABI engine digests the build job records while the AAR is on disk.
+        # `drop_engine_map` removes it, which is the "the metadata cannot prove the APK
+        # carries an engine" case and must be rejected rather than skipped.
+        "core_engine_sha256": {} if drop_engine_map else engine_map,
         "signature_state": signature_state,
         "signature_state_measured_by": "apksigner verify --verbose --print-certs",
         "apk_arm64_v8a_sha256": digests.get(f"satelite-one-{apk_version}-arm64-v8a-{kind}.apk", ""),

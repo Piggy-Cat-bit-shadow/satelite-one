@@ -29,9 +29,29 @@ not carry (release signing is a local, user-owned step). So this script reports 
 measured state and refuses the states that are definitely wrong; it never claims the
 signature's *identity*.
 
+What it proves about the engine
+-------------------------------
+
+Everything above is a statement about files, names, hashes and metadata. None of it opens
+an APK. That blind spot was not theoretical: this repository has shipped a pipeline in
+which the arm64-v8a split assembled, installed, and passed every gate here while
+containing no engine at all, because the AAR it was built from packaged only x86_64 and
+nothing asked the APK what it carried.
+
+So each APK is now opened and required to contain **its own** ABI's engine at
+`lib/<abi>/libbox.so`, with a digest that matches the `build-info.json` map
+(`core_engine_sha256`, recorded when the AAR was actually present). With `--aar` the map
+is additionally compared against the real AAR, which closes the loop from the pinned
+core through the packaged bytes: the digest can then only be right if the APK holds the
+AAR's engine byte for byte.
+
+The check is keyed on the ABI in the APK's filename, so an APK carrying only some other
+ABI's engine fails rather than passing on "a libbox.so exists somewhere".
+
 Usage:
     verify_release_bundle.py <bundle-dir> --expect-signature <unsigned|signed>
                              [--expect-app-commit SHA] [--expect-core-commit SHA]
+                             [--aar app/libs/libbox.aar]
 
 Exit status 0 only when every check passes. On success, stdout is the NUL-safe list of
 publishable file paths (one per line), suitable for feeding to the release step.
@@ -42,6 +62,15 @@ import json
 import os
 import re
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _zipcontent import (  # noqa: E402
+    apk_engine_abis,
+    apk_engine_digest,
+    aar_engine_map,
+    describe_zip,
+)
 
 # The two shipping ABIs, and the exact filename shape the naming step produces:
 #   satelite-one-<version>-<abi>-<kind>.apk
@@ -112,7 +141,29 @@ def main():
         default=None,
         help="also write the publishable file list here, so a caller can diff it",
     )
+    parser.add_argument(
+        "--aar",
+        default=None,
+        help="the libbox.aar these APKs were built from; enables the AAR-side half of "
+        "the engine identity check",
+    )
+    parser.add_argument(
+        "--require-aar",
+        action="store_true",
+        help="fail unless --aar was given. CI sets this so the stronger check cannot "
+        "silently disappear from a workflow edit",
+    )
     args = parser.parse_args()
+
+    # A gate whose strongest check can be dropped by forgetting a flag is one edit away
+    # from being the gate that let an engine-less APK through. CI therefore asserts it.
+    if args.require_aar and not args.aar:
+        fail(
+            "--require-aar was given without --aar, so the engine identity check could "
+            "not compare the APKs against the AAR they were built from"
+        )
+    if args.aar is not None and not os.path.isfile(args.aar):
+        fail(f"--aar {args.aar} does not exist")
 
     bundle = os.path.abspath(args.bundle)
     if not os.path.isdir(bundle):
@@ -246,7 +297,83 @@ def main():
     if info.get("core_ref") != "pinned":
         fail(f"build-info.json core_ref={info.get('core_ref')!r}, expected 'pinned'")
 
-    # ---- 5. the core identity must be a full commit SHA ---------------------------
+    # ---- 5. every APK must carry ITS OWN ABI's engine -----------------------------
+    # Everything before this section is a statement about filenames, whole-file hashes
+    # and JSON. None of it looks inside an APK, which is how an arm64-v8a split with no
+    # `lib/` directory at all once passed every gate in this repository. The digest map
+    # comes from build-info.json, which the build job writes while the AAR is on disk;
+    # `--aar` additionally re-derives it from those bytes, so with the flag set this
+    # comparison is anchored to the pinned core rather than to metadata alone.
+    engine_map = info.get("core_engine_sha256")
+    if not isinstance(engine_map, dict) or not engine_map:
+        fail(
+            "build-info.json has no core_engine_sha256 map, so no APK's engine can be "
+            "checked against the AAR it was built from. The map is what proves each "
+            "split carries its own ABI's core rather than merely carrying *a* core."
+        )
+    bad_digests = {
+        abi: value
+        for abi, value in engine_map.items()
+        if not re.fullmatch(r"[0-9a-f]{64}", str(value or ""))
+    }
+    if bad_digests:
+        fail(f"build-info.json core_engine_sha256 has non-sha256 entries: {bad_digests}")
+
+    for abi, name in sorted(by_abi.items()):
+        path = os.path.join(bundle, name)
+        # Keyed on the ABI in the FILENAME, which is the artifact's own claim about
+        # itself - "this is the arm64-v8a build". An APK holding only some other ABI's
+        # engine fails here instead of passing on "a libbox.so exists somewhere".
+        digest = apk_engine_digest(path, abi)
+        if digest is None:
+            fail(
+                f"{name} is the {abi} APK but packages no lib/{abi}/libbox.so. It would "
+                "install and run with no engine (the core never loads) while every "
+                f"filename and metadata check above still passed. Carried: "
+                f"{apk_engine_abis(path) or 'no engine for any ABI'}; {describe_zip(path)}"
+            )
+        expected_digest = str(engine_map.get(abi) or "")
+        if digest != expected_digest:
+            fail(
+                f"{name} packages lib/{abi}/libbox.so with sha256 {digest[:16]}… but the "
+                f"AAR this build used has {expected_digest[:16]}… for {abi}. The APK's "
+                "engine is not the pinned core's engine - a stale AAR, a relabelled "
+                "artifact, or a tampered/modified engine binary."
+            )
+        print(f"engine: {name} carries lib/{abi}/libbox.so {digest[:16]}…", file=sys.stderr)
+
+    # The other direction: an APK may not smuggle in an ABI the bundle was not built
+    # for. `splits` produces exactly one engine per split, and a cargo-culted universal
+    # APK would ship every ABI's core inside a file that claims one.
+    for abi, name in sorted(by_abi.items()):
+        carried = apk_engine_abis(os.path.join(bundle, name))
+        extra = [a for a in carried if a != abi]
+        if extra:
+            fail(
+                f"{name} is the {abi} APK but also packages engines for {extra}; the "
+                "release must ship one ABI's engine per split APK"
+            )
+
+    if args.aar is not None:
+        aar_map = aar_engine_map(args.aar)
+        for abi, name in sorted(by_abi.items()):
+            if abi not in aar_map:
+                fail(
+                    f"--aar {args.aar} packages no jni/{abi}/libbox.so, so {name} could "
+                    f"not have been built from it. The AAR carries {sorted(aar_map)}."
+                )
+            if aar_map[abi] != engine_map.get(abi):
+                fail(
+                    f"{args.aar} has jni/{abi}/libbox.so sha256 {aar_map[abi][:16]}… but "
+                    f"build-info.json records {str(engine_map.get(abi))[:16]}… while the "
+                    f"APK carries {apk_engine_digest(os.path.join(bundle, name), abi)[:16]}…"
+                )
+        print(
+            f"engine identity: {len(by_abi)} APK(s) match {args.aar} per ABI",
+            file=sys.stderr,
+        )
+
+    # ---- 6. the core identity must be a full commit SHA ---------------------------
     core_commit = info.get("core_commit") or ""
     if not re.fullmatch(r"[0-9a-f]{40}", core_commit):
         fail(f"build-info.json core_commit is not a full 40-char lowercase SHA: {core_commit!r}")
@@ -254,7 +381,7 @@ def main():
     if not re.fullmatch(r"[0-9a-f]{40}", app_commit):
         fail(f"build-info.json app commit is not a full 40-char lowercase SHA: {app_commit!r}")
 
-    # ---- 6. the requested signature expectation must hold -------------------------
+    # ---- 7. the requested signature expectation must hold -------------------------
     # The measured state is what the build job recorded; the release step re-measures
     # with apksigner. Both must agree with the expectation, so an unsigned or
     # debug-signed artifact can never be published as a release.
@@ -280,7 +407,7 @@ def main():
         name for name in OPTIONAL_FILES if name in entries
     ]
 
-    # ---- 7. the bundle must contain NOTHING ELSE --------------------------------
+    # ---- 8. the bundle must contain NOTHING ELSE --------------------------------
     # Verified-set == uploaded-set has to hold by construction, not by two enumerations
     # agreeing. The publish step uploads exactly the names written by `--list-to`, and
     # `action-gh-release` resolves those against its `working-directory`; the only way a

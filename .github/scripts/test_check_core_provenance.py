@@ -26,10 +26,16 @@ SHA_B = "b" * 40
 failures: list[str] = []
 
 
-def make_aar(path: str, embedded: bytes) -> None:
-    """A minimal AAR-shaped zip holding one libbox.so."""
+def make_aar(path: str, embedded: bytes, abis=("arm64-v8a", "x86_64")) -> None:
+    """A minimal AAR-shaped zip holding one libbox.so per ABI.
+
+    Two ABIs by default because that is what the gate now requires: an AAR that packages
+    only one of them cannot produce the other split with an engine, which is the defect
+    this fixture must be able to express (see the single-ABI case below).
+    """
     with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr("jni/arm64-v8a/libbox.so", b"\x7fELF" + embedded + b"\x00" * 64)
+        for abi in abis:
+            archive.writestr(f"jni/{abi}/libbox.so", b"\x7fELF" + embedded + b"\x00" * 64)
 
 
 def make_provenance(path: str, commit: str, version: str) -> None:
@@ -37,24 +43,23 @@ def make_provenance(path: str, commit: str, version: str) -> None:
         handle.write(f"commit={commit}\nversion={version}\n")
 
 
-def run(aar: str, provenance: str, expected: str) -> int:
-    return subprocess.run(
-        [sys.executable, GATE, aar, provenance, expected],
-        capture_output=True,
-        text=True,
-    ).returncode
+def run(aar: str, provenance: str, expected: str, abis: str = None) -> int:
+    cmd = [sys.executable, GATE, aar, provenance, expected]
+    if abis is not None:
+        cmd += ["--abis", abis]
+    return subprocess.run(cmd, capture_output=True, text=True).returncode
 
 
-def expect_reject(label: str, aar: str, provenance: str, expected: str) -> None:
-    rc = run(aar, provenance, expected)
+def expect_reject(label: str, aar: str, provenance: str, expected: str, abis: str = None) -> None:
+    rc = run(aar, provenance, expected, abis)
     if rc == 0:
         failures.append(f"{label}: gate ACCEPTED what it must reject")
     else:
         print(f"  rejected as required: {label}")
 
 
-def expect_accept(label: str, aar: str, provenance: str, expected: str) -> None:
-    rc = run(aar, provenance, expected)
+def expect_accept(label: str, aar: str, provenance: str, expected: str, abis: str = None) -> None:
+    rc = run(aar, provenance, expected, abis)
     if rc != 0:
         failures.append(f"{label}: gate REJECTED a valid pair")
     else:
@@ -103,6 +108,36 @@ def main() -> int:
         with zipfile.ZipFile(bare_aar, "w") as archive:
             archive.writestr("classes.jar", b"")
         expect_reject("AAR without libbox.so", bare_aar, good_prov, SHA_A)
+
+        # 8. The gate used to pass an AAR that packaged only ONE of the two shipping
+        #    ABIs: it asked "does any libbox.so contain the pin?", and x86_64 alone
+        #    answered yes. The arm64-v8a split then assembled, installed and shipped
+        #    with no engine, while this gate reported success. The shape below is that
+        #    accident, reduced to its essentials.
+        single_abi_aar = os.path.join(tmp, "x86_64-only.aar")
+        make_aar(single_abi_aar, SHA_A.encode(), abis=("x86_64",))
+        expect_reject(
+            "AAR packaging only x86_64 (arm64 split would ship no engine)",
+            single_abi_aar,
+            good_prov,
+            SHA_A,
+        )
+
+        # 9. ...and the same AAR asked only for the ABI it does have is a legitimate
+        #    build for some other product, so the rule has to be "every ABI we were told
+        #    to ship", not "every ABI imaginable". This keeps the check above honest: it
+        #    fails because arm64-v8a is REQUIRED, not because the AAR has one ABI.
+        expect_accept(
+            "single-ABI AAR when only that ABI is required",
+            single_abi_aar,
+            good_prov,
+            SHA_A,
+            abis="x86_64",
+        )
+
+        # 10. An ABI list that is empty checks nothing, so it must be a configuration
+        #     error rather than a vacuous pass.
+        expect_reject("empty ABI list", good_aar, good_prov, SHA_A, abis=",")
 
     if failures:
         print("\nFAILED:", file=sys.stderr)

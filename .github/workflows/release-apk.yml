@@ -215,6 +215,14 @@ jobs:
       - name: Provenance gate negative tests
         run: python3 .github/scripts/test_check_core_provenance.py
 
+      # Same reason, for the engine guard: the arm64/engine-absence defect this gate
+      # now rejects is one this repository actually shipped, so the cases that must be
+      # REJECTED are exercised on every release run - an engine-less APK, an APK holding
+      # only another ABI's engine, a one-byte-modified engine, and a single-ABI AAR
+      # against a two-APK bundle.
+      - name: Release ABI/engine guard negative tests
+        run: python3 .github/scripts/test_release_abi_guard.py
+
       # 同一个理由, 针对签名与发布门禁: publish job 只在 v* tag 才跑, 所以
       #   * APK 从哪来(download-artifact 落到工作目录)与校验步骤去哪找是否一致,
       #   * 空列表是否必然失败,
@@ -472,16 +480,49 @@ jobs:
             "run_id": "${GITHUB_RUN_ID}"
           }
           JSON
+          # The per-ABI engine digests, taken from the AAR THIS BUILD USED. This is the
+          # reference the bundle verifier compares each APK's packaged engine against, so
+          # "the APK carries the pinned core" becomes a byte-level statement rather than
+          # a metadata one. It is recorded here, while the AAR is on disk, because the
+          # publish job does not receive the AAR (it is not part of the bundle).
+          #
+          # `_zipcontent` is the same module the two gates use, so the digest recorded
+          # here cannot drift from the digest they compute.
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, os.path.join(os.environ["GITHUB_WORKSPACE"], ".github", "scripts"))
+          from _zipcontent import aar_engine_map  # noqa: E402
+
+          aar = os.path.join(os.environ["GITHUB_WORKSPACE"], "app", "libs", "libbox.aar")
+          engines = aar_engine_map(aar)
+          if not engines:
+              raise SystemExit(f"::error::{aar} packages no engine for any ABI")
+          path = "build-info.json"
+          with open(path, encoding="utf-8") as handle:
+              info = json.load(handle)
+          info["core_engine_sha256"] = engines
+          with open(path, "w", encoding="utf-8") as handle:
+              json.dump(info, handle, indent=2)
+          print("core_engine_sha256 = " + json.dumps(engines, sort_keys=True))
+          PY
           python3 -c "import json,sys; json.load(open('build-info.json')); print('build-info.json is valid JSON')"
           cat build-info.json
 
           # ---- 4. run the SAME verifier the publish job will run --------------------
+          # `--require-aar` is set here, and only here: this job has the AAR, so it can
+          # prove APK engine == AAR engine byte for byte. The flag makes that the
+          # enforced shape rather than something a later edit could drop by accident.
           python3 "${GITHUB_WORKSPACE}/.github/scripts/verify_release_bundle.py" . \
             --expect-signature "$EXPECT_SIGNATURE" \
             --expect-version "$VERSION" \
             --expect-kind "$KIND" \
             --expect-app-commit "${APP_COMMIT_FULL:-$GITHUB_SHA}" \
             --expect-core-commit "$CORE_SHA" \
+            --aar "${GITHUB_WORKSPACE}/app/libs/libbox.aar" \
+            --require-aar \
             --list-to bundle-files.txt
           echo "=== bundle verifier agreed; publishable files ==="
           cat bundle-files.txt

@@ -32,3 +32,8 @@ app/src/main/jniLibs/
 # release workflow's cache path). It must never be committed — a stub AAR has no
 # libbox.so and would make the provenance gate's warnings meaningless.
 /local-stub-aar/
+
+# Python bytecode from running the release gate scripts. `.github/scripts` now holds an
+# importable module (`_zipcontent`) shared by the gates and their tests, so running any
+# of them locally leaves a cache directory behind.
+__pycache__/
