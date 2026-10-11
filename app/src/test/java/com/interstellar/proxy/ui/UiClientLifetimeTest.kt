@@ -1,5 +1,6 @@
 package com.interstellar.proxy.ui
 
+import com.interstellar.proxy.bg.PlatformFacts
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -349,4 +350,109 @@ class UiClientLifetimeTest {
             0,
             violations.get(),
         )
-    }}
+    }
+
+    // --- the two guards together: backgrounding during the startup window -------------------------
+
+    /**
+     * `startProxy`'s establish and the foreground fact, composed the way `AppViewModel` composes them.
+     *
+     * The two guards were written and verified independently. This is the one check that they do not
+     * undo each other, and it is deliberately the SHORTEST scenario that crosses them:
+     *
+     *     foreground -> a proxy start is in its establishing window
+     *                -> the app goes to the background inside that window
+     *                -> the backgrounded client must not re-establish itself
+     *                -> the app comes back
+     *                -> the client is restored, exactly once
+     *
+     * The wiring below is not a convenient stand-in, it is `AppViewModel`'s: the listener routes a
+     * foreground fact to `resumeUiClient()` / `suspendUiClient()`, `UiClientLifetime` decides both the
+     * suspend and the establish, and the facts come from the real [PlatformFacts] rather than from a
+     * direct call to the lifetime - which is the whole point of the composition, because the listener
+     * being driven by the notification path is what the ordering work changed.
+     *
+     * Nothing here needs `AppViewModel` itself: its lifetime decision is entirely delegated to
+     * [UiClientLifetime], so a real lifetime plus the real fact source is enough to compose the two
+     * guards, and no emulator is involved.
+     */
+    @Test
+    fun `backgrounding during the startup window does not leave a UI client, and foreground restores one`() {
+        val lifetime = UiClientLifetime()
+        val suspends = java.util.concurrent.atomic.AtomicInteger(0)
+        val resumes = java.util.concurrent.atomic.AtomicInteger(0)
+
+        // AppViewModel.foregroundListener: `if (foreground) resumeUiClient() else suspendUiClient()`.
+        val listener: (Boolean) -> Unit = { foreground ->
+            if (foreground) {
+                if (lifetime.onForeground()) resumes.incrementAndGet()
+            } else {
+                if (lifetime.onBackground(headlessProbe = false)) suspends.incrementAndGet()
+            }
+        }
+
+        // Put the canonical fact in the foreground BEFORE subscribing, so the subscribe-time replay
+        // below is the value this scenario starts from rather than whatever another test left behind.
+        PlatformFacts.onForegroundChanged(true)
+        PlatformFacts.addForegroundListener(listener)
+        try {
+            // Subscribing replays the canonical value: a foreground fact, so nothing is suspended and
+            // no resume is owed yet. Measured off so the counters describe transitions only.
+            assertEquals(
+                "subscribing replayed a fact that changed the lifetime; the scenario's baseline is the " +
+                    "foreground state this test just recorded",
+                0,
+                suspends.get() + resumes.get(),
+            )
+            assertTrue("the foreground baseline must want the UI client", lifetime.wantsClient())
+
+            // A proxy start begins. `startProxy` reaches its establish after a delay, so this is the
+            // window the app can be backgrounded inside - and the poll and receiver are live, which is
+            // what makes a missed correction permanent rather than transient.
+            assertTrue("a start in flight must still want the client", lifetime.wantsClient())
+            assertTrue("and its reconnect poll must be live", lifetime.mayReconnect())
+
+            // The app goes to the background inside that window. The listener runs synchronously on
+            // this recording thread, exactly as it does on the main thread in the app.
+            PlatformFacts.onForegroundChanged(false)
+            assertEquals("the background fact must suspend the client exactly once", 1, suspends.get())
+            assertFalse(
+                "the client must not be wanted after the app went to the background",
+                lifetime.wantsClient(),
+            )
+            assertFalse(
+                "the reconnect poll must not be allowed to resurrect a backgrounded client",
+                lifetime.mayReconnect(),
+            )
+            // This is the guard the startProxy fix added: the establish reads the verdict at the last
+            // moment, so the pending start no longer builds a client the background edge just refused.
+            assertFalse(
+                "the startup establish's verdict is stale - it would still connect, leaving a " +
+                    "backgrounded app holding a UI command socket with no later edge to correct it",
+                lifetime.wantsClient(),
+            )
+
+            // The app comes back before the start has finished.
+            PlatformFacts.onForegroundChanged(true)
+            assertEquals("the foreground fact must resume the client exactly once", 1, resumes.get())
+            assertTrue("the restored client must be wanted again", lifetime.wantsClient())
+
+            // A repeated foreground fact is not a second session: the app receives several ON_STARTs,
+            // and a duplicate connect() fires onDisconnected() on the client it replaces.
+            PlatformFacts.onForegroundChanged(true)
+            assertEquals(
+                "a repeated foreground fact asked for a second connection sequence; a redundant " +
+                    "connect() reaches the onDisconnected()/applySocketDrop() path",
+                1,
+                resumes.get(),
+            )
+            assertTrue("the client is still wanted after the duplicate edge", lifetime.wantsClient())
+        } finally {
+            PlatformFacts.removeForegroundListener(listener)
+            // Leave the canonical fact deterministic for the next test, as the other PlatformFacts
+            // tests do.
+            PlatformFacts.onForegroundChanged(false)
+        }
+    }
+}
+
