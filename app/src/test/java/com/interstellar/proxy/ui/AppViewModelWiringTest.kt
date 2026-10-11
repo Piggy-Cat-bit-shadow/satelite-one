@@ -1,6 +1,7 @@
 package com.interstellar.proxy.ui
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -221,6 +222,107 @@ class AppViewModelWiringTest {
                 "the status is Starting or Stopped, so a resume with the core already Started would " +
                 "leave the UI frozen with no error and no way to recover.",
             establish < poll,
+        )
+    }
+
+    // --- ownership: one socket, so every establish needs a verdict -------------------
+
+    /**
+     * The startup establish in `startProxy()` is a UI-client establish and must be gated too.
+     *
+     * `commandClient` is ONE socket. `startProxy()` reaches the same `CommandClient` the guarded
+     * `connect()` hands to the UI, so its `commandClient.connect()` is not a separate, startup-only
+     * client that could legitimately sit outside the lifetime — it is the UI's client, established
+     * from a second place.
+     *
+     * That second place is reachable while suspended, which is what made this a real bypass rather
+     * than a tidiness question. `startProxy()` is called from the Compose UI, so it starts in the
+     * foreground, but everything after `delay(250)` runs on `Dispatchers.IO`: tapping start and
+     * immediately backgrounding the app lets the background edge land first, and `suspendUiClient()`
+     * has by then already disconnected the client and set the verdict to "not wanted" (measured on
+     * the real [UiClientLifetime]: `onBackground` -> true, then `wantsClient` -> false). An
+     * unguarded connect then rebuilt the client *after* that disconnect, with no later edge to
+     * correct it - `resumeUiClient()` fires only when the user comes back, and `mayReconnect()`
+     * gates new polls without ever closing an existing client.
+     *
+     * # Why this counts establishes instead of checking positions
+     *
+     * "There is an `if` before the connect" is the assertion that already failed this file once: the
+     * gate can be left intact while a second, ungated establish is added beside it, and a positional
+     * check cannot see that. What is asserted here is the ownership invariant itself - in this
+     * function, the number of establish calls equals the number of establish calls that sit inside a
+     * lifetime verdict. Equal counts can only hold when every one of them is gated.
+     *
+     * The two legitimate shapes are the only ones accepted: `connect()`'s
+     * `if (wantsClient) { … }`, and `startProxy()`'s `if (uiLifetime.wantsClient()) { … }`. The
+     * comment-stripped source is used because these functions discuss `commandClient.connect()` in
+     * prose while explaining the gate, and a count taken over raw text includes the prose.
+     */
+    @Test
+    fun `every establish in connect and startProxy is behind a lifetime verdict`() {
+        val establishes = Regex("commandClient\\.connect\\(\\)")
+
+        // Two functions, two allowed shapes. `connect()` legitimately has TWO establishes - the
+        // immediate one inside `if (wantsClient) { … }` and the poll's inside
+        // `if (!uiLifetime.mayReconnect()) continue` - so its poll establish is accounted for
+        // separately rather than being counted as an ungated call. `startProxy()` gets one verdict
+        // and no poll, so for it the two counts must be exactly equal.
+        for ((signature, gate, allowPoll) in listOf(
+            Triple("fun connect()", "if (wantsClient) {", true),
+            Triple("fun startProxy()", "if (uiLifetime.wantsClient()) {", false),
+        )) {
+            val body = bodyOf(signature)
+            val total = establishes.findAll(code(body)).count()
+            val gated = establishes.findAll(code(blockAfter(body, gate))).count()
+            val inPoll = if (allowPoll) {
+                establishes.findAll(blockAfter(body, "pollJob = viewModelScope.launch")).count()
+            } else {
+                0
+            }
+            assertTrue(
+                "`$signature` no longer establishes the client at all; this test cannot bind the " +
+                    "gate it exists for",
+                total > 0,
+            )
+            assertEquals(
+                "`$signature` establishes the UI command client outside every lifetime verdict " +
+                    "($total establish call(s); $gated inside `$gate`, $inPoll inside the reconnect " +
+                    "poll). `commandClient` is one socket shared with the UI, so a call outside a " +
+                    "verdict builds the client the canonical lifetime has just refused - reachable " +
+                    "by backgrounding the app during the startup coroutine, and permanent because no " +
+                    "later edge corrects an already connected client.",
+                total,
+                gated + inPoll,
+            )
+        }
+    }
+
+    /**
+     * The headless probe is the deliberate exception, and it must stay deliberate.
+     *
+     * `runDisconnectedUrlTest` drives this same client without any lifetime verdict, on purpose:
+     * a url-test run from the 未连接 state has no UI to serve, signals readiness only through
+     * `onConnected()`, and is bounded by the kernel's per-node timeout. Its own continuation is
+     * `reapplyOwedSuspend()`, which applies a background edge that arrived mid-probe.
+     *
+     * Stating it as a test keeps the exception visible: the assertion above deliberately covers
+     * only `connect()`/`startProxy()`, and a future edit that gated the probe too would make the
+     * probe time out, while one that copied this shape into `startProxy()` would be caught there.
+     */
+    @Test
+    fun `the headless probe establishes the client without a lifetime verdict, on purpose`() {
+        val body = code(bodyOf("private suspend fun runDisconnectedUrlTest("))
+        val total = Regex("commandClient\\.connect\\(\\)").findAll(body).count()
+        assertTrue(
+            "`runDisconnectedUrlTest` no longer establishes the client; the headless url-test would " +
+                "wait on a socket nobody opened and time out",
+            total > 0,
+        )
+        assertFalse(
+            "`runDisconnectedUrlTest` now consults the lifetime verdict. The probe is not UI work: " +
+                "it runs with no UI to serve and already handles a mid-probe background edge through " +
+                "`reapplyOwedSuspend()`, so gating it here would only make the probe time out.",
+            body.contains("wantsClient()"),
         )
     }
 

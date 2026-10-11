@@ -694,7 +694,34 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 android.util.Log.d("InterstellarUI", "config ok length=" + config.length)
                 com.interstellar.proxy.bg.BoxService.start()
-                commandClient.connect()
+                // Same client, same lifetime as every other establish in this file: `commandClient`
+                // is ONE socket, and the guarded `connect()` above hands it to the UI. So the
+                // startup establish is a UI-client establish too, and it needs the same verdict.
+                //
+                // This call is not decoration - `onConnected()` and the Status tick are what
+                // promote Starting -> Started and cancel `startingWatchdog`, so the client has to
+                // exist for the start to be observed at all. That is why the fix is a verdict and
+                // not a removal.
+                //
+                // It is also reachable while suspended, which is what makes the verdict necessary
+                // rather than tidy. startProxy() is invoked from the Compose UI, so it begins in
+                // the foreground, but everything below runs on Dispatchers.IO after `delay(250)`:
+                // tapping start and immediately pressing Home lets the background edge land first,
+                // and `suspendUiClient()` has by then already disconnected the client and set the
+                // verdict to "not wanted" (measured: onBackground -> true, wantsClient -> false).
+                // An unguarded connect here then rebuilt it, after the disconnect, with no later
+                // edge to correct it - `resumeUiClient()` only fires when the user returns, and
+                // `mayReconnect()` gates new polls without ever closing an existing client. The
+                // result was a backgrounded app holding a UI command socket for the rest of the
+                // session. Reading the verdict here, at the last moment before the establish,
+                // means the decision uses the canonical state rather than the state at entry.
+                //
+                // When the verdict refuses, nothing else is needed: `suspendUiClient()` has already
+                // run `commandClient.disconnect()`, and the status converges through
+                // `SERVICE_STOPPED` plus `startingWatchdog` exactly as it would have anyway.
+                if (uiLifetime.wantsClient()) {
+                    commandClient.connect()
+                }
             } catch (e: Exception) {
                 _message.value = str(com.interstellar.proxy.R.string.vm_start_failed, e.message ?: "")
                 markStopped()
