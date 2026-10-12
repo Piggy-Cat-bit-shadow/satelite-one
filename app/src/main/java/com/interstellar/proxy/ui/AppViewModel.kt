@@ -256,8 +256,46 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _testProgress = MutableStateFlow<Pair<Int, Int>?>(null)
     val testProgress: StateFlow<Pair<Int, Int>?> = _testProgress
 
+    /**
+     * Nodes of the batch run currently in flight, or of the run that just finished.
+     *
+     * Published so the result summary counts over the very set the run submitted instead of
+     * deriving its own. Two independent derivations are how the summary came to report
+     * "0 nodes · 0 ok · 0 failed" beside five real latencies.
+     */
+    private val _testTags = MutableStateFlow<List<String>>(emptyList())
+    val testTags: StateFlow<List<String>> = _testTags
+
     /** Epoch seconds when the current url-test run started (0 = idle). */
     @Volatile private var testStartEpoch = 0L
+
+    /**
+     * The ONE source of truth for a batch run: the node tags actually submitted to it.
+     *
+     * Both the progress denominator and the completion condition read this set, so they cannot
+     * disagree. It previously did not exist and each side guessed separately - the denominator
+     * from the `proxy` group (absent in a raw config), else the size of the delays map, else the
+     * subscription pool; the numerator from stamps across the WHOLE outbounds snapshot, `direct`,
+     * `block`, selectors and hidden nodes included. A numerator and a denominator drawn from
+     * different sets can never meet, so a run sat at "测速中" until its 25 s cap every time and
+     * the bar never reached N/N.
+     */
+    @Volatile private var testRunTags: Set<String> = emptySet()
+
+    /**
+     * tag → newest urlTestTime seen during the current run.
+     *
+     * Accumulated across snapshots instead of read from the latest one: `updateOutbounds` carries
+     * whatever subset the kernel chose to push, so counting within a single snapshot would drop
+     * results that arrived earlier and stall the run again.
+     */
+    private val testRunStamps = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** Wall clock at run start, for the per-node and total durations in the log. */
+    @Volatile private var testRunStartedAtMs = 0L
+
+    /** Nodes whose end time has already been logged, so each is reported exactly once. */
+    private val testRunReported = java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
     /** Serializes kernel url-test runs. */
     private val kernelUrlTestMutex = kotlinx.coroutines.sync.Mutex()
@@ -439,23 +477,39 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 val map = _delays.value.toMutableMap()
                 for (item in outbounds) {
                     map[item.tag] = item.urlTestDelay
+                    // Remember every stamp this run has seen, not just this snapshot's.
+                    if (testStartEpoch > 0 && item.urlTestTime > 0) {
+                        testRunStamps[item.tag] = item.urlTestTime
+                    }
                 }
                 _delays.value = map
-                // url-test progress: count results stamped after this run started
-                if (testStartEpoch > 0) {
-                    val done = outbounds.count { it.urlTestTime >= testStartEpoch }
-                    val prevTotal = _testProgress.value?.second ?: 0
-                    val total = maxOf(prevTotal, outbounds.size)
-                    if (total > 0) {
-                        if (done >= total) {
-                            testStartEpoch = 0
-                            if (kernelTestManual) {
-                                _testProgress.value = null
-                                _testing.value = false
-                            }
-                        } else if (kernelTestManual) {
-                            _testProgress.value = done.coerceAtMost(total) to total
+                // url-test progress and completion, both measured over the SAME set the run
+                // submitted. Nothing here reads outbounds.size: that snapshot also carries
+                // `direct`, `block`, selectors and nodes no run ever submits, none of which can
+                // report a stamp - which is exactly how the bar used to stall short of N/N.
+                val eligible = testRunTags
+                if (testStartEpoch > 0 && eligible.isNotEmpty()) {
+                    val startedAt = testRunStartedAtMs
+                    for (tag in eligible) {
+                        val stamp = testRunStamps[tag] ?: continue
+                        if (stamp >= testStartEpoch && startedAt > 0 && testRunReported.add(tag)) {
+                            AppLog.log(
+                                "test",
+                                "  $tag → ${map[tag] ?: 0}ms at +${System.currentTimeMillis() - startedAt}ms",
+                            )
                         }
+                    }
+                    val done = eligible.count { tag -> (testRunStamps[tag] ?: 0L) >= testStartEpoch }
+                    if (done >= eligible.size) {
+                        testStartEpoch = 0
+                        if (kernelTestManual) {
+                            val total = if (startedAt > 0) System.currentTimeMillis() - startedAt else 0
+                            AppLog.log("test", "batch done: $done/${eligible.size} in ${total}ms")
+                            _testProgress.value = null
+                            _testing.value = false
+                        }
+                    } else if (kernelTestManual) {
+                        _testProgress.value = done to eligible.size
                     }
                 }
                 // NB: snapshots can arrive at any moment (delayed pushes) and
@@ -952,8 +1006,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun urlTest(groupTag: String) {
         if (_testing.value) return
         val target = urlTestTarget(groupTag)
+        // The run's node set is established HERE, once, and everything downstream - the progress
+        // denominator, the completion condition and the per-node logging - reads it back.
+        beginTestRun(target)
         _testing.value = true
-        _testProgress.value = 0 to urlTestTotal()
+        _testProgress.value = 0 to testRunTags.size
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 if (_status.value == Status.Started) {
@@ -973,18 +1030,44 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** Denominator for the batch progress: live group size → known delays → pool size. */
-    private fun urlTestTotal(): Int {
-        _groups.value.find { it.tag == GROUP_TAG }?.let { group ->
-            if (group.items.isNotEmpty()) return group.items.size
-        }
-        if (_delays.value.isNotEmpty()) return _delays.value.size
-        return SubscriptionRepository.poolOf(
-            _subscriptions.value,
-            _activeSubscriptionId.value,
-            _mixEnabled.value,
-            _mixSubscriptionIds.value,
-        ).size
+    /**
+     * The nodes a batch url-test actually submits, resolved once for the whole run.
+     *
+     * This is the single `eligibleNodes` source the progress bar and the execution both use. A
+     * member that is itself a group (`selector` / `urltest`) is not an endpoint and is skipped by
+     * the kernel's per-item pass, so counting it would put a node in the denominator that can
+     * never report a result.
+     *
+     * That group filter is the whole exclusion, deliberately: `direct` and `block` ARE endpoints
+     * the kernel measures, so when a config puts them in a group they stay counted. Dropping them
+     * here would make N disagree with what was actually submitted, which is the one thing this
+     * number must not do.
+     */
+    private fun eligibleUrlTestTags(target: String): List<String> =
+        _groups.value.find { it.tag == target }
+            ?.items
+            ?.filterNot { it.type.equals("selector", true) || it.type.equals("urltest", true) }
+            ?.map { it.tag }
+            ?.distinct()
+            .orEmpty()
+
+    /**
+     * Start a run's bookkeeping for [target]. The only place a run's node set is established.
+     *
+     * The per-node timeline is logged as it happens, so a run's real shape (which node returned
+     * when, and how long the whole batch took) is readable afterwards rather than inferred.
+     */
+    private fun beginTestRun(target: String) {
+        val eligible = eligibleUrlTestTags(target)
+        testRunStamps.clear()
+        testRunReported.clear()
+        testRunTags = eligible.toSet()
+        _testTags.value = eligible
+        testRunStartedAtMs = System.currentTimeMillis()
+        com.interstellar.proxy.core.AppLog.log(
+            "test",
+            "batch start: ${eligible.size} node(s) in group '$target': ${eligible.joinToString()}",
+        )
     }
 
     /**
@@ -1018,7 +1101,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 // a colliding run's settle may have flashed these off while
                 // this caller was waiting on the mutex
                 _testing.value = true
-                _testProgress.value = 0 to urlTestTotal()
+                _testProgress.value = 0 to testRunTags.size
             }
             // The cause is kept rather than collapsed into a Boolean. A libbox failure
             // here reads "url test: get command client: <cause>", which names the boundary
@@ -1070,6 +1153,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
             if (!connected) throw IllegalStateException(str(com.interstellar.proxy.R.string.vm_test_service_timeout))
             kernelTestManual = true // manual run: progress + settle own the UI state
+            // A headless probe reaches the kernel by the same path, so it needs the same node set.
+            // When urlTest() already established it this is a no-op; when the probe is driven
+            // directly it is what gives the run a denominator and a completion condition.
+            if (testRunTags.isEmpty()) beginTestRun(target)
+            _testProgress.value = 0 to testRunTags.size
             testStartEpoch = System.currentTimeMillis() / 1000
             val failure = runCatching {
                 CommandTarget.standaloneClient().urlTest(target)
