@@ -151,13 +151,26 @@ fun NodesPage(viewModel: AppViewModel) {
     val testRunning = testing
     // resolved in composition: computeNodesTestSummary runs outside composable scope
     val genericFailNote = stringResource(R.string.nodes_test_fail_generic)
+    // The tags the run actually covers: the items of the group this run targets.
+    //
+    // The summary used to count `tagsFor(storedNodes)` - the pool the APP's generated config
+    // runs on. A user-supplied raw config carries no share links, so that pool is empty, and a
+    // run that measured five real delays still reported "0 nodes · 0 ok · 0 failed" while the
+    // cards beside it showed 169ms/171ms/.... Targeting the same group the url-test targets
+    // keeps the summary and the cards describing the same set, and for a generated config it
+    // resolves to `auto` (every pool node) exactly as before.
+    val testedGroup = com.interstellar.proxy.ui.resolveUrlTestTarget(
+        currentTab?.tag ?: MinimalConfigBuilder.GROUP_TAG,
+        groups,
+    )
+    val testedTags = groups.find { it.tag == testedGroup }?.items?.map { it.tag }
+        ?: MinimalConfigBuilder.tagsFor(storedNodes)
     LaunchedEffect(testRunning) {
         if (testRunning) {
             testSummary = null // a new run clears the old summary
         } else if (prevRunning) {
-            // just finished — snapshot stats over the current pool tags
-            val tags = MinimalConfigBuilder.tagsFor(storedNodes)
-            testSummary = computeNodesTestSummary(tags, delays, genericFailNote)
+            // just finished — snapshot stats over the tags this run covered
+            testSummary = computeNodesTestSummary(testedTags, delays, genericFailNote)
         }
         prevRunning = testRunning
     }

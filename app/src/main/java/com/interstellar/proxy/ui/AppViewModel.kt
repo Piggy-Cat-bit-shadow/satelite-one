@@ -919,6 +919,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
                 CommandTarget.standaloneClient().selectOutbound(pending.first, pending.second)
+            }.onSuccess {
+                // Positive confirmation. Until this line existed the restore was observable only
+                // by its ABSENCE (no vm_switch_failed), so "the stored pick reached the core" and
+                // "nothing was ever sent" looked identical in the logs - which is exactly the
+                // ambiguity that made this behaviour hard to trust.
+                com.interstellar.proxy.core.AppLog.log(
+                    "ui",
+                    str(com.interstellar.proxy.R.string.vm_switch_restored, pending.second, pending.first),
+                )
             }.onFailure {
                 _message.value = str(com.interstellar.proxy.R.string.vm_switch_failed, it.message ?: "")
             }

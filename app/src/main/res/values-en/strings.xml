@@ -31,6 +31,9 @@
     <string name="vm_start_failed">Start failed: %1$s</string>
     <string name="vm_config_update_failed">Failed to update config</string>
     <string name="vm_switch_failed">Switch failed: %1$s</string>
+    <!-- Positive confirmation on the logs page: a pick made while the core was stopped has
+         been pushed to the core after it started -->
+    <string name="vm_switch_restored">Restored last selection: %1$s · %2$s</string>
     <string name="vm_test_failed">Test failed: %1$s</string>
     <string name="vm_no_test_config">Could not generate a test config</string>
     <string name="vm_test_service_timeout">Timed out waiting for the test service</string>

@@ -31,6 +31,8 @@
     <string name="vm_start_failed">启动失败: %1$s</string>
     <string name="vm_config_update_failed">配置更新失败</string>
     <string name="vm_switch_failed">切换失败: %1$s</string>
+    <!-- 日志页的正向确认:内核未运行时选的节点,在下次启动后恢复到内核 -->
+    <string name="vm_switch_restored">已恢复上次选择: %1$s · %2$s</string>
     <string name="vm_test_failed">测速失败: %1$s</string>
     <string name="vm_no_test_config">无法生成测速配置</string>
     <string name="vm_test_service_timeout">测速服务启动超时</string>
