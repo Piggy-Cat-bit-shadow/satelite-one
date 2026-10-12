@@ -842,8 +842,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 if (_status.value == Status.Started) {
-                    if (!runKernelUrlTest(manual = true, target = target)) {
-                        _message.value = str(com.interstellar.proxy.R.string.vm_test_failed_send)
+                    runKernelUrlTest(manual = true, target = target)?.let { failure ->
+                        _message.value = str(com.interstellar.proxy.R.string.vm_test_failed, failure)
                     }
                 } else {
                     runDisconnectedUrlTest(target)
@@ -892,9 +892,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      * spinner mid-run). Marks the
      * run epoch, sends the command, then waits for the outbounds stream to
      * report every member stamped after the epoch — bounded by the kernel's
-     * per-node timeout plus margin. False = the command could not be sent.
+     * per-node timeout plus margin. A non-null result is the failure to report: the
+     * command could not be sent, and the libbox error says why.
      */
-    private suspend fun runKernelUrlTest(manual: Boolean, target: String = MinimalConfigBuilder.AUTO_TAG): Boolean =
+    private suspend fun runKernelUrlTest(manual: Boolean, target: String = MinimalConfigBuilder.AUTO_TAG): String? =
         kernelUrlTestMutex.withLock {
             kernelTestManual = manual
             testStartEpoch = System.currentTimeMillis() / 1000
@@ -904,17 +905,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 _testing.value = true
                 _testProgress.value = 0 to urlTestTotal()
             }
-            val ok = runCatching {
+            // The cause is kept rather than collapsed into a Boolean. A libbox failure
+            // here reads "url test: get command client: <cause>", which names the boundary
+            // that actually failed - no command socket, core gone, dial rejected. Throwing
+            // that away and reporting a bare "could not send" hid a control-plane fault
+            // behind a latency-test message and made the next round start from zero.
+            val failure = runCatching {
                 CommandTarget.standaloneClient().urlTest(target)
-            }.isSuccess
-            if (!ok) {
+            }.exceptionOrNull()
+            if (failure != null) {
                 testStartEpoch = 0
-                return@withLock false
+                return@withLock failure.message ?: failure.toString()
             }
             val deadline = System.currentTimeMillis() + PER_NODE_TEST_TIMEOUT_MS + 10_000
             while (testStartEpoch > 0 && System.currentTimeMillis() < deadline) delay(500)
             testStartEpoch = 0 // cap fallback; callers' finally owns the UI state
-            true
+            null
         }
 
     /**
@@ -950,10 +956,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             if (!connected) throw IllegalStateException(str(com.interstellar.proxy.R.string.vm_test_service_timeout))
             kernelTestManual = true // manual run: progress + settle own the UI state
             testStartEpoch = System.currentTimeMillis() / 1000
-            val ok = runCatching {
+            val failure = runCatching {
                 CommandTarget.standaloneClient().urlTest(target)
-            }.isSuccess
-            if (!ok) throw IllegalStateException(str(com.interstellar.proxy.R.string.vm_test_cmd_failed))
+            }.exceptionOrNull()
+            if (failure != null) {
+                throw IllegalStateException(
+                    str(
+                        com.interstellar.proxy.R.string.vm_test_failed,
+                        failure.message ?: failure.toString(),
+                    ),
+                )
+            }
             // bounded by the kernel's per-node timeout (15s) + margin —
             // a fixed 10s here used to cut the headless core mid-run and
             // leave the bottom nodes 未测

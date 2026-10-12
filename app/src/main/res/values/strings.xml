@@ -31,11 +31,9 @@
     <string name="vm_start_failed">启动失败: %1$s</string>
     <string name="vm_config_update_failed">配置更新失败</string>
     <string name="vm_switch_failed">切换失败: %1$s</string>
-    <string name="vm_test_failed_send">测速失败: 命令发送失败</string>
     <string name="vm_test_failed">测速失败: %1$s</string>
     <string name="vm_no_test_config">无法生成测速配置</string>
     <string name="vm_test_service_timeout">测速服务启动超时</string>
-    <string name="vm_test_cmd_failed">测速命令发送失败</string>
     <string name="vm_download_failed">下载失败: %1$s · 订阅域名可能无法直连, 建议开启代理后重试</string>
     <string name="vm_local_subscription">本地订阅</string>
     <string name="vm_imported_nodes">已导入 %1$d 个节点</string>

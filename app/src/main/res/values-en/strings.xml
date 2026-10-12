@@ -31,11 +31,9 @@
     <string name="vm_start_failed">Start failed: %1$s</string>
     <string name="vm_config_update_failed">Failed to update config</string>
     <string name="vm_switch_failed">Switch failed: %1$s</string>
-    <string name="vm_test_failed_send">Test failed: could not send command</string>
     <string name="vm_test_failed">Test failed: %1$s</string>
     <string name="vm_no_test_config">Could not generate a test config</string>
     <string name="vm_test_service_timeout">Timed out waiting for the test service</string>
-    <string name="vm_test_cmd_failed">Failed to send the test command</string>
     <string name="vm_download_failed">Download failed: %1$s · the subscription host may be unreachable directly; try again with the proxy on</string>
     <string name="vm_local_subscription">Local subscription</string>
     <string name="vm_imported_nodes">Imported %1$d nodes</string>
