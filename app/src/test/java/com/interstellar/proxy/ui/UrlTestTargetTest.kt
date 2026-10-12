@@ -56,4 +56,59 @@ class UrlTestTargetTest {
     fun `group type match is case-insensitive so live snapshots still resolve`() {
         check(resolveUrlTestTarget("🇭🇰 香港", listOf(group("🇭🇰 香港", "URLTest"))) == "🇭🇰 香港")
     }
+
+    // ---- a config with no `auto` at all (any user-supplied raw config) ----
+
+    /**
+     * The app's `auto` is its own generated group's name. When a raw config is running, the
+     * old rule still returned `auto`, and the kernel answered
+     * `NotFound: outbound not found: auto` - so 测速 on a fully populated group tested
+     * nothing, and the UI showed only "could not send command".
+     */
+    private val rawGroups = listOf(
+        CoreGroup(
+            tag = "🌍 国外流量",
+            type = "selector",
+            selected = "🇺🇸 美国｜NaiveProxy",
+            items = listOf(
+                CoreGroupItem("🇺🇸 美国｜Vless Reality Vision", "vless"),
+                CoreGroupItem("🇺🇸 美国｜NaiveProxy", "naive"),
+            ),
+        ),
+        CoreGroup("🤖 AI", "selector", "🇺🇸 美国｜AnyTLS", listOf(CoreGroupItem("🇺🇸 美国｜AnyTLS", "anytls"))),
+    )
+
+    @Test
+    fun `a selector is tested under its own tag when the config has no auto`() {
+        check(resolveUrlTestTarget("🌍 国外流量", rawGroups) == "🌍 国外流量") {
+            "a raw config's selector must be tested itself, not a tag nothing defines"
+        }
+        check(resolveUrlTestTarget("🤖 AI", rawGroups) == "🤖 AI")
+    }
+
+    @Test
+    fun `nothing resolves to auto unless the config actually defines it`() {
+        val resolved = listOf(
+            resolveUrlTestTarget("", rawGroups),
+            resolveUrlTestTarget("nope", rawGroups),
+            resolveUrlTestTarget("🌍 国外流量", rawGroups),
+        )
+        check(resolved.none { it == MinimalConfigBuilder.AUTO_TAG }) {
+            "auto was returned for a config that does not define it: $resolved"
+        }
+    }
+
+    @Test
+    fun `a blank tag falls back to a group the config really has`() {
+        check(resolveUrlTestTarget("", rawGroups) == "🌍 国外流量") {
+            "the fallback must name a live group"
+        }
+    }
+
+    @Test
+    fun `no groups at all still yields the historical default`() {
+        // The pre-connect case: nothing is known yet, so the caller's own name is kept and
+        // StartProxy's own gating decides whether a test is sent at all.
+        check(resolveUrlTestTarget("whatever", emptyList()) == MinimalConfigBuilder.AUTO_TAG)
+    }
 }

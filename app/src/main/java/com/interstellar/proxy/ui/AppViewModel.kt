@@ -119,12 +119,34 @@ data class RuntimeState(
  * tags; the kernel's per-item pass skips those ("大量未测"), so a selector (or an
  * unknown/blank tag) falls back to [MinimalConfigBuilder.AUTO_TAG], whose members are
  * every node. Pure so the mapping is unit-testable without a ViewModel.
+ *
+ * `auto` is a name the APP's own generated config gives its urltest group. A user-supplied
+ * raw config has no such outbound, and falling back to it unconditionally sent
+ * `URLTest("auto")` at a config that does not define it:
+ *
+ *     Test failed: url test: rpc error: code = NotFound desc = outbound not found: auto
+ *
+ * which is why the latency test could never run on a raw config - the group the user was
+ * looking at was fully populated, and every run tested nothing at all. So `auto` is used
+ * only when the running config actually has it; otherwise the group the user asked for is
+ * tested directly.
  */
 internal fun resolveUrlTestTarget(groupTag: String, groups: List<CoreGroup>): String {
-    if (groupTag.isBlank()) return MinimalConfigBuilder.AUTO_TAG
-    val live = groups.find { it.tag == groupTag }
-    val isUrlTest = live != null && live.type.equals("urltest", ignoreCase = true)
-    return if (isUrlTest) groupTag else MinimalConfigBuilder.AUTO_TAG
+    val auto = groups.find { it.tag == MinimalConfigBuilder.AUTO_TAG }
+    val live = groups.find { it.tag == groupTag && groupTag.isNotBlank() }
+
+    // Unknown or blank: the config's own `auto` when it exists, else whatever group this
+    // config does offer, rather than a name nothing defines.
+    if (live == null) {
+        return auto?.tag ?: groups.firstOrNull()?.tag ?: MinimalConfigBuilder.AUTO_TAG
+    }
+    // A urltest group is testable under its own tag.
+    if (live.type.equals("urltest", ignoreCase = true)) return live.tag
+    // A selector: `auto` (every node) is the better target when this config has one,
+    // because the kernel skips members that are themselves groups...
+    if (auto != null) return auto.tag
+    // ...and when it does not, the selector itself is what the user is looking at.
+    return live.tag
 }
 
 /** Transient feedback pill (subscription updates etc.). */
