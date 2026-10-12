@@ -1,7 +1,20 @@
-# Lifecycle and platform facts
+# Lifecycle and platform facts — moved
 
-PlatformFacts is canonical collector and serial bridge. Foreground/screen are levels, USER_PRESENT is an edge, trim is original Android integer; network is not a wake substitute.
+This file was split in the Stage-2 knowledge refresh because it covered two subsystems
+that change for different reasons and have different owners.
 
-Session ownership and bounded drain prevent old facts reaching a new core (`51cb7f5`, `1a86247`). Listeners run outside the fact lock because reentrancy was an ordering risk (`36dee73`, `15b5ff1`). Initial screen seeding captures epoch before platform read; any later observation, including the same level, invalidates it (`481e370`, `15c432d`).
+| Read this | For |
+|---|---|
+| `modules/platform-facts.md` | `PlatformFacts`, `ScreenFactState`: raw Android facts, level-vs-edge, the observation epoch, the lock boundary, listener ordering and reentrancy, session attach/detach and the bounded drain |
+| `modules/lifecycle-services.md` | `BoxService`, `VPNService`, `ProxyService`, `CoreLifecycle`: core ownership, the TUN fd, start/stop convergence, the notification's generation gate, and the settings that are read but never written |
 
-JVM tests cover ordering, seed wiring, lock boundary, session handover, trim and start guards. They do not prove OEM scheduling, Doze, physical unlock or actual revoke.
+Nothing was dropped; both files are denser than this one was. If you arrived here from an
+older reference, the corresponding content is:
+
+| Old line | Now |
+|---|---|
+| "PlatformFacts is canonical collector and serial bridge…" | `modules/platform-facts.md` §"What it is, and what it is not" |
+| "Session ownership and bounded drain prevent old facts reaching a new core" | `modules/platform-facts.md` §"Session ownership and bounded drain" |
+| "Listeners run outside the fact lock…" | `modules/platform-facts.md` §"Lock boundary and listener ordering" |
+| "Initial screen seeding captures epoch before platform read…" | `modules/platform-facts.md` §"The seed: epoch first, platform read second" |
+| "JVM tests cover ordering…" | `modules/tests-evidence.md` |
