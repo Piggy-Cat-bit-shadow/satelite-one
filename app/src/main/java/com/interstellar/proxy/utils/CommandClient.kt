@@ -103,6 +103,18 @@ open class CommandClient(
     private var connectionEpoch = 0
     private var commandClient: io.nekohasekai.libbox.CommandClient? = null
 
+    /**
+     * Whether the current outage has already been reported.
+     *
+     * The logs page polls `connect()` every 2 s while it is not connected, and "not connected"
+     * is the ordinary state whenever the VPN is down. Logging every attempt therefore emitted a
+     * ~15-line stack trace every two seconds, which buried the one line that mattered - the
+     * reason the *core* failed - under its own retry noise. The first failure of an outage keeps
+     * its stack (that is the diagnostic); the rest are the same failure, so they are silent.
+     * Reset on a successful connect, so the next outage is reported again.
+     */
+    private val connectFailureReported = java.util.concurrent.atomic.AtomicBoolean(false)
+
     fun connect() {
         val epoch: Int
         val previousClient: io.nekohasekai.libbox.CommandClient?
@@ -139,7 +151,11 @@ open class CommandClient(
                 newClient = io.nekohasekai.libbox.CommandClient(ClientHandler(epoch), options)
                 newClient.connect()
             } catch (e: Exception) {
-                Log.d("CommandClient", "connect failed", e)
+                // First failure of this outage keeps its stack; the poll's repeats are the same
+                // failure and are dropped (see connectFailureReported).
+                if (connectFailureReported.compareAndSet(false, true)) {
+                    Log.d("CommandClient", "connect failed (further failures are not repeated)", e)
+                }
                 if (isActiveEpoch(epoch)) {
                     handler.onConnectionError(
                         ConnectionErrorKind.ConnectFailed,
@@ -188,6 +204,7 @@ open class CommandClient(
     private inner class ClientHandler(private val epoch: Int) : CommandClientHandler {
         override fun connected() {
             if (!isActiveEpoch(epoch)) return
+            connectFailureReported.set(false)
             getAllHandlers().forEach { it.onConnected() }
             Log.d("CommandClient", "connected")
         }
