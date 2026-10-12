@@ -720,7 +720,23 @@ jobs:
           BUILD_DATE_OUT="${META[3]}"
           SIGNATURE_STATE_OUT="${META[4]}"
           TAG="${GITHUB_REF_NAME}"
-          PREV_TAG=$(git tag --list 'v*' --sort=-v:refname | grep -vx "$TAG" | head -n1 || true)
+          # The previous tag is the CLOSEST ANCESTOR of this one, not the highest version
+          # string. This repository reset its version line - 0.2.0 .. v0.5.10, then a fresh
+          # v0.1.0 - so `--sort=-v:refname` resolved v0.5.10 for a v0.1.1 tag and labelled the
+          # notes "自 v0.5.10 以来" while actually listing the whole 0.1.x line. Distance, not
+          # version order, is what "the release before this one" means.
+          PREV_TAG=""
+          BEST_DISTANCE=""
+          for candidate in $(git tag --list 'v*'); do
+            [ "$candidate" = "$TAG" ] && continue
+            git merge-base --is-ancestor "$candidate" "$TAG" 2>/dev/null || continue
+            distance=$(git rev-list --count "${candidate}..${TAG}")
+            [ "$distance" -gt 0 ] || continue
+            if [ -z "$BEST_DISTANCE" ] || [ "$distance" -lt "$BEST_DISTANCE" ]; then
+              BEST_DISTANCE="$distance"
+              PREV_TAG="$candidate"
+            fi
+          done
           RANGE="${PREV_TAG:+${PREV_TAG}..}${TAG}"
           SUMMARY_COMMIT=$(git log --format=%H -1 "$RANGE" -- version.properties 2>/dev/null || true)
           [ -n "$SUMMARY_COMMIT" ] || SUMMARY_COMMIT="$TAG"
@@ -732,7 +748,11 @@ jobs:
             echo "- commit: \`${CORE_COMMIT_OUT}\`"
             echo "- build: ${BUILD_DATE_OUT}"
             echo "- APK 签名: \`${SIGNATURE_STATE_OUT}\`(apksigner 实测, 见 apksigner-verify.txt)"
-            echo "- app commit: \`${APP_COMMIT_FULL:-unknown}\`"
+            # APP_COMMIT_FULL is exported by the BUILD job, and GITHUB_ENV does not cross jobs -
+            # so in this publish job it was always empty and every release body read
+            # "app commit: `unknown`". Fall back to GITHUB_SHA exactly as build-info.json and the
+            # bundle verifier already do; in a tag run that IS the commit being released.
+            echo "- app commit: \`${APP_COMMIT_FULL:-$GITHUB_SHA}\`"
             echo
             echo "## 更新摘要"
             echo
