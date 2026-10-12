@@ -132,7 +132,17 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
 
             override fun appendLogs(message: List<LogEntry>) {
                 for (entry in message) {
-                    append(LogLine(entry.level, entry.message, System.currentTimeMillis()))
+                    // The core colours its own level prefixes; this page renders plain
+                    // text, so the sequences are stripped here - at the single point where
+                    // a core line becomes a displayed line. The core's content is not
+                    // modified, only its presentation.
+                    append(
+                        LogLine(
+                            entry.level,
+                            com.interstellar.proxy.core.AnsiEscape.strip(entry.message),
+                            System.currentTimeMillis(),
+                        ),
+                    )
                 }
             }
         },
