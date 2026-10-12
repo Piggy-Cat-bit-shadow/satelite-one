@@ -3,15 +3,20 @@
 | Item | Result |
 |---|---|
 | Repository / branch | `Piggy-Cat-bit-shadow/satelite-one` / `main` |
-| Baseline/current HEAD | `2cb6eb9b8e3721036534ef84b1e4352369ac1484` |
-| Production baseline | same |
+| Production implementation baseline | `2cb6eb9b8e3721036534ef84b1e4352369ac1484` |
+| Documentation-only knowledge tip at capture | `6864a1ef9295d865ef09b10614ef657efb3a14f4` |
 | Latest tag baseline | `v0.5.10` / `6f4124c` |
 | Core pin / producer provenance | `1965bbf351710b86722838ae61a91b62c97d29de` / same |
 | Commits scanned | 1,000+ reachable history; deep review of current single-core, lifecycle and release series |
 | Production code changed | NO |
 | Git history rewritten | NO |
 
-The knowledge base captures client/core ownership, raw Android facts, VPN/network/service ownership, UI-client lifetime, import boundary, and release provenance. Cross-checks covered version properties, Gradle, workflows, provenance/release scripts, local producer record, source, tests and history. Earlier multi-core history is SUPERSEDED, not erased.
+The knowledge base captures client/core ownership, raw Android facts, VPN/network/service ownership, UI-client lifetime, import boundary, and release provenance. Cross-checks covered version properties, Gradle, workflows, provenance/release scripts, local producer record, source, tests and history. It explicitly separates AAR producer/binary identity, Gradle self-consistency, final per-ABI APK integrity, verified-bundle identity, and measured signing state; none stands in for the others. Earlier multi-core history is SUPERSEDED, not erased.
+
+The implementation baseline deliberately remains the last production commit. At
+capture, `2cb6eb9..6864a1e` is documentation/evidence only; a future reader must
+still inspect `production-baseline..HEAD` and classify the delta rather than assume
+that documentation commits are product changes.
 
 ## Existing-document classification
 
