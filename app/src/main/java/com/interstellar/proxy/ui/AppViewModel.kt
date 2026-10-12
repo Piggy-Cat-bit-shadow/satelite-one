@@ -517,7 +517,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     for (tag in eligible) {
                         val stamp = testRunStamps[tag] ?: continue
                         if (stamp >= testStartEpoch && startedAt > 0 && testRunReported.add(tag)) {
-                            AppLog.log(
+                            com.interstellar.proxy.core.AppLog.log(
                                 "test",
                                 "  $tag → ${map[tag] ?: 0}ms at +${System.currentTimeMillis() - startedAt}ms",
                             )
@@ -528,7 +528,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         testStartEpoch = 0
                         if (kernelTestManual) {
                             val total = if (startedAt > 0) System.currentTimeMillis() - startedAt else 0
-                            AppLog.log("test", "batch done: $done/${eligible.size} in ${total}ms")
+                            com.interstellar.proxy.core.AppLog.log(
+                                "test",
+                                "batch done: $done/${eligible.size} in ${total}ms",
+                            )
                             _testProgress.value = null
                             _testing.value = false
                         }
