@@ -133,6 +133,43 @@ data class UiToast(val text: String, val kind: Kind) {
 }
 
 /**
+ * Decide whether the node the user last picked still has to be pushed to a running core.
+ *
+ * A pick made while the VPN is **stopped** is only honoured immediately for a *generated*
+ * config: `SubscriptionRepository` bakes it into the selector's `default` when it rewrites
+ * the JSON. A **raw** config is passed through untouched (that is the documented contract
+ * for a user-supplied sing-box config), so nothing carries the pick into the core. The
+ * nodes page meanwhile shows `Settings.selectedOutboundTag` as the selection - so the UI
+ * claimed a choice the core had never been told about, and after a restart the core ran
+ * the config's own `default` while the page pointed at a different node.
+ *
+ * The restore is deliberately conservative; every one of these returns null, which leaves
+ * the config's `default` in force rather than guessing:
+ *
+ *  - no group is known for the stored tag (an older value, or a pick from another config);
+ *  - the group is gone from the live config;
+ *  - the group is a `urltest` - those choose their own member, a manual pick is meaningless;
+ *  - the item is not a member of that group any more (a stale tag must never be pushed);
+ *  - the group is already on that item, so there is nothing to restore.
+ *
+ * Pure, so the decision is unit-testable without a device or a core.
+ *
+ * @return the `group to item` to select, or null when nothing is owed.
+ */
+internal fun pendingSelectionRestore(
+    storedGroup: String,
+    storedItem: String,
+    groups: List<CoreGroup>,
+): Pair<String, String>? {
+    if (storedGroup.isBlank() || storedItem.isBlank()) return null
+    val group = groups.find { it.tag == storedGroup } ?: return null
+    if (!group.type.equals("selector", ignoreCase = true)) return null
+    if (group.items.none { it.tag == storedItem }) return null
+    if (group.selected == storedItem) return null
+    return group.tag to storedItem
+}
+
+/**
  * App-wide state holder: box status via the local command socket,
  * subscriptions, and start/stop orchestration.
  */
@@ -373,6 +410,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
             override fun updateGroups(newGroups: MutableList<OutboundGroup>) {
                 _groups.value = newGroups.map(::convertGroup)
+                restorePendingSelection()
             }
 
             override fun updateOutbounds(outbounds: List<io.nekohasekai.libbox.OutboundGroupItem>) {
@@ -631,6 +669,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         startingWatchdog?.cancel()
         startingWatchdog = null
         autoTested = false
+        // A fresh core must be allowed to restore the stored pick again.
+        selectionRestoreAttempted = false
         if (_status.value != Status.Stopped) {
             _status.value = Status.Stopped
         }
@@ -799,6 +839,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun selectNode(groupTag: String, itemTag: String) {
         Settings.selectedOutboundTag = itemTag
+        // Stored with the group: restoring a pick needs to know WHICH selector it belonged
+        // to, and a tag alone does not say (see pendingSelectionRestore).
+        Settings.selectedOutboundGroup = groupTag
         _selectedOutboundTag.value = itemTag
         viewModelScope.launch(Dispatchers.IO) {
             if (_status.value == Status.Started) {
@@ -808,13 +851,54 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     _message.value = str(com.interstellar.proxy.R.string.vm_switch_failed, it.message ?: "")
                 }
             } else {
-                // stopped: bake the pick into the regenerated config and
-                // refresh the static groups so the page reflects it at once
+                // stopped: this rewrite bakes the pick into the selector's `default` for a
+                // *generated* config. A *raw* user config is passed through untouched, so
+                // for those the pick is instead restored once the core is up and its groups
+                // are known (restorePendingSelection). The comment here used to promise the
+                // bake unconditionally, which was simply untrue for a raw config - the pick
+                // was dropped and the page kept showing a node the core was not using.
                 val config = SubscriptionRepository.regenerateActiveConfig()
                 if (config != null) {
                     _staticGroups.value = parseSingboxGroups(config)
                 }
                 _selectedOutboundTag.value = Settings.selectedOutboundTag
+            }
+        }
+    }
+
+    /**
+     * True once a restore has been attempted for the current core.
+     *
+     * Reset when the core stops. It exists so the stream of group snapshots cannot push the
+     * stored pick again *after* the user has made a different choice in the same session.
+     *
+     * Written from the UI thread (the stop path) and read from the command client's
+     * callback thread (the group stream), so the reset has to be published rather than
+     * hoped for - otherwise a restart can silently skip the restore.
+     */
+    @Volatile
+    private var selectionRestoreAttempted = false
+
+    /**
+     * Push the node the user picked while the core was stopped.
+     *
+     * Driven by the group stream rather than by a "started" callback: those snapshots arrive
+     * *over the command channel*, so running here means that channel is already usable.
+     * Sending from the start callback instead would race the very socket it needs.
+     */
+    private fun restorePendingSelection() {
+        if (selectionRestoreAttempted) return
+        val pending = pendingSelectionRestore(
+            Settings.selectedOutboundGroup,
+            Settings.selectedOutboundTag,
+            _groups.value,
+        ) ?: return
+        selectionRestoreAttempted = true
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                CommandTarget.standaloneClient().selectOutbound(pending.first, pending.second)
+            }.onFailure {
+                _message.value = str(com.interstellar.proxy.R.string.vm_switch_failed, it.message ?: "")
             }
         }
     }

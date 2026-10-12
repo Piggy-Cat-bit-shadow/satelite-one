@@ -145,6 +145,25 @@ object Settings {
             commit()
         }
 
+    /**
+     * The group [selectedOutboundTag] was picked in.
+     *
+     * Stored alongside the tag because a tag alone does not identify a choice: a config may
+     * hold several selectors, and the same item can be a member of more than one of them.
+     * Restoring a pick by searching for "the group that contains this tag" would then be a
+     * guess, and a wrong guess silently moves a selector the user never touched.
+     *
+     * Empty means no group is known for the stored tag - a value written before this key
+     * existed, or a pick made against a config that is no longer active. Nothing is
+     * restored from an unknown group; the config's own `default` stays in force.
+     */
+    var selectedOutboundGroup: String
+        get() = properties.getProperty("selectedOutboundGroup", "")
+        set(value) {
+            properties.setProperty("selectedOutboundGroup", value)
+            commit()
+        }
+
 
     /** Nodes page layout: grid (default) or list. */
     var nodesGridView: Boolean
