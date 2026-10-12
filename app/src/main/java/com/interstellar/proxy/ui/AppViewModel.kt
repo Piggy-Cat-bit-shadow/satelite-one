@@ -149,6 +149,30 @@ internal fun resolveUrlTestTarget(groupTag: String, groups: List<CoreGroup>): St
     return live.tag
 }
 
+/**
+ * The node tags a batch url-test submits, from the members of the group it targets.
+ *
+ * This is the single `eligibleNodes` source: the progress denominator, the completion condition
+ * and the result summary all resolve from it, so they cannot disagree. Two independent
+ * derivations are what let a run report "0 nodes · 0 ok · 0 failed" beside five real latencies
+ * while also never reaching completion.
+ *
+ * A member that is itself a group (`selector` / `urltest`) is not an endpoint, and the kernel's
+ * per-item pass skips it - so counting it would put a node in the denominator that can never
+ * report. `direct` and `block` are deliberately NOT excluded: they are endpoints the kernel does
+ * measure, and dropping them here would make N disagree with what was actually submitted, which
+ * is the one thing this number must not do.
+ *
+ * Pure, so the counting rules are unit-testable without a core or a device.
+ */
+internal fun eligibleUrlTestTags(items: List<CoreGroupItem>): List<String> =
+    items
+        .filterNot { it.type.equals("selector", ignoreCase = true) }
+        .filterNot { it.type.equals("urltest", ignoreCase = true) }
+        .map { it.tag }
+        .filter { it.isNotBlank() }
+        .distinct()
+
 /** Transient feedback pill (subscription updates etc.). */
 data class UiToast(val text: String, val kind: Kind) {
     enum class Kind { Success, Error }
@@ -1033,23 +1057,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     /**
      * The nodes a batch url-test actually submits, resolved once for the whole run.
      *
-     * This is the single `eligibleNodes` source the progress bar and the execution both use. A
-     * member that is itself a group (`selector` / `urltest`) is not an endpoint and is skipped by
-     * the kernel's per-item pass, so counting it would put a node in the denominator that can
-     * never report a result.
-     *
-     * That group filter is the whole exclusion, deliberately: `direct` and `block` ARE endpoints
-     * the kernel measures, so when a config puts them in a group they stay counted. Dropping them
-     * here would make N disagree with what was actually submitted, which is the one thing this
-     * number must not do.
+     * Delegates to the pure [eligibleUrlTestTags] so the counting rules are unit-testable; this
+     * wrapper only supplies the live group snapshot.
      */
     private fun eligibleUrlTestTags(target: String): List<String> =
-        _groups.value.find { it.tag == target }
-            ?.items
-            ?.filterNot { it.type.equals("selector", true) || it.type.equals("urltest", true) }
-            ?.map { it.tag }
-            ?.distinct()
-            .orEmpty()
+        com.interstellar.proxy.ui.eligibleUrlTestTags(
+            _groups.value.find { it.tag == target }?.items.orEmpty(),
+        )
 
     /**
      * Start a run's bookkeeping for [target]. The only place a run's node set is established.
