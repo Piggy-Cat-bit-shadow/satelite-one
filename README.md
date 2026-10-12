@@ -124,8 +124,16 @@ git clone --branch testing https://github.com/Piggy-Cat-bit-shadow/sing-box /tmp
 cd /tmp/sing-box
 go install github.com/sagernet/gomobile/cmd/gomobile@v0.1.12
 go install github.com/sagernet/gomobile/cmd/gobind@v0.1.12
-go run ./cmd/internal/build_libbox -target android
-cp libbox.aar <app>/app/libs/libbox.aar
+# 把要发布的内核 revision 同时作为 version 与 commit 编译进去, 否则
+# :app:verifyCoreProvenance 会因为二进制自称的 revision 与 build-info 不一致而失败。
+SING_BOX_BUILD_VERSION=<coreCommit> \
+SING_BOX_BUILD_COMMIT=<coreCommit> \
+  go run ./cmd/internal/build_libbox -target android
+# build_libbox 把 AAR 写在隔离的 gomobile 工作目录里 (<root>/_libbox_build/libbox.aar),
+# 不在模块根目录; 这里用仓库里同一个 resolver, 与两个 workflow 共用一条规则。
+AAR="$(bash <app>/.github/scripts/resolve_libbox_aar.sh "$PWD")"
+cp "$AAR" <app>/app/libs/libbox.aar
+cp libbox.provenance <app>/app/libs/libbox.provenance
 ```
 
 工具链要求（以 `cmd/internal/build_libbox` 与 `build_shared/sdk.go` 为准）：
