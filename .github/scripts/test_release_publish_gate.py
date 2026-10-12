@@ -824,6 +824,26 @@ def test_kind_must_lead_with_the_measured_state():
         )
         check(code == 0, f"the honest kind/state pairing must PASS, got {err.strip()[:200]}")
 
+        # The kind a REAL release produces. The naming step abbreviates the measured state
+        # `signed-by-user` to `signed`, so the files a v* tag publishes are named
+        # `...-signed-<tag>.apk`. The two cases above only ever exercised the dry-run
+        # spelling (and used the raw state as the kind), so this pairing - the only one a
+        # released artifact has - was never run. It is the case that used to be rejected.
+        release = write_bundle(
+            os.path.join(tmp, "kindrelease"),
+            signature_state="signed-by-user",
+            kind="signed-v0.5.10",
+        )
+        code, _, err = run_bundle_preflight(
+            release,
+            extra_args=("--expect-kind", "signed-v0.5.10"),
+        )
+        check(
+            code == 0,
+            f"the kind a signed release actually produces must PASS, got exit={code}: "
+            f"{err.strip()[:200]}",
+        )
+
 
 def test_expect_kind_survives_a_hyphenated_version():
     """A version containing '-' must not be mistaken for part of the ABI.

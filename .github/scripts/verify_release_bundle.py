@@ -278,8 +278,16 @@ def main():
     # `kind` embeds the measured signature state as a prefix (unsigned-dryrun,
     # signed-vX.Y.Z, ...), so the relation is "kind starts with the state" rather than
     # equality - and it is only checked when the caller told us the kind.
+    #
+    # The prefix is the TOKEN the naming step emits, not the raw state string. That step
+    # passes `unsigned` and `debug-signed` through unchanged but abbreviates
+    # `signed-by-user` to `signed` ("正式发布 → ...-signed-<tag>.apk"). Comparing against
+    # the raw state therefore rejected exactly the one kind a signed release produces
+    # (signed-vX.Y.Z) while still accepting the dry-run kinds: a real release could never
+    # have cleared this gate, and only a dry run ever ran it.
     state = info.get("signature_state")
-    if args.expect_kind is not None and not args.expect_kind.startswith(str(state)):
+    kind_token = {"signed-by-user": "signed"}.get(str(state), str(state))
+    if args.expect_kind is not None and not args.expect_kind.startswith(kind_token):
         fail(
             f"build-info.json signature_state={state!r} does not lead the filename kind "
             f"{args.expect_kind!r} the naming step reported"
