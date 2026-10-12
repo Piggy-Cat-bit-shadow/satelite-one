@@ -75,14 +75,18 @@ interface ProxyCore : PlatformFactSink {
 
 /**
  * Neutral start-time overrides, mapped onto sing-box's OverrideOptions.
+ *
+ * These are the ONLY things the app overrides at start: sing-box's `OverrideOptions`
+ * carries `autoRedirect` and the package lists, and nothing else. A selected outbound is
+ * deliberately NOT here - libbox has no such override, so a field for it could only ever be
+ * silently ignored. Choosing a node is a command, not a config override; see
+ * `AppViewModel.pendingSelectionRestore`.
  */
 data class CoreOverrides(
     val autoRedirect: Boolean,
     val perAppEnabled: Boolean,
     val perAppInclude: Boolean,
     val perAppPackages: Set<String>,
-    /** Tag the UI wants selected. */
-    val selectedTag: String? = null,
 )
 
 /** Neutral system-proxy state (BoxService ↔ core, decoupled from libbox types). */
