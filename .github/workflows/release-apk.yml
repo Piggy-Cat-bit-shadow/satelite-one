@@ -61,6 +61,18 @@ env:
   NDK_VERSION: 28.0.13004108
   GOMOBILE_VERSION: v0.1.12
   GO_VERSION: '1.25.5'
+  # The keystore alias is NON-SECRET release metadata: it is fixed, public, and carries no
+  # signing power on its own. It therefore belongs here, versioned with the workflow,
+  # instead of in repository settings.
+  #
+  # Keeping it out of `secrets` is not cosmetic. GitHub masks any secret VALUE wherever it
+  # matches, so while the alias lived in a secret the plain string `satelite-one` was
+  # redacted across this repository's logs, and any job output containing it was silently
+  # dropped ("Skip output 'artifact_name' since it may contain secret") - which is what
+  # broke the publish job's artifact download.
+  #
+  # Only the keystore bytes and the two passwords are secrets.
+  SIGNING_KEY_ALIAS: satelite-one
 
 jobs:
   build:
@@ -291,7 +303,8 @@ jobs:
         env:
           KEYSTORE_B64: ${{ secrets.INTERSTELLAR_KEYSTORE_B64 }}
           STORE_PASSWORD: ${{ secrets.INTERSTELLAR_STORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.INTERSTELLAR_KEY_ALIAS }}
+          # Non-secret metadata, versioned in this workflow's top-level env.
+          KEY_ALIAS: ${{ env.SIGNING_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.INTERSTELLAR_KEY_PASSWORD }}
         run: |
           set -euo pipefail
@@ -593,24 +606,26 @@ jobs:
       - name: Download the release bundle
         uses: actions/download-artifact@v4
         with:
-          # Deliberately NOT `name: ${{ needs.build.outputs.artifact_name }}`.
+          # Selected by a run-pinned pattern, deliberately NOT by
+          # `needs.build.outputs.artifact_name`.
           #
-          # That job output is never delivered. The artifact is named
-          # `satelite-one-<version>-<kind>-run<N>`, the INTERSTELLAR_KEY_ALIAS secret IS
-          # the string `satelite-one`, and Actions refuses to propagate any job output
-          # that contains a secret value:
+          # The pattern is anchored to THIS run's number, so the only artifact it can
+          # match is the one this run's build job uploaded; a similarly-named artifact
+          # from another run cannot be picked up. `merge-multiple` flattens the result
+          # into the single directory everything downstream reads, and the bundle
+          # verifier still refuses any file it did not expect - so even if the pattern
+          # ever matched more than one artifact, a stray file could not reach a release.
+          # Nothing in this step depends on cross-job output plumbing.
           #
-          #   ##[warning]Skip output 'artifact_name' since it may contain secret.
-          #
-          # An empty `name` makes this action download *every* artifact and nest each one
-          # in a directory named after it, which the bundle verifier correctly rejects:
-          #
-          #   bundle must be flat; found subdirectories: ['satelite-one-...-run14']
-          #
-          # Selecting by pattern keeps the choice in this job instead of in a value that
-          # secret masking can silently empty, and `merge-multiple` flattens it into the
-          # one directory everything downstream reads. The pattern is pinned to this run's
-          # number, so a stale artifact from another run cannot be picked up.
+          # History worth recording: this step originally used the job output, and
+          # Actions silently refused to deliver it while the keystore alias was stored as
+          # a secret - the artifact name begins with `satelite-one`, the alias secret WAS
+          # that string, and any job output containing a secret value is dropped
+          # ("Skip output 'artifact_name' since it may contain secret"). An empty `name`
+          # then made this action download every artifact nested in a directory named
+          # after it, which the verifier rejected. The alias now lives in this workflow's
+          # env, so that particular failure is gone; the pattern is kept because it is the
+          # more robust of the two, not because of that episode.
           pattern: satelite-one-*-run${{ github.run_number }}
           merge-multiple: true
           path: release-bundle

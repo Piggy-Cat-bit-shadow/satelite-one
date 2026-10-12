@@ -193,9 +193,13 @@ CI 通过以下 secrets 注入正式签名材料（只在 `v*` tag push 且 `dry
 ```
 INTERSTELLAR_KEYSTORE_B64     base64(interstellar.jks)
 INTERSTELLAR_STORE_PASSWORD
-INTERSTELLAR_KEY_ALIAS
 INTERSTELLAR_KEY_PASSWORD
 ```
+
+keystore alias（`satelite-one`）**不是**秘密，因此不走 Secret：它是固定的公开 signing
+metadata，版本化在 `release-apk.yml` 的 `env.SIGNING_KEY_ALIAS` 里。把它当成 Secret
+会让 GitHub 把普通字符串 `satelite-one` 在日志中一律 mask 成 `***`，并静默丢掉任何
+含它的 job output。
 
 ## CI
 
