@@ -205,7 +205,33 @@ jobs:
           SING_BOX_BUILD_VERSION="${CORE_SHA}" \
           SING_BOX_BUILD_COMMIT="${CORE_SHA}" \
             go run ./cmd/internal/build_libbox -target android
-          cp libbox.aar "${GITHUB_WORKSPACE}/app/libs/libbox.aar"
+          # build_libbox runs gomobile in an isolated work directory and names its output
+          # by ABSOLUTE path inside it, so the AAR is never left in the module root:
+          #
+          #   outputPath := filepath.Join(gomobileWorkDir(rootDir), config.OutputName)
+          #   gomobileWorkDir(root) := filepath.Join(root, "_libbox_build")
+          #
+          # The builder copies the artifact out only when a sibling sing-box-for-android
+          # checkout happens to exist, which is not the case here. So the bare
+          # `cp libbox.aar` failed with "No such file or directory" *after* a build that
+          # had in fact succeeded: libbox.provenance IS written into the module root,
+          # which is what made the step look like it had produced nothing at all.
+          #
+          # Resolve the AAR from where the builder actually writes it, and fail loudly if
+          # it is absent -- rather than publishing whatever a bare `cp` happens to find.
+          AAR=""
+          for candidate in "_libbox_build/libbox.aar" "libbox.aar"; do
+            if [ -f "$candidate" ]; then
+              AAR="$candidate"
+              break
+            fi
+          done
+          if [ -z "$AAR" ]; then
+            echo "::error::build_libbox produced no libbox.aar (looked in _libbox_build/ and the module root)"
+            exit 1
+          fi
+          echo "libbox.aar resolved at ${AAR}"
+          cp "$AAR" "${GITHUB_WORKSPACE}/app/libs/libbox.aar"
           cp libbox.provenance "${GITHUB_WORKSPACE}/app/libs/libbox.provenance"
 
       # A gate nobody has seen fail is not evidence. This exercises the rejection cases
