@@ -541,6 +541,12 @@ jobs:
           # `--require-aar` is set here, and only here: this job has the AAR, so it can
           # prove APK engine == AAR engine byte for byte. The flag makes that the
           # enforced shape rather than something a later edit could drop by accident.
+          #
+          # The publishable list is written OUTSIDE release-bundle/ on purpose. The bundle
+          # is what gets uploaded, and the verifier refuses any bundle holding a file it
+          # does not know about. Writing the list INTO the bundle (as this used to) added a
+          # sixth file to the artifact that the publish-side preflight then rejected as
+          # unexpected: the list describing the set had put itself outside the set.
           python3 "${GITHUB_WORKSPACE}/.github/scripts/verify_release_bundle.py" . \
             --expect-signature "$EXPECT_SIGNATURE" \
             --expect-version "$VERSION" \
@@ -549,9 +555,9 @@ jobs:
             --expect-core-commit "$CORE_SHA" \
             --aar "${GITHUB_WORKSPACE}/app/libs/libbox.aar" \
             --require-aar \
-            --list-to bundle-files.txt
+            --list-to "${GITHUB_WORKSPACE}/bundle-files.txt"
           echo "=== bundle verifier agreed; publishable files ==="
-          cat bundle-files.txt
+          cat "${GITHUB_WORKSPACE}/bundle-files.txt"
 
       - name: Upload the release bundle
         uses: actions/upload-artifact@v4
@@ -587,7 +593,26 @@ jobs:
       - name: Download the release bundle
         uses: actions/download-artifact@v4
         with:
-          name: ${{ needs.build.outputs.artifact_name }}
+          # Deliberately NOT `name: ${{ needs.build.outputs.artifact_name }}`.
+          #
+          # That job output is never delivered. The artifact is named
+          # `satelite-one-<version>-<kind>-run<N>`, the INTERSTELLAR_KEY_ALIAS secret IS
+          # the string `satelite-one`, and Actions refuses to propagate any job output
+          # that contains a secret value:
+          #
+          #   ##[warning]Skip output 'artifact_name' since it may contain secret.
+          #
+          # An empty `name` makes this action download *every* artifact and nest each one
+          # in a directory named after it, which the bundle verifier correctly rejects:
+          #
+          #   bundle must be flat; found subdirectories: ['satelite-one-...-run14']
+          #
+          # Selecting by pattern keeps the choice in this job instead of in a value that
+          # secret masking can silently empty, and `merge-multiple` flattens it into the
+          # one directory everything downstream reads. The pattern is pinned to this run's
+          # number, so a stale artifact from another run cannot be picked up.
+          pattern: satelite-one-*-run${{ github.run_number }}
+          merge-multiple: true
           path: release-bundle
 
       # 发布前的最后一道工具化检查: 这一步失败就没有 Release。
@@ -625,8 +650,17 @@ jobs:
             echo "::error::expected exactly 2 per-ABI APKs in the verified set, got ${#APKS[@]}"
             exit 1
           fi
-          bash .github/scripts/measure_apk_signature.sh signed "${APKS[@]}"
-          echo "all ${#APKS[@]} APKs verify as signed with a non-debug certificate"
+          # The verified list holds BARE names (see the verifier's --list-to), and this
+          # step runs from the workspace root, so every name has to be resolved INSIDE the
+          # bundle before it is handed to the measurement. Passing the bare names made the
+          # script report "does not exist" and exit 1 - refusing to measure a bundle that
+          # had just passed every check, purely on where the step happened to stand.
+          APK_PATHS=()
+          for name in "${APKS[@]}"; do
+            APK_PATHS+=("release-bundle/${name}")
+          done
+          bash .github/scripts/measure_apk_signature.sh signed "${APK_PATHS[@]}"
+          echo "all ${#APK_PATHS[@]} APKs verify as signed with a non-debug certificate"
 
       # 更新摘要 = "版本提交"(范围内最后改 version.properties 的那个)的完整
       # message(标题+正文), 再附自上一 tag 以来的其余提交。按 version.properties
@@ -722,8 +756,13 @@ jobs:
           # 谁也不会发现。现在两处都收口: verifier 拒绝任何它不认识的文件 (拟上传集合
           # 因此完整), 这里则一个字都不重新枚举 (被校验集合因此就是被上传集合)。
           #
-          # working-directory 让清单里的裸文件名解析到 release-bundle/ 内的那一份字节。
+          # `working_directory` 让清单里的裸文件名解析到 release-bundle/ 内的那一份字节。
+          #
+          # 名字是**下划线**的, 这是这个 action 自己声明的输入名 (action.yml 里只有
+          # working_directory)。之前写成 working-directory 是一个**未被声明的输入**:
+          # Actions 只会告警并把它丢掉, 于是 files 里的裸文件名被拿去工作区根目录解析,
+          # 一个都匹配不上, 而 fail_on_unmatched_files: true 会因此把发布判成失败。
           files: ${{ steps.verified.outputs.files }}
-          working-directory: release-bundle
+          working_directory: release-bundle
           body_path: release_notes.md
           fail_on_unmatched_files: true

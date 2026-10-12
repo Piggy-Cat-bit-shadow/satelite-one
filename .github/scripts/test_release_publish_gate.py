@@ -133,8 +133,14 @@ def test_publish_job_verifies_and_uploads_one_bundle():
         re.search(r"files: \$\{\{\s*steps\.verified\.outputs\.files\s*\}\}", publish) is not None,
         "the release does not upload the verified step's file list",
     )
+    # The input name is action-gh-release's own, and it is spelled with an UNDERSCORE:
+    # `working_directory`, the only such key in that action's action.yml. The hyphenated
+    # spelling this assertion used to demand is not a declared input at all - Actions drops
+    # it with a warning, `files` is then resolved against the workspace root, and
+    # `fail_on_unmatched_files: true` fails the release. Asserting the exact spelling IS
+    # the property: nothing is resolved inside the bundle unless the action receives it.
     check(
-        "working-directory: release-bundle" in publish,
+        "working_directory: release-bundle" in publish,
         "the release does not resolve the verified list inside the bundle directory; the "
         "bare names in that list would then be looked up against the wrong copy of the bytes",
     )
