@@ -67,6 +67,21 @@ class ScreenSeedWiringTest {
         }
     }
 
+    /**
+     * Wait until at least [count] facts have been delivered.
+     *
+     * Needed because `events.clear()` is only a safe baseline once nothing is still in flight.
+     */
+    private fun awaitAtLeast(sink: Sink, count: Int) {
+        val deadline = System.currentTimeMillis() + 5_000
+        while (sink.events.size < count && System.currentTimeMillis() < deadline) {
+            Thread.sleep(2)
+        }
+        check(sink.events.size >= count) {
+            "expected at least $count facts, got ${sink.events}"
+        }
+    }
+
     // ------------------------------------------------- S02: the read/seed order itself
 
     @Test
@@ -209,7 +224,14 @@ class ScreenSeedWiringTest {
         PlatformFacts.onScreenChanged(true)
         val sink = Sink()
         val session = PlatformFacts.attach(sink)
-        awaitScreenFact(sink, true)
+        // `attach` enqueues TWO facts - the screen reading and the foreground state - and drains
+        // them asynchronously. Waiting for only the screen one left the foreground fact in
+        // flight, so it could land after the clear below and sit in the list *in front of* the
+        // event under test; the assertion then saw two entries where it expected one, and failed
+        // on whichever runner lost that race. It passed on the dev CI and failed on the release
+        // runner, blocking the v0.1.1 publish. Waiting for the whole drain before clearing is
+        // what PlatformFactsTest already does.
+        awaitAtLeast(sink, 2)
         sink.events.clear()
 
         PlatformFacts.onScreenChanged(true)     // same value, new observation
