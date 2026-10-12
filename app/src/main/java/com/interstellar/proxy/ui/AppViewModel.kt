@@ -290,6 +290,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _testTags = MutableStateFlow<List<String>>(emptyList())
     val testTags: StateFlow<List<String>> = _testTags
 
+    /**
+     * This run's outcomes: tag → delay, for the nodes that actually reported during it.
+     *
+     * Deliberately NOT the `delays` map. `delays` accumulates across runs, so after a run where
+     * every node timed out it still holds the previous run's successes - and the summary then
+     * reported "5 nodes · 5 ok · 0 failed" for a run in which nothing succeeded. A node missing
+     * from here did not succeed in this run, which is what makes failure and timeout countable.
+     */
+    private val _testResult = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val testResult: StateFlow<Map<String, Int>> = _testResult
+
     /** Epoch seconds when the current url-test run started (0 = idle). */
     @Volatile private var testStartEpoch = 0L
 
@@ -524,6 +535,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }
                     val done = eligible.count { tag -> (testRunStamps[tag] ?: 0L) >= testStartEpoch }
+                    // Publish this run's outcomes as they land: a tag absent from here did not
+                    // report in THIS run, so the summary counts it as a failure instead of
+                    // reusing a delay from an earlier run.
+                    _testResult.value = eligible
+                        .filter { tag -> (testRunStamps[tag] ?: 0L) >= testStartEpoch }
+                        .associateWith { tag -> map[tag] ?: 0 }
                     if (done >= eligible.size) {
                         testStartEpoch = 0
                         if (kernelTestManual) {
@@ -1080,6 +1097,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         testRunReported.clear()
         testRunTags = eligible.toSet()
         _testTags.value = eligible
+        _testResult.value = emptyMap()
         testRunStartedAtMs = System.currentTimeMillis()
         com.interstellar.proxy.core.AppLog.log(
             "test",

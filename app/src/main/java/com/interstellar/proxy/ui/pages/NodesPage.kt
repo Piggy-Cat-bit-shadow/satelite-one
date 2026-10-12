@@ -156,12 +156,16 @@ fun NodesPage(viewModel: AppViewModel) {
     // `tagsFor(storedNodes)`, the pool the APP's generated config runs on, so a raw config (no
     // share links, empty pool) reported "0 nodes · 0 ok · 0 failed" beside five real latencies.
     val testedTags by viewModel.testTags.collectAsState()
+    // This run's outcomes only - not `delays`, which accumulates across runs and would report a
+    // previous run's successes for a run in which every node timed out.
+    val testResult by viewModel.testResult.collectAsState()
     LaunchedEffect(testRunning) {
         if (testRunning) {
             testSummary = null // a new run clears the old summary
         } else if (prevRunning) {
-            // just finished — snapshot stats over the tags this run covered
-            testSummary = computeNodesTestSummary(testedTags, delays, genericFailNote)
+            // just finished — snapshot stats over the tags this run covered, using this run's own
+            // outcomes so a timeout counts as a failure rather than as a stale success
+            testSummary = computeNodesTestSummary(testedTags, testResult, genericFailNote)
         }
         prevRunning = testRunning
     }
