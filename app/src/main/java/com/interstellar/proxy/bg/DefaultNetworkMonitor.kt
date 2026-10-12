@@ -112,13 +112,64 @@ object DefaultNetworkMonitor {
     /**
      * A core registered its default-interface listener.
      *
-     * `PlatformInterfaceWrapper.startDefaultInterfaceMonitor`. Registers only this
-     * listener and immediately tells it the interface we already know about, so a core
-     * that starts while the network is up does not have to wait for the next change.
+     * `PlatformInterfaceWrapper.startDefaultInterfaceMonitor`. Registers this listener and
+     * immediately tells it the interface we already know about, so a core that starts
+     * while the network is up does not have to wait for the next change.
+     *
+     * ## This report must happen before this call returns
+     *
+     * "Immediately" is load-bearing, and it is why this does not go through
+     * [checkDefaultInterfaceUpdate] when an answer is already available.
+     *
+     * The core starts its interface monitor in the Initialize stage of its own start -
+     * `NetworkManager.Start` calls `r.interfaceMonitor.Start()`, which is this function -
+     * and initialises rule-sets one stage later, in the Start stage (`Router.Start`). A
+     * rule-set with a remote URL DIALS during that initialisation whenever it has nothing
+     * cached: a first start after install, or after the cache is cleared.
+     *
+     * The core treats the first network-environment observation it ever sees as a
+     * transition - it claims an epoch and runs the reset body - and that transition
+     * cancels every dial already in flight, as "network changed while dialling". Reporting
+     * from a coroutine let that observation land in the middle of the rule-set
+     * initialisation, so a start cancelled its own resource fetch:
+     *
+     *     start router: initialize rule-set[N]: initial rule-set: <tag>:
+     *       network changed while dialling
+     *
+     * which fails `Router.Start`, fails the box start, and stops the service. Retrying
+     * could not help: nothing had been cached, so every attempt re-fetched and re-raced.
+     *
+     * Reporting here - still inside Initialize, before the router can dial - settles the
+     * environment first. Every later announcement repeats the same fingerprint, which the
+     * core's `recomputeNetworkEnvironment` reports as "not changed" and ignores.
      */
     fun addListener(listener: InterfaceUpdateListener) {
         listeners.add(listener)
+        if (deliverKnownInterfaceNow(listener)) return
         checkDefaultInterfaceUpdate(defaultNetwork)
+    }
+
+    /**
+     * Tell [listener] which interface the tracked network is on, without leaving this call.
+     *
+     * One attempt, no retries: this runs on the core's start thread (the start path is an
+     * IO dispatcher, never the main looper), while the retry loop in
+     * [checkDefaultInterfaceUpdate] is allowed to spend ~1 s. When the interface cannot be
+     * resolved yet there is nothing to settle, and the asynchronous path takes over
+     * exactly as before.
+     *
+     * @return true when the listener was told; false when there is no answer yet and the
+     *   caller must fall back to the asynchronous path.
+     */
+    private fun deliverKnownInterfaceNow(listener: InterfaceUpdateListener): Boolean {
+        val network = defaultNetwork ?: return false
+        val resolved = resolveInterface(network) ?: return false
+        // Claimed like every other event that publishes an answer, so a resolve still in
+        // flight for an older observation cannot overwrite this one afterwards.
+        val token = resolution.beginAttempt()
+        if (!resolution.isWinner(token)) return false
+        listener.updateDefaultInterface(resolved.name, resolved.index, false, false)
+        return true
     }
 
     /**
