@@ -217,32 +217,19 @@ jobs:
           SING_BOX_BUILD_VERSION="${CORE_SHA}" \
           SING_BOX_BUILD_COMMIT="${CORE_SHA}" \
             go run ./cmd/internal/build_libbox -target android
-          # build_libbox runs gomobile in an isolated work directory and names its output
-          # by ABSOLUTE path inside it, so the AAR is never left in the module root:
+          # build_libbox names its output by ABSOLUTE path inside an isolated gomobile
+          # work directory (`<root>/_libbox_build/libbox.aar`), not in the module root this
+          # step `cd`-ed into, and it copies the artifact out only when a sibling
+          # sing-box-for-android checkout exists - which is never the case here. A bare
+          # `cp libbox.aar` therefore failed with "No such file or directory" *after* a
+          # build that had in fact succeeded: libbox.provenance IS written to the module
+          # root, which is what made the step look like it had produced nothing at all.
           #
-          #   outputPath := filepath.Join(gomobileWorkDir(rootDir), config.OutputName)
-          #   gomobileWorkDir(root) := filepath.Join(root, "_libbox_build")
-          #
-          # The builder copies the artifact out only when a sibling sing-box-for-android
-          # checkout happens to exist, which is not the case here. So the bare
-          # `cp libbox.aar` failed with "No such file or directory" *after* a build that
-          # had in fact succeeded: libbox.provenance IS written into the module root,
-          # which is what made the step look like it had produced nothing at all.
-          #
-          # Resolve the AAR from where the builder actually writes it, and fail loudly if
-          # it is absent -- rather than publishing whatever a bare `cp` happens to find.
-          AAR=""
-          for candidate in "_libbox_build/libbox.aar" "libbox.aar"; do
-            if [ -f "$candidate" ]; then
-              AAR="$candidate"
-              break
-            fi
-          done
-          if [ -z "$AAR" ]; then
-            echo "::error::build_libbox produced no libbox.aar (looked in _libbox_build/ and the module root)"
-            exit 1
-          fi
-          echo "libbox.aar resolved at ${AAR}"
+          # The location rule lives in one script that android-ci.yml calls too, so the
+          # release path and the dev path cannot drift apart the way they did. Its
+          # rejection cases (no AAR at all, two different candidates) are exercised by
+          # test_resolve_libbox_aar.py rather than being comments.
+          AAR="$(bash "${GITHUB_WORKSPACE}/.github/scripts/resolve_libbox_aar.sh" "$PWD")"
           cp "$AAR" "${GITHUB_WORKSPACE}/app/libs/libbox.aar"
           cp libbox.provenance "${GITHUB_WORKSPACE}/app/libs/libbox.provenance"
 
@@ -268,6 +255,12 @@ jobs:
       # 这三件事必须在这里被证明 —— 否则它们只会在真要发版的那一次才第一次执行。
       - name: Release publish gate checks
         run: python3 .github/scripts/test_release_publish_gate.py
+
+      # Both workflows now share one AAR-location rule, and its rejection cases (no AAR
+      # anywhere, two different candidates) can never be reached on a healthy checkout -
+      # so they are exercised here instead of being promises in a comment.
+      - name: libbox.aar resolver checks
+        run: python3 .github/scripts/test_resolve_libbox_aar.py
 
       # The core's own provenance record is the single source of truth; it also
       # has to survive a cache hit, where no checkout exists.

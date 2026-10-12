@@ -157,7 +157,13 @@ jobs:
           SING_BOX_BUILD_VERSION="${CORE_SHA}" \
           SING_BOX_BUILD_COMMIT="${CORE_SHA}" \
             go run ./cmd/internal/build_libbox -target android
-          cp libbox.aar "${GITHUB_WORKSPACE}/app/libs/libbox.aar"
+          # build_libbox names its output by ABSOLUTE path inside an isolated gomobile
+          # work directory, so the AAR is not in the module root this step `cd`-ed into.
+          # A bare `cp libbox.aar` here was the same defect the release workflow already
+          # had to fix; the rule now lives in one script both workflows call, so the dev
+          # path and the release path cannot drift apart again.
+          AAR="$(bash "${GITHUB_WORKSPACE}/.github/scripts/resolve_libbox_aar.sh" "$PWD")"
+          cp "$AAR" "${GITHUB_WORKSPACE}/app/libs/libbox.aar"
           cp libbox.provenance "${GITHUB_WORKSPACE}/app/libs/libbox.provenance"
           ls -la "${GITHUB_WORKSPACE}/app/libs/"
 
@@ -174,6 +180,11 @@ jobs:
       # signed-by-user 的判定表是否 fail-closed。
       - name: Release publish gate checks
         run: python3 .github/scripts/test_release_publish_gate.py
+
+      # The AAR-location rule this job depends on is shared with release-apk.yml, and its
+      # rejection cases cannot be reached on a healthy checkout; they are exercised here.
+      - name: libbox.aar resolver checks
+        run: python3 .github/scripts/test_resolve_libbox_aar.py
 
       # What this proves: the AAR matches the revision THIS RUN resolved from
       # CORE_BRANCH=testing. It is deliberately NOT evidence about the revision pinned in
