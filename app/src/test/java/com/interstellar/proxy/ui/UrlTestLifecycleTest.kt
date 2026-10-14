@@ -27,12 +27,37 @@ class UrlTestLifecycleTest {
     private val viewModelSource =
         File("src/main/java/com/interstellar/proxy/ui/AppViewModel.kt").readText()
 
+    /**
+     * Source with comments removed.
+     *
+     * The whole-file assertions below look for the names of things that were deliberately
+     * removed, and the code explains those removals in comments - which mention the very names
+     * being asserted absent. Checking prose as if it were code made the guard fail on its own
+     * documentation.
+     */
+    private val viewModelCode = viewModelSource.lines()
+        .filterNot { it.trimStart().startsWith("//") || it.trimStart().startsWith("*") }
+        .joinToString("\n")
+
+    /**
+     * The body of a declaration, brace-matched or not.
+     *
+     * Some of these are expression-bodied (`= eligibleUrlTestTags(target)...`), which have no
+     * braces of their own. Searching for the next `{` then ran on into the FOLLOWING function and
+     * judged unrelated code - so the expression form is taken up to the blank line that ends it.
+     */
     private fun bodyOf(signature: String): String {
         val start = viewModelSource.indexOf(signature)
         check(start >= 0) { "not found in AppViewModel.kt: $signature" }
+        val brace = viewModelSource.indexOf('{', start)
+        val equals = viewModelSource.indexOf('=', start)
+        if (equals in 0 until brace) {
+            val end = viewModelSource.indexOf("\n\n", equals)
+            return viewModelSource.substring(start, if (end > 0) end else viewModelSource.length)
+        }
         var depth = 0
-        var i = viewModelSource.indexOf('{', start)
-        val from = i
+        var i = brace
+        val from = brace
         while (i < viewModelSource.length) {
             when (viewModelSource[i]) {
                 '{' -> depth++
@@ -76,13 +101,14 @@ class UrlTestLifecycleTest {
     @Test
     fun `no client-side completion inference survives anywhere`() {
         // The specific shapes that used to decide a run was over on the client's terms.
-        check(!viewModelSource.contains("PER_NODE_TEST_TIMEOUT_MS")) {
+        // Comments are excluded: the code explains these removals by name.
+        check(!viewModelCode.contains("PER_NODE_TEST_TIMEOUT_MS")) {
             "the client-side per-node timeout constant is back"
         }
-        check(!viewModelSource.contains("awaitUrlTestSettled(")) {
+        check(!viewModelCode.contains("awaitUrlTestSettled")) {
             "the settle poll is back; the RPC already returned, so it can only add latency"
         }
-        check(!viewModelSource.contains("kernelTestManual")) {
+        check(!viewModelCode.contains("kernelTestManual")) {
             "the manual/smart flag that gated completion is back; the `manual` parameter " +
                 "belongs to the call, not to shared mutable state read from the stream"
         }
