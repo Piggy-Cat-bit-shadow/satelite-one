@@ -164,19 +164,19 @@ fun NodesPage(viewModel: AppViewModel) {
     // as soon as the kernel has SCHEDULED its round - long before any delay arrives - so a
     // lifecycle-triggered summary would snapshot an empty result set every time. Deriving it
     // keeps the same information, refreshes as results land, and gates nothing.
-    // The summary is derived from the run's own results, not from the test lifecycle.
+    // Held to the run's own results, never to the run's lifecycle.
     //
     // It used to be computed when `testing` flipped back to false. That worked only while the
-    // client decided for itself when a run was over. Now the RPC is the lifecycle and it returns
-    // as soon as the kernel has SCHEDULED its round - long before any delay arrives - so a
-    // lifecycle-triggered summary would snapshot an empty result set every time. Deriving it
-    // keeps the same information, refreshes as results land, and gates nothing.
+    // client decided for itself when a run was over; now the RPC returns as soon as the kernel
+    // has SCHEDULED its round, long before any delay arrives, so a lifecycle-triggered summary
+    // would snapshot an empty result set every time.
     //
-    // Held back while the progress window is open, because until every node has reported the
-    // unreported ones are indistinguishable from failures and the banner would read
-    // "0 ok / 5 failed" for a run that is simply not finished. Numbers first, verdict after.
+    // It is NOT held back until every node reports either - that condition is unreachable. A node
+    // that fails produces no stamp at all (sing-box records display history only for successes),
+    // so "wait for N/N" is the same trap as the old completion gate, one layer up. The verdict is
+    // therefore always shown for the run, and it firms up as results land.
     val testSummary: NodesTestSummary? =
-        if (testProg != null || testedTags.isEmpty()) null
+        if (testedTags.isEmpty()) null
         else computeNodesTestSummary(testedTags, testResult, genericFailNote)
     val testRunning = testing
 
@@ -581,7 +581,16 @@ private fun TestSummaryBar(
                 color = colors.primary,
                 trackColor = colors.primaryMuted,
             )
-        } else if (summary != null) {
+        }
+        // NOT `else if`, and deliberately not gated on `running` either.
+        //
+        // The two rows answer different questions and neither can wait for the other: the
+        // progress row closes when every node has reported (which a failing node never does -
+        // sing-box records no stamp for a failure), while the verdict is already known and merely
+        // firms up as more results land. Chaining them, or gating the verdict on the progress
+        // window, meant a run containing any failed node showed no verdict at all - the same
+        // unreachable-condition mistake as the old completion gate, one layer up.
+        if (summary != null) {
             val summaryModeLabel = stringResource(R.string.nodes_url_test)
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
