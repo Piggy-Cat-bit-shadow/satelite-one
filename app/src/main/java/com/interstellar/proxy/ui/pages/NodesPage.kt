@@ -146,9 +146,6 @@ fun NodesPage(viewModel: AppViewModel) {
 
     // ── 底部测速进度条与完成摘要 ──
     val testProg by viewModel.testProgress.collectAsState()
-    var testSummary by remember { mutableStateOf<NodesTestSummary?>(null) }
-    var prevRunning by remember { mutableStateOf(false) }
-    val testRunning = testing
     // resolved in composition: computeNodesTestSummary runs outside composable scope
     val genericFailNote = stringResource(R.string.nodes_test_fail_generic)
     // The tags the run actually covers. Taken from the ViewModel - which is the side that
@@ -159,16 +156,29 @@ fun NodesPage(viewModel: AppViewModel) {
     // This run's outcomes only - not `delays`, which accumulates across runs and would report a
     // previous run's successes for a run in which every node timed out.
     val testResult by viewModel.testResult.collectAsState()
-    LaunchedEffect(testRunning) {
-        if (testRunning) {
-            testSummary = null // a new run clears the old summary
-        } else if (prevRunning) {
-            // just finished — snapshot stats over the tags this run covered, using this run's own
-            // outcomes so a timeout counts as a failure rather than as a stale success
-            testSummary = computeNodesTestSummary(testedTags, testResult, genericFailNote)
-        }
-        prevRunning = testRunning
-    }
+
+    // The summary is derived from the run's own results, not from the test lifecycle.
+    //
+    // It used to be computed when `testing` flipped back to false. That worked only while the
+    // client decided for itself when a run was over. Now the RPC is the lifecycle and it returns
+    // as soon as the kernel has SCHEDULED its round - long before any delay arrives - so a
+    // lifecycle-triggered summary would snapshot an empty result set every time. Deriving it
+    // keeps the same information, refreshes as results land, and gates nothing.
+    // The summary is derived from the run's own results, not from the test lifecycle.
+    //
+    // It used to be computed when `testing` flipped back to false. That worked only while the
+    // client decided for itself when a run was over. Now the RPC is the lifecycle and it returns
+    // as soon as the kernel has SCHEDULED its round - long before any delay arrives - so a
+    // lifecycle-triggered summary would snapshot an empty result set every time. Deriving it
+    // keeps the same information, refreshes as results land, and gates nothing.
+    //
+    // Held back while the progress window is open, because until every node has reported the
+    // unreported ones are indistinguishable from failures and the banner would read
+    // "0 ok / 5 failed" for a run that is simply not finished. Numbers first, verdict after.
+    val testSummary: NodesTestSummary? =
+        if (testProg != null || testedTags.isEmpty()) null
+        else computeNodesTestSummary(testedTags, testResult, genericFailNote)
+    val testRunning = testing
 
     Column(
         modifier = Modifier
@@ -396,12 +406,18 @@ fun NodesPage(viewModel: AppViewModel) {
         }
 
         // ── 进度条/统计摘要: 悬于节点卡片上方 ──
-        if (testRunning || testSummary != null) {
+        //
+        // The bar tracks the DISPLAY window, not the RPC: `testProg != null` lasts until every
+        // node of the target has reported, while the RPC itself is over almost immediately (the
+        // core schedules its round and returns). `testRunning` is still included so that a run
+        // whose target size is unknown - progress null by design - shows 测速中… rather than
+        // nothing at all.
+        if (testRunning || testProg != null || testSummary != null) {
             TestSummaryBar(
-                running = testRunning,
+                running = testRunning || testProg != null,
                 progress = testProg,
                 summary = testSummary,
-                onDismiss = { testSummary = null },
+                onDismiss = { viewModel.dismissTestSummary() },
                 modifier = Modifier.padding(bottom = 8.dp),
             )
         }

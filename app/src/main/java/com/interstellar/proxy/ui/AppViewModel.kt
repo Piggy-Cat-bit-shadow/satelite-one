@@ -272,11 +272,31 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _delays = MutableStateFlow<Map<String, Int>>(emptyMap())
     val delays: StateFlow<Map<String, Int>> = _delays
 
-    /** True while a group url-test is in flight (for UI spinners). */
+    /**
+     * True while a manual url-test RPC is in flight - nothing more.
+     *
+     * Mirrors the official client, whose `GroupsViewModel.urlTestGroup` adds the tag to
+     * `testingGroups`, awaits the CommandClient call, and removes it in `finally`. No polling, no
+     * timestamp gate, no settle wait: the call IS the lifecycle.
+     *
+     * In the pinned core `StartedService.URLTest` schedules its round with `go ...` and returns
+     * immediately, so this window is short by design. The delays keep arriving afterwards on the
+     * outbounds stream, and those are what the user actually reads off the page.
+     */
     private val _testing = MutableStateFlow(false)
     val testing: StateFlow<Boolean> = _testing
 
-    /** Batch test progress (done, total); null while idle. */
+    /**
+     * Batch progress (done, total) - DISPLAY ONLY.
+     *
+     * It must not decide whether a run is over: not `_testing`, not the mutex, not the epoch.
+     * Its lifetime is a display concern (it ends once the run's results have all arrived, or when
+     * the user dismisses the banner). That is the "downgrade done >= total from a lifecycle
+     * condition to pure UI information" this refactor exists for.
+     *
+     * Null means "show no numbers": when the target's size cannot be established the page says
+     * 测速中… rather than inventing a denominator, because a wrong 47/52 is worse than no count.
+     */
     private val _testProgress = MutableStateFlow<Pair<Int, Int>?>(null)
     val testProgress: StateFlow<Pair<Int, Int>?> = _testProgress
 
@@ -301,7 +321,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _testResult = MutableStateFlow<Map<String, Int>>(emptyMap())
     val testResult: StateFlow<Map<String, Int>> = _testResult
 
-    /** Epoch seconds when the current url-test run started (0 = idle). */
+    /**
+     * Epoch seconds when the current run started (0 = no run to attribute stamps to).
+     *
+     * A DISPLAY FILTER only: it decides which streamed delays belong to this run, so the progress
+     * numbers and the summary describe this run rather than the accumulated `delays` cache.
+     *
+     * It deliberately no longer gates anything. It used to be polled by `awaitUrlTestSettled`
+     * ("while testStartEpoch > 0") to decide the client was finished, which is the client-side
+     * lifecycle this refactor removes - the core had long since returned.
+     */
     @Volatile private var testStartEpoch = 0L
 
     /**
@@ -332,14 +361,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     /** Nodes whose end time has already been logged, so each is reported exactly once. */
     private val testRunReported = java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
-    /** Serializes kernel url-test runs. */
+    /**
+     * Serializes kernel url-test requests, and does nothing else.
+     *
+     * Its only job is to stop a manual test and a smart-mode test from overlapping. It must not
+     * carry a completion judgement, a progress judgement, a timestamp lifetime or a timeout
+     * lifetime - a lock that also encodes "the test is over" is how one run's stream could settle
+     * another run's wait.
+     */
     private val kernelUrlTestMutex = kotlinx.coroutines.sync.Mutex()
-
-    /** True while the in-flight kernel url-test run belongs to the manual button. */
-    @Volatile private var kernelTestManual = false
-
-    /** sing-box's per-node url-test HTTP timeout (constant.TCPTimeout, hardcoded in the kernel). */
-    private val PER_NODE_TEST_TIMEOUT_MS = 15_000L
 
     private val _subscriptions =
         MutableStateFlow(SubscriptionRepository.subscriptions.toList())
@@ -518,10 +548,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
                 _delays.value = map
-                // url-test progress and completion, both measured over the SAME set the run
-                // submitted. Nothing here reads outbounds.size: that snapshot also carries
-                // `direct`, `block`, selectors and nodes no run ever submits, none of which can
-                // report a stamp - which is exactly how the bar used to stall short of N/N.
+                // Progress and summary are measured over the SAME set the run submitted. Nothing
+                // here reads outbounds.size: that snapshot also carries `direct`, `block`,
+                // selectors and nodes no run ever submits, none of which can report a stamp.
+                //
+                // Nothing here touches `_testing` either. This stream cannot know whether the RPC
+                // is still in flight, and it used to end the run on `done >= total` - a condition
+                // it could only satisfy by accident, because a node that is never submitted never
+                // reports. `done >= total` is now display-only: it closes the PROGRESS DISPLAY,
+                // and the lifecycle belongs to the RPC alone.
                 val eligible = testRunTags
                 if (testStartEpoch > 0 && eligible.isNotEmpty()) {
                     val startedAt = testRunStartedAtMs
@@ -534,31 +569,26 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             )
                         }
                     }
-                    val done = eligible.count { tag -> (testRunStamps[tag] ?: 0L) >= testStartEpoch }
+                    val reported = eligible.filter { tag -> (testRunStamps[tag] ?: 0L) >= testStartEpoch }
                     // Publish this run's outcomes as they land: a tag absent from here did not
                     // report in THIS run, so the summary counts it as a failure instead of
                     // reusing a delay from an earlier run.
-                    _testResult.value = eligible
-                        .filter { tag -> (testRunStamps[tag] ?: 0L) >= testStartEpoch }
-                        .associateWith { tag -> map[tag] ?: 0 }
-                    if (done >= eligible.size) {
-                        testStartEpoch = 0
-                        if (kernelTestManual) {
-                            val total = if (startedAt > 0) System.currentTimeMillis() - startedAt else 0
-                            com.interstellar.proxy.core.AppLog.log(
-                                "test",
-                                "batch done: $done/${eligible.size} in ${total}ms",
-                            )
-                            _testProgress.value = null
-                            _testing.value = false
-                        }
-                    } else if (kernelTestManual) {
-                        _testProgress.value = done to eligible.size
+                    _testResult.value = reported.associateWith { tag -> map[tag] ?: 0 }
+                    if (reported.size >= eligible.size) {
+                        // Display complete. The RPC may be long done - the core schedules its round
+                        // and returns at once - so this only closes the progress window.
+                        val elapsed = if (startedAt > 0) System.currentTimeMillis() - startedAt else 0
+                        com.interstellar.proxy.core.AppLog.log(
+                            "test",
+                            "batch results complete: ${reported.size}/${eligible.size} in ${elapsed}ms",
+                        )
+                        _testProgress.value = null
+                    } else {
+                        _testProgress.value = reported.size to eligible.size
                     }
                 }
-                // NB: snapshots can arrive at any moment (delayed pushes) and
-                // must never kill an in-flight run — the settle branch above
-                // and the callers' finally own the testing state.
+                // NB: snapshots can arrive at any moment (delayed pushes) and must never kill an
+                // in-flight run - the RPC's own finally owns the testing state.
             }
 
         },
@@ -780,7 +810,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (!autoTested) {
             autoTested = true
             viewModelScope.launch(Dispatchers.IO) {
-                runCatching { CommandTarget.standaloneClient().urlTest(MinimalConfigBuilder.AUTO_TAG) }
+                // Smart-mode auto-test. It goes through runKernelUrlTest so it shares the mutex
+                // with a manual run (the two must not overlap), and it passes manual = false so
+                // it cannot open the manual spinner or clear the manual run's progress. It used
+                // to call the client directly here, which meant a smart test could interleave
+                // with a manual one.
+                runKernelUrlTest(target = MinimalConfigBuilder.AUTO_TAG, manual = false)
             }
         }
     }
@@ -1047,29 +1082,34 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private fun urlTestTarget(groupTag: String): String =
         resolveUrlTestTarget(groupTag, _groups.value)
 
+    /**
+     * Manual URL Test. The RPC call is the whole lifecycle.
+     *
+     * Same shape as the official client's `urlTestGroup`: mark testing, call, clear in finally.
+     * The target is resolved ONCE here and then used for the RPC, the progress denominator and
+     * the summary, so the three can no longer describe different groups.
+     */
     fun urlTest(groupTag: String) {
-        if (_testing.value) return
         val target = urlTestTarget(groupTag)
-        // The run's node set is established HERE, once, and everything downstream - the progress
-        // denominator, the completion condition and the per-node logging - reads it back.
-        beginTestRun(target)
-        _testing.value = true
-        _testProgress.value = 0 to testRunTags.size
         viewModelScope.launch(Dispatchers.IO) {
-            try {
-                if (_status.value == Status.Started) {
-                    runKernelUrlTest(manual = true, target = target)?.let { failure ->
-                        _message.value = str(com.interstellar.proxy.R.string.vm_test_failed, failure)
-                    }
-                } else {
-                    runDisconnectedUrlTest(target)
+            if (_status.value == Status.Started) {
+                runKernelUrlTest(target = target, manual = true)?.let { failure ->
+                    _message.value = str(com.interstellar.proxy.R.string.vm_test_failed, failure)
                 }
-            } catch (e: Exception) {
-                _message.value = str(com.interstellar.proxy.R.string.vm_test_failed, e.message ?: "")
-            } finally {
-                _testing.value = false
-                _testProgress.value = null
-                testStartEpoch = 0
+            } else {
+                // The headless probe path owns its own core, so it keeps its own error handling;
+                // it reaches the kernel through the same single call.
+                beginTestRun(target)
+                _testing.value = true
+                _testProgress.value = initialProgress(target)
+                try {
+                    runDisconnectedUrlTest(target)
+                } catch (e: Exception) {
+                    _message.value = str(com.interstellar.proxy.R.string.vm_test_failed, e.message ?: "")
+                } finally {
+                    _testing.value = false
+                    _testProgress.value = null
+                }
             }
         }
     }
@@ -1086,10 +1126,39 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         )
 
     /**
-     * Start a run's bookkeeping for [target]. The only place a run's node set is established.
+     * The denominator for [target], or null when it cannot be established.
      *
-     * The per-node timeline is logged as it happens, so a run's real shape (which node returned
-     * when, and how long the whole batch took) is readable afterwards rather than inferred.
+     * Null rather than a guess: a wrong "47 / 52" is worse than no count, and the page says
+     * 测速中… instead. This is also the reason there is no `_delays.size` fallback any more - a
+     * historical delay cache is not this run's member set, so using it made the total describe
+     * nodes that were never submitted.
+     */
+    private fun urlTestTotal(target: String): Int? =
+        eligibleUrlTestTags(target).size.takeIf { it > 0 }
+
+    /** Progress to publish when a manual run starts; null = show 测速中… without numbers. */
+    private fun initialProgress(target: String): Pair<Int, Int>? = urlTestTotal(target)?.let { 0 to it }
+
+    /**
+     * Drop the finished run's result banner.
+     *
+     * Pure display state: clearing it cannot affect any run, and the next run repopulates both
+     * streams from scratch in [beginTestRun].
+     */
+    fun dismissTestSummary() {
+        _testTags.value = emptyList()
+        _testResult.value = emptyMap()
+        _testProgress.value = null
+    }
+
+    /**
+     * Start a run's display bookkeeping for [target]. The only place a run's node set, its epoch
+     * and its per-node timeline are established.
+     *
+     * Note what this is NOT: it does not mark the client as testing, it does not schedule any
+     * timeout, and nothing polls it to decide the run is over. It exists so the progress numbers
+     * and the summary describe the run that was just requested, using the target that was
+     * actually submitted.
      */
     private fun beginTestRun(target: String) {
         val eligible = eligibleUrlTestTags(target)
@@ -1099,6 +1168,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _testTags.value = eligible
         _testResult.value = emptyMap()
         testRunStartedAtMs = System.currentTimeMillis()
+        // Stamps at or after this belong to this run. Display filter only - see testStartEpoch.
+        testStartEpoch = System.currentTimeMillis() / 1000
         com.interstellar.proxy.core.AppLog.log(
             "test",
             "batch start: ${eligible.size} node(s) in group '$target': ${eligible.joinToString()}",
@@ -1106,54 +1177,47 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Wait for the kernel url-test to finish. Nodes test concurrently, each
-     * with sing-box's own per-node HTTP timeout (constant.TCPTimeout = 15s,
-     * not configurable), so the run is bounded by that plus scheduling
-     * margin — wait for the stream's done>=total clear, capped at 15s+10s.
-     * No independent overall-stall heuristic.
+     * One kernel url-test run: mark, call, clear. Nothing else.
+     *
+     * The official client's whole implementation is
+     * `testingGroups + tag` -> `CommandClient.urlTest(tag)` -> `finally { testingGroups - tag }`,
+     * and this is that shape. Everything the previous version added around the call -
+     * an epoch to attribute stamps to, a `done >= total` gate that could never be satisfied, and
+     * a 15 s + 10 s settle poll after the RPC had already returned - was the client trying to
+     * decide whether the kernel had finished. It cannot know, and it does not need to: the call
+     * returning is the end of the client's involvement, and the delays arrive on the outbounds
+     * stream afterwards.
+     *
+     * The mutex is kept, and is only a serialization of manual against smart-mode runs. It no
+     * longer carries any completion meaning.
+     *
+     * A non-null result is the failure to report. The cause is kept rather than collapsed into a
+     * Boolean: a libbox failure reads "url test: get command client: <cause>", which names the
+     * boundary that actually failed - no command socket, core gone, dial rejected.
      */
-    private suspend fun awaitUrlTestSettled(capMs: Long = PER_NODE_TEST_TIMEOUT_MS + 10_000) {
-        val deadline = System.currentTimeMillis() + capMs
-        while (System.currentTimeMillis() < deadline && testStartEpoch > 0) {
-            delay(500)
-        }
-    }
-
-    /**
-     * One kernel url-test run, serialized: without the mutex one run's stream
-     * pushes would settle another run's wait (or let a stray push kill the
-     * spinner mid-run). Marks the
-     * run epoch, sends the command, then waits for the outbounds stream to
-     * report every member stamped after the epoch — bounded by the kernel's
-     * per-node timeout plus margin. A non-null result is the failure to report: the
-     * command could not be sent, and the libbox error says why.
-     */
-    private suspend fun runKernelUrlTest(manual: Boolean, target: String = MinimalConfigBuilder.AUTO_TAG): String? =
+    private suspend fun runKernelUrlTest(target: String, manual: Boolean): String? =
         kernelUrlTestMutex.withLock {
-            kernelTestManual = manual
-            testStartEpoch = System.currentTimeMillis() / 1000
             if (manual) {
-                // a colliding run's settle may have flashed these off while
-                // this caller was waiting on the mutex
+                beginTestRun(target)
                 _testing.value = true
-                _testProgress.value = 0 to testRunTags.size
+                _testProgress.value = initialProgress(target)
+            } else {
+                // A smart-mode run must not touch the manual test's UI state. It still needs the
+                // display bookkeeping, so the stream can attribute its results to the right target
+                // without ever touching _testing.
+                beginTestRun(target)
             }
-            // The cause is kept rather than collapsed into a Boolean. A libbox failure
-            // here reads "url test: get command client: <cause>", which names the boundary
-            // that actually failed - no command socket, core gone, dial rejected. Throwing
-            // that away and reporting a bare "could not send" hid a control-plane fault
-            // behind a latency-test message and made the next round start from zero.
-            val failure = runCatching {
+            try {
                 CommandTarget.standaloneClient().urlTest(target)
-            }.exceptionOrNull()
-            if (failure != null) {
-                testStartEpoch = 0
-                return@withLock failure.message ?: failure.toString()
+                null
+            } catch (e: Exception) {
+                e.message ?: e.toString()
+            } finally {
+                if (manual) {
+                    // The RPC is the lifecycle: whatever happened above, the client is done here.
+                    _testing.value = false
+                }
             }
-            val deadline = System.currentTimeMillis() + PER_NODE_TEST_TIMEOUT_MS + 10_000
-            while (testStartEpoch > 0 && System.currentTimeMillis() < deadline) delay(500)
-            testStartEpoch = 0 // cap fallback; callers' finally owns the UI state
-            null
         }
 
     /**
@@ -1187,13 +1251,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 if (i > 0 && i % 10 == 0) commandClient.connect()
             }
             if (!connected) throw IllegalStateException(str(com.interstellar.proxy.R.string.vm_test_service_timeout))
-            kernelTestManual = true // manual run: progress + settle own the UI state
-            // A headless probe reaches the kernel by the same path, so it needs the same node set.
-            // When urlTest() already established it this is a no-op; when the probe is driven
-            // directly it is what gives the run a denominator and a completion condition.
-            if (testRunTags.isEmpty()) beginTestRun(target)
-            _testProgress.value = 0 to testRunTags.size
-            testStartEpoch = System.currentTimeMillis() / 1000
+            // A headless probe reaches the kernel through the same single call, so the client's
+            // involvement ends when that call returns. It used to be followed by a
+            // `awaitUrlTestSettled()` that waited out the kernel's per-node timeout plus margin -
+            // the same client-side lifecycle this refactor removes from the attached path.
             val failure = runCatching {
                 CommandTarget.standaloneClient().urlTest(target)
             }.exceptionOrNull()
@@ -1205,10 +1266,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     ),
                 )
             }
-            // bounded by the kernel's per-node timeout (15s) + margin —
-            // a fixed 10s here used to cut the headless core mid-run and
-            // leave the bottom nodes 未测
-            awaitUrlTestSettled()
         } finally {
             probeSocketUp = false
             // Clear the probe flag and re-apply any owed suspend FIRST, before anything suspendable.
