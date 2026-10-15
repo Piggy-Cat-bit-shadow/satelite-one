@@ -1,5 +1,7 @@
 package com.interstellar.proxy.data.config
 
+import com.interstellar.proxy.data.model.CLASH_MODE_DIRECT
+import com.interstellar.proxy.data.model.CLASH_MODE_GLOBAL
 import com.interstellar.proxy.data.model.NodeType
 import com.interstellar.proxy.data.model.ProxyNode
 import kotlinx.serialization.json.JsonElement
@@ -233,6 +235,33 @@ object MinimalConfigBuilder {
                     put("server", "dns-local")
                 },
             )
+            // Direct mode must not resolve through the proxy.
+            //
+            // `dns-remote` detours to the selector unconditionally, and `dns.final`
+            // is `dns-remote`. Without this rule, switching to Direct changed the
+            // route of every connection while every lookup still went out over the
+            // proxy - and, worse, dialling the DoH server through the selector is
+            // itself enough to keep a proxy connection alive, so "直连" traffic
+            // could still be observed from the node.
+            //
+            // DNS rules support `clash_mode` in this kernel
+            // (`option/rule_dns.go` `ClashMode`, matched by the same
+            // `rule.ClashModeItem` the route rules use), so the fix is a routing
+            // rule rather than a detour that would have to be rewritten - which
+            // would mean reloading the config on every mode change.
+            //
+            // The detour is overridden per-query instead of per-server: the same
+            // `dns-remote` transport is reused, so nothing about the Rule and
+            // Global DNS policy changes. Placed AFTER the bootstrap rule so that a
+            // DoH server whose own address is a domain still resolves locally
+            // rather than through itself.
+            add(
+                buildJsonObject {
+                    put("clash_mode", CLASH_MODE_DIRECT)
+                    put("server", "dns-remote")
+                    putJsonArray("outbound") { add(DIRECT_TAG) }
+                },
+            )
         }
         put("final", "dns-remote")
         put("strategy", "prefer_ipv4")
@@ -241,10 +270,42 @@ object MinimalConfigBuilder {
 
     /**
      * Minimal route: sniff, hand DNS to the DNS module, keep the LAN out of the
-     * tunnel, send everything else to the selector.
+     * tunnel, let the routing mode override, send everything else to the
+     * selector.
      *
-     * No geo rule sets, no CN bypass, no overseas rule, no ad blocking, no
-     * user-defined domain rules and no mode-dependent `final`.
+     * No geo rule sets, no CN bypass, no overseas rule, no ad blocking and no
+     * user-defined domain rules.
+     *
+     * ## Why the mode rules are here, and why in this position
+     *
+     * The kernel's mode is bare state: it only changes traffic because a rule
+     * matches on it. A rule carrying nothing but `clash_mode` is *disabled* while
+     * another mode is active (`rule.ClashModeItem.Match` returns false), so these
+     * two rules are inert in Rule mode and the paths below them are exactly the
+     * ones this generator produced before.
+     *
+     * Position is forced by the router's own action semantics
+     * (`route/route.go`): a rule whose action is `sniff` or `resolve` runs its
+     * action and the loop CONTINUES, while `route`, `reject` and `hijack-dns`
+     * stop the search. The two mode rules use `outbound`, i.e. `route`, so they
+     * must sit after `sniff` (or nothing is ever sniffed in Global/Direct) and
+     * after `hijack-dns` (so DNS is still answered by the DNS module in every
+     * mode). Because a `route` action ends the search, they must also sit before
+     * the LAN rule - otherwise that rule's unconditional `ip_is_private` match
+     * would consume the traffic first and Direct could never reach the public
+     * internet through this generator.
+     *
+     * ## Global and the LAN
+     *
+     * The LAN `route_exclude_address` ranges on the TUN stay in force in every
+     * mode. Those packets never enter sing-box at all, so the Global rule cannot
+     * and does not capture them: "LAN stays reachable" is a property of the
+     * tunnel, deliberately independent of the routing mode.
+     *
+     * The mode rules are deliberately written against [GROUP_TAG] and
+     * [DIRECT_TAG] - the same two outbounds the LAN rule and `final` already use -
+     * so the mode machinery adds no outbound dependency that a config could
+     * reference and not have.
      */
     private fun kotlinx.serialization.json.JsonObjectBuilder.buildRoute() {
         putJsonArray("rules") {
@@ -253,6 +314,18 @@ object MinimalConfigBuilder {
                 buildJsonObject {
                     put("protocol", "dns")
                     put("action", "hijack-dns")
+                },
+            )
+            add(
+                buildJsonObject {
+                    put("clash_mode", CLASH_MODE_DIRECT)
+                    put("outbound", DIRECT_TAG)
+                },
+            )
+            add(
+                buildJsonObject {
+                    put("clash_mode", CLASH_MODE_GLOBAL)
+                    put("outbound", GROUP_TAG)
                 },
             )
             add(

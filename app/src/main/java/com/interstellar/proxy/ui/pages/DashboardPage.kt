@@ -16,7 +16,9 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -25,6 +27,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -48,6 +52,9 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -59,6 +66,7 @@ import com.interstellar.proxy.constant.Status
 import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.data.SubscriptionRepository
 import com.interstellar.proxy.data.config.MinimalConfigBuilder
+import com.interstellar.proxy.data.model.RoutingMode
 import com.interstellar.proxy.ui.AppViewModel
 import com.interstellar.proxy.ui.TrafficDisplay
 import com.interstellar.proxy.ui.trafficDisplay
@@ -103,6 +111,7 @@ fun DashboardPage(
     val connectedAt by viewModel.connectedAt.collectAsState()
     val history by viewModel.history.collectAsState()
     val proxyScope by viewModel.proxyScope.collectAsState()
+    val routingMode by viewModel.routingMode.collectAsState()
     val running = status == Status.Started
     val runtime by viewModel.runtime.collectAsState()
     // raw configs may not name any group "proxy" — fall back to the first selector
@@ -298,6 +307,24 @@ fun DashboardPage(
             }
 
             Spacer(Modifier.height(8.dp))
+
+            // ── 路由模式：规则 / 全局 / 直连 ──
+            //
+            // 就地可操作,不是跳转胶囊:这是"流量走哪里"的直接开关,把它藏进设置页会让
+            // 用户以为上面那个"切换模式"(节点自动/手动)就是它。两条轴必须一眼可分:
+            //   · 切换模式  = 手动选择(selector)指向 auto 还是某个节点   → 跳节点页
+            //   · 路由模式  = 内核是否执行 route 规则                    → 本控件直接切
+            //
+            // 三种模式下都可操作:
+            //   · 内核未运行时只是预设,启动后由 AppViewModel.reconcileRoutingMode() 下发;
+            //   · 内核运行中由 setRoutingMode() 走运行时 SetClashMode 热切换,不重载配置、
+            //     不重启 VPN。
+            // 所以这里既不 disable 也不做乐观假状态:值只有一个来源(MutableStateFlow ←
+            // Settings.routingMode),失败由定位层回滚并提示。
+            RoutingModeSelector(
+                selected = routingMode,
+                onSelect = { viewModel.setRoutingMode(it) },
+            )
 
             Spacer(Modifier.height(12.dp))
 
@@ -628,6 +655,115 @@ private fun RuntimeRow(label: String, value: String) {
 }
 
 /** All four dashboard instruments share one exact height so the grid stays uniform. */
+
+/**
+ * 路由模式三段控件: 规则 / 全局 / 直连。
+ *
+ * Deliberately hand-rolled rather than `SingleChoiceSegmentedButtonRow`: the dashboard's
+ * chips are pill-shaped, tracked and tinted from [LocalInterstellarColors], and reusing
+ * the Material default would put a second, visually different control language on the same
+ * screen. The accessibility contract the Material component would have supplied is kept
+ * explicitly instead of implicitly:
+ *
+ *  - the group carries `Role.Tab`-like semantics via [selectableGroup], so a screen reader
+ *    announces it as one choice among N rather than as three unrelated buttons;
+ *  - each segment is [selectable] with `selected`, so the current mode is reported, not just
+ *    drawn;
+ *  - each segment has its own `contentDescription` naming the axis ("路由模式") and the
+ *    option, because "规则" alone says nothing about what it changes;
+ *  - [Modifier.height] is fixed, so a font-scale change cannot silently move the grid below.
+ *
+ * Order and labels are the product's: 规则 (the kernel's default), 全局, 直连.
+ */
+@Composable
+private fun RoutingModeSelector(
+    selected: RoutingMode,
+    onSelect: (RoutingMode) -> Unit,
+) {
+    val colors = LocalInterstellarColors.current
+    val haptics = LocalHapticFeedback.current
+    val label = stringResource(R.string.dash_label_route)
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Text(
+            label,
+            color = colors.textTertiary,
+            fontSize = 11.sp,
+            letterSpacing = 0.5.sp,
+            maxLines = 1,
+        )
+        Spacer(Modifier.width(10.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .weight(1f)
+                .height(36.dp)
+                .clip(RoundedCornerShape(50))
+                .background(colors.bgDeep)
+                .padding(3.dp)
+                .selectableGroup(),
+        ) {
+            // `stringResource` is @Composable, so it cannot be called from a non-composable
+            // lambda passed to forEach. Each segment is therefore its own composable, which is
+            // also what keeps a selection change from recomposing the whole row's text.
+            RoutingMode.entries.forEach { mode ->
+                RoutingModeSegment(
+                    mode = mode,
+                    axisLabel = label,
+                    selected = mode == selected,
+                    onSelect = {
+                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onSelect(mode)
+                    },
+                )
+            }
+        }
+    }
+}
+
+/** One segment of [RoutingModeSelector]; carries the selection semantics itself. */
+@Composable
+private fun RowScope.RoutingModeSegment(
+    mode: RoutingMode,
+    axisLabel: String,
+    selected: Boolean,
+    onSelect: () -> Unit,
+) {
+    val colors = LocalInterstellarColors.current
+    val text = stringResource(
+        when (mode) {
+            RoutingMode.RULE -> R.string.dash_route_rule
+            RoutingMode.GLOBAL -> R.string.dash_route_global
+            RoutingMode.DIRECT -> R.string.dash_route_direct
+        },
+    )
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier
+            .weight(1f)
+            .fillMaxHeight()
+            .clip(RoundedCornerShape(50))
+            .background(if (selected) colors.primary else Color.Transparent)
+            .selectable(
+                selected = selected,
+                role = Role.RadioButton,
+                onClick = { if (!selected) onSelect() },
+            )
+            // "规则" alone does not say what it changes, so the axis is part of the
+            // announcement rather than only the value.
+            .semantics { contentDescription = "$axisLabel: $text" },
+    ) {
+        Text(
+            text,
+            color = if (selected) colors.bgDeep else colors.textSecondary,
+            fontSize = 12.sp,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            maxLines = 1,
+        )
+    }
+}
 
 @Composable
 private fun StatusChip(label: String, value: String, onClick: () -> Unit) {

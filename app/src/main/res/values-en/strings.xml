@@ -35,6 +35,11 @@
          been pushed to the core after it started -->
     <string name="vm_switch_restored">Restored last selection: %1$s · %2$s</string>
     <string name="vm_test_failed">Test failed: %1$s</string>
+    <!-- Routing mode: positive confirmation (logs page) and failure notice. The failure text
+         must say that the setting was stored while the core kept the old mode, or the UI state
+         and the real traffic would disagree silently. -->
+    <string name="vm_routing_mode_applied">Routing mode switched: %1$s</string>
+    <string name="vm_routing_mode_failed">Routing mode not applied (saved as %1$s): %2$s</string>
     <string name="vm_no_test_config">Could not generate a test config</string>
     <string name="vm_test_service_timeout">Timed out waiting for the test service</string>
     <string name="vm_download_failed">Download failed: %1$s · the subscription host may be unreachable directly; try again with the proxy on</string>
@@ -89,6 +94,11 @@
     <string name="dash_scope_on">On</string>
     <string name="dash_scope_off">Off</string>
     <string name="dash_label_switch">Switch mode</string>
+    <!-- Routing mode: an independent axis from "Switch mode" (node auto/manual) above -->
+    <string name="dash_label_route">Routing mode</string>
+    <string name="dash_route_rule">Rule</string>
+    <string name="dash_route_global">Global</string>
+    <string name="dash_route_direct">Direct</string>
     <string name="dash_caption_session">Session</string>
     <string name="dash_caption_session_hint">Connected for · tap for details</string>
     <string name="dash_caption_traffic">Traffic</string>

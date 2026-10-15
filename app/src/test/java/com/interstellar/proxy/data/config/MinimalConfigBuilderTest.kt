@@ -59,34 +59,118 @@ class MinimalConfigBuilderTest {
     }
 
     @Test
-    fun `route is sniff hijack-dns and LAN only with the selector as final`() {
+    fun `route is sniff hijack-dns the two mode rules and LAN with the selector as final`() {
         val route = config()["route"]!!.jsonObject
         val rules = route["rules"]!!.jsonArray.map { it.jsonObject }
-        check(rules.size == 3) { "exactly sniff + hijack-dns + LAN: $rules" }
+        check(rules.size == 5) { "exactly sniff + hijack-dns + Direct + Global + LAN: $rules" }
         check(rules[0]["action"]!!.jsonPrimitive.content == "sniff")
         check(rules[1]["protocol"]!!.jsonPrimitive.content == "dns")
         check(rules[1]["action"]!!.jsonPrimitive.content == "hijack-dns")
-        check(rules[2]["ip_is_private"]!!.jsonPrimitive.content == "true")
+        check(rules[2]["clash_mode"]!!.jsonPrimitive.content == "Direct")
         check(rules[2]["outbound"]!!.jsonPrimitive.content == MinimalConfigBuilder.DIRECT_TAG)
+        check(rules[3]["clash_mode"]!!.jsonPrimitive.content == "Global")
+        check(rules[3]["outbound"]!!.jsonPrimitive.content == MinimalConfigBuilder.GROUP_TAG)
+        check(rules[4]["ip_is_private"]!!.jsonPrimitive.content == "true")
+        check(rules[4]["outbound"]!!.jsonPrimitive.content == MinimalConfigBuilder.DIRECT_TAG)
         check(route["final"]!!.jsonPrimitive.content == MinimalConfigBuilder.GROUP_TAG) { "everything else rides the selector" }
     }
 
-    @Test
-    fun `dns is the system resolver for outbound dials plus one remote DoH`() {
-        val dns = config()["dns"]!!.jsonObject
-        val servers = dns["servers"]!!.jsonArray.map { it.jsonObject }
-        check(servers.size == 2) { "no CN/hosts/extra servers: $servers" }
-        check(servers[0]["tag"]!!.jsonPrimitive.content == "dns-local")
-        check(servers[0]["type"]!!.jsonPrimitive.content == "local")
-        val remote = servers[1]
-        check(remote["tag"]!!.jsonPrimitive.content == "dns-remote")
-        check(remote["type"]!!.jsonPrimitive.content == "https")
-        check(remote["detour"]!!.jsonPrimitive.content == MinimalConfigBuilder.GROUP_TAG) { "app DNS rides the selector" }
+    // ---- routing mode ----
 
+    /**
+     * The mode rules are what make Rule/Global/Direct mean anything.
+     *
+     * The kernel's mode is bare state that only changes traffic because a rule matches on
+     * it, and a mode's rules are inert while another mode is current. Without these two
+     * rules `SetClashMode` succeeds and changes nothing - the exact failure this feature
+     * exists to avoid - so their absence must be a red build, not a silent regression.
+     */
+    @Test
+    fun `both runtime routing modes are declared as clash_mode route rules`() {
+        val rules = config()["route"]!!.jsonObject["rules"]!!.jsonArray.map { it.jsonObject }
+        val modes = rules.mapNotNull { it["clash_mode"]?.jsonPrimitive?.content }
+        check(modes == listOf("Direct", "Global")) {
+            "the kernel derives its mode list from these: $modes"
+        }
+        // Rule is deliberately NOT declared: clashmode.NewManager always prepends the
+        // default mode ("Rule"), so declaring it would only add a redundant rule.
+        check("Rule" !in modes) { "Rule is the implicit default and needs no rule" }
+    }
+
+    /**
+     * Order is load-bearing, so it is pinned rather than described.
+     *
+     * `route/route.go` continues the rule walk after a `sniff`/`resolve` action but STOPS at
+     * `route`, `reject` or `hijack-dns`. Two consequences decide the layout:
+     * the mode rules must come after `hijack-dns` (or DNS is hijacked by TUN before the
+     * rules run and mode-independent DNS policy stops working), and before the LAN rule
+     * (whose unconditional `ip_is_private` match would otherwise consume the connection and
+     * Direct could never route anything).
+     */
+    @Test
+    fun `the mode rules sit between the dns hijack and the lan bypass`() {
+        val rules = config()["route"]!!.jsonObject["rules"]!!.jsonArray.map { it.jsonObject }
+        val sniff = rules.indexOfFirst { it["action"]?.jsonPrimitive?.content == "sniff" }
+        val hijack = rules.indexOfFirst { it["action"]?.jsonPrimitive?.content == "hijack-dns" }
+        val direct = rules.indexOfFirst { it["clash_mode"]?.jsonPrimitive?.content == "Direct" }
+        val global = rules.indexOfFirst { it["clash_mode"]?.jsonPrimitive?.content == "Global" }
+        val lan = rules.indexOfFirst { it["ip_is_private"]?.jsonPrimitive?.content == "true" }
+        check(sniff in 0..<hijack) { "sniff must run before everything: $sniff/$hijack" }
+        check(hijack < global) { "a route action stops the walk, so Global must follow hijack-dns" }
+        check(direct < global) { "the narrower override (Direct) must be decided before the broader one (Global)" }
+        check(direct < lan) { "the LAN rule is unconditional and terminal: the mode rules must precede it" }
+    }
+
+    /**
+     * The mode rules may only name outbounds the config already defines.
+     *
+     * A `clash_mode` rule with no outbound decodes as an implicit `route` action with an empty
+     * tag; it passes config validation and then fails at match time with
+     * "outbound not found". Every referenced tag is therefore checked against the real outbound
+     * list, which is the check the kernel's own validator does NOT perform.
+     */
+    @Test
+    fun `every outbound the mode rules reference exists`() {
+        val json = config()
+        val tags = objs(json, "outbounds").map { it["tag"]!!.jsonPrimitive.content }.toSet()
+        val referenced = json["route"]!!.jsonObject["rules"]!!.jsonArray
+            .map { it.jsonObject }
+            .mapNotNull { it["outbound"]?.jsonPrimitive?.content }
+        check(referenced.isNotEmpty()) { "the route still routes something" }
+        referenced.forEach { tag ->
+            check(tag in tags) { "route rule references '$tag', which is not an outbound: $tags" }
+        }
+    }
+
+    /**
+     * Direct mode must not resolve through the proxy.
+     *
+     * `dns-remote` detours to the selector and `dns.final` is `dns-remote`, so without this
+     * rule every lookup would still leave through the proxy node after the user chose 直连 -
+     * and dialling the DoH server through the selector is by itself enough to keep a node
+     * connection alive. DNS rules support `clash_mode` in this kernel, so the detour is
+     * overridden per query instead of rewriting the server (which would need a config reload
+     * on every mode change).
+     */
+    @Test
+    fun `direct mode sends dns out directly instead of through the selector`() {
+        val dns = config()["dns"]!!.jsonObject
         val rules = dns["rules"]!!.jsonArray.map { it.jsonObject }
-        check(rules.size == 1) { "only the outbound-dial bootstrap rule: $rules" }
+        check(rules.size == 2) { "bootstrap + direct-mode override: $rules" }
+        // Bootstrap stays first: a DoH server named by a domain must still resolve locally.
         check(rules[0]["outbound"]!!.jsonPrimitive.content == "any")
         check(rules[0]["server"]!!.jsonPrimitive.content == "dns-local")
+        check(rules[1]["clash_mode"]!!.jsonPrimitive.content == "Direct")
+        check(rules[1]["server"]!!.jsonPrimitive.content == "dns-remote")
+        val overrideOutbound = rules[1]["outbound"]!!.jsonArray.map { it.jsonPrimitive.content }
+        check(overrideOutbound == listOf(MinimalConfigBuilder.DIRECT_TAG)) {
+            "the direct override must use the direct outbound, not the selector: $overrideOutbound"
+        }
+        // The transport is reused, so Rule/Global DNS policy is untouched.
+        val servers = dns["servers"]!!.jsonArray.map { it.jsonObject }
+        check(servers[1]["detour"]!!.jsonPrimitive.content == MinimalConfigBuilder.GROUP_TAG) {
+            "dns-remote itself still detours to the selector"
+        }
         check(dns["final"]!!.jsonPrimitive.content == "dns-remote")
     }
 
@@ -104,6 +188,25 @@ class MinimalConfigBuilderTest {
         check("mtu" !in tun) { "the app must not pin a tun mtu: $tun" }
         val mixed = inbounds.first { it["type"]!!.jsonPrimitive.content == "mixed" }
         check(mixed["listen_port"]!!.jsonPrimitive.content == "2080")
+    }
+
+    @Test
+    fun `dns is the system resolver for outbound dials plus one remote DoH`() {
+        val dns = config()["dns"]!!.jsonObject
+        val servers = dns["servers"]!!.jsonArray.map { it.jsonObject }
+        check(servers.size == 2) { "no CN/hosts/extra servers: $servers" }
+        check(servers[0]["tag"]!!.jsonPrimitive.content == "dns-local")
+        check(servers[0]["type"]!!.jsonPrimitive.content == "local")
+        val remote = servers[1]
+        check(remote["tag"]!!.jsonPrimitive.content == "dns-remote")
+        check(remote["type"]!!.jsonPrimitive.content == "https")
+        check(remote["detour"]!!.jsonPrimitive.content == MinimalConfigBuilder.GROUP_TAG) { "app DNS rides the selector" }
+
+        val rules = dns["rules"]!!.jsonArray.map { it.jsonObject }
+        check(rules.size == 2) { "the outbound-dial bootstrap rule plus the Direct-mode override: $rules" }
+        check(rules[0]["outbound"]!!.jsonPrimitive.content == "any")
+        check(rules[0]["server"]!!.jsonPrimitive.content == "dns-local")
+        check(dns["final"]!!.jsonPrimitive.content == "dns-remote")
     }
 
     @Test
@@ -125,6 +228,20 @@ class MinimalConfigBuilderTest {
         check(fallback["default"]!!.jsonPrimitive.content == MinimalConfigBuilder.AUTO_TAG)
     }
 
+    @Test
+    fun `generated config is well-formed json and round-trips`() {        // A cheap second pair of eyes on the shape: the assertions above index into parsed
+        // objects, so a change that produced, say, two `route` keys or a trailing comma would
+        // be reported by the parser as a confusing failure elsewhere rather than as itself.
+        // Re-serialising must also succeed - the config is consumed as text by the core.
+        val text = MinimalConfigBuilder.build(nodes, MinimalConfigBuilder.BuildOptions())
+        val parsed = Json.parseToJsonElement(text).jsonObject
+        check(parsed.keys.containsAll(listOf("log", "dns", "inbounds", "outbounds", "route", "experimental"))) {
+            "generated config lost a top-level section: ${parsed.keys}"
+        }
+        val again = Json.parseToJsonElement(Json.encodeToString(kotlinx.serialization.json.JsonElement.serializer(), parsed))
+        check(again == Json.parseToJsonElement(text)) { "the generated config does not round-trip" }
+    }
+
     // ---- no app-side policy ----
 
     @Test
@@ -141,9 +258,12 @@ class MinimalConfigBuilderTest {
         )) {
             check(!text.contains(forbidden)) { "generated config must not contain '$forbidden'" }
         }
-        // the only route rules are the three minimal ones
+        // the only route rules are the five minimal ones: sniff, hijack-dns, the two routing
+        // modes, and the LAN bypass. `clash_mode` is a ROUTING-mode override, not app-side
+        // policy (it carries no geo/domain knowledge and adds no outbound), which is why the
+        // forbidden-string list above still holds unchanged.
         val rules = config()["route"]!!.jsonObject["rules"]!!.jsonArray
-        check(rules.size == 3)
+        check(rules.size == 5)
         check("rule_set" !in config()["route"]!!.jsonObject) { "no rule-set declarations" }
     }
 

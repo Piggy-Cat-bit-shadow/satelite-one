@@ -165,6 +165,32 @@ object Settings {
         }
 
 
+    /**
+     * Routing mode: Rule / Global / Direct. NEVER a node pick - see
+     * [selectedOutboundTag] for that. The two coexist.
+     *
+     * Stored as the kernel's own spelling ([com.interstellar.proxy.data.model.RoutingMode.wire]),
+     * so the persisted value is exactly what goes on the wire and what a route
+     * rule compares against. Only a recognised spelling is ever written: the
+     * getter cannot fail, and an unrecognised value left behind by a downgrade
+     * falls back to Rule rather than propagating an unknown mode into the core.
+     *
+     * Default Rule matches the kernel's own default (`clashmode.NewManager` maps
+     * an empty `default_mode` to "Rule"), so an existing install that has never
+     * touched this control keeps the behaviour it already had.
+     */
+    var routingMode: String
+        get() = com.interstellar.proxy.data.model.RoutingMode
+            .fromWire(properties.getProperty("routingMode"))
+            ?.wire
+            ?: com.interstellar.proxy.data.model.RoutingMode.DEFAULT.wire
+        set(value) {
+            val mode = com.interstellar.proxy.data.model.RoutingMode.fromWire(value)
+                ?: com.interstellar.proxy.data.model.RoutingMode.DEFAULT
+            properties.setProperty("routingMode", mode.wire)
+            commit()
+        }
+
     /** Nodes page layout: grid (default) or list. */
     var nodesGridView: Boolean
         get() = properties.getProperty("nodesGridView", "true").toBoolean()

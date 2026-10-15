@@ -14,6 +14,7 @@ import com.interstellar.proxy.data.ConfigStore
 import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.data.SubscriptionRepository
 import com.interstellar.proxy.data.config.MinimalConfigBuilder
+import com.interstellar.proxy.data.model.RoutingMode
 import com.interstellar.proxy.data.net.SubscriptionFetcher
 import com.interstellar.proxy.data.subscription.SubscriptionParser
 import io.nekohasekai.libbox.Libbox
@@ -389,6 +390,21 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _selectedOutboundTag = MutableStateFlow(Settings.selectedOutboundTag)
     val selectedOutboundTag: StateFlow<String> = _selectedOutboundTag
 
+    /**
+     * Routing mode (Rule / Global / Direct) — the UI's view of `Settings.routingMode`.
+     *
+     * A separate axis from [selectedOutboundTag]: that one picks *which* outbound the
+     * selector points at, this one decides whether the route rules run at all. They are
+     * both persisted, both restored on construction, and neither is derived from the other.
+     *
+     * Seeded from the persisted value, not from the core: the core is not necessarily
+     * running, and on a cold start the UI must be able to render the mode the user chose
+     * before anything has been attached. Reconciliation with the kernel happens once the
+     * service is up — see [reconcileRoutingMode].
+     */
+    private val _routingMode = MutableStateFlow(RoutingMode.fromWire(Settings.routingMode) ?: RoutingMode.DEFAULT)
+    val routingMode: StateFlow<RoutingMode> = _routingMode
+
     /** Nodes page layout: grid (default) or list; persisted. */
     private val _nodesGridView = MutableStateFlow(Settings.nodesGridView)
     val nodesGridView: StateFlow<Boolean> = _nodesGridView
@@ -515,6 +531,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 if (_status.value == Status.Starting) {
                     markStarted()
                 }
+                // First tick after the tun is up: the SetClashMode RPC answers
+                // "invalid argument" until the service reports STARTED, so the stored
+                // routing mode is (re-)asserted here rather than from onConnected().
+                // Guarded internally, so the 1 Hz stream sends it once per session.
+                reconcileRoutingMode()
                 _speed.value = SpeedState(
                     uplinkPerSecond = status.uplink,
                     downlinkPerSecond = status.downlink,
@@ -826,6 +847,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         autoTested = false
         // A fresh core must be allowed to restore the stored pick again.
         selectionRestoreAttempted = false
+        // Same reason, and the same place: a fresh core must be told the routing mode
+        // again, and the next request-level reconcile must be allowed to fire.
+        routingModeApplied = false
         if (_status.value != Status.Stopped) {
             _status.value = Status.Stopped
         }
@@ -1064,6 +1088,106 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }.onFailure {
                 _message.value = str(com.interstellar.proxy.R.string.vm_switch_failed, it.message ?: "")
             }
+        }
+    }
+
+    // ---- routing mode ----
+
+    /**
+     * True once the stored mode has been pushed to the core for the current session.
+     *
+     * Reset where `selectionRestoreAttempted` is reset (the stop paths) for the same reason:
+     * one push per core, so a later user choice is never overwritten by a stale reconcile.
+     * Written from the UI thread and read from the command client's callback thread, so it is
+     * published rather than hoped for.
+     */
+    @Volatile
+    private var routingModeApplied = false
+
+    /**
+     * The ONE place a routing mode change is decided, persisted and sent.
+     *
+     * Deliberately shaped like [selectNode]: persist the intent first, then send it to a core
+     * that is already running, then report a failure instead of hiding it. The order matters
+     * because the two cases must both end up correct:
+     *
+     *  - **core running** - the intent is persisted and the kernel is switched in place. No
+     *    config reload, no service restart: the kernel's clash-mode Manager is runtime state
+     *    and a route rule reads it per connection.
+     *  - **core stopped** - nothing is sent, because there is nothing to send it to. The value
+     *    is persisted and [reconcileRoutingMode] applies it when the core next comes up, so the
+     *    choice is never silently dropped.
+     *
+     * Persisting even when the send fails is the deliberate choice: this is a *user intent*, and
+     * [reconcileRoutingMode] retries it on the next start. The failure is surfaced rather than
+     * swallowed, and the traffic effect is stated in the message, so "UI says Direct while the
+     * core still routes Rule" cannot pass unnoticed.
+     *
+     * Unlike [selectNode] this does not rewrite the active config: the generated config already
+     * declares every mode the UI offers, and a raw config is never rewritten at all.
+     */
+    fun setRoutingMode(mode: RoutingMode) {
+        val previous = _routingMode.value
+        if (mode == previous) return
+        // Intent first, so a stop/start in between cannot lose it.
+        Settings.routingMode = mode.wire
+        _routingMode.value = mode
+        // A change is a fresh decision: a reconcile already done for this session must not
+        // suppress the push below, and a later reconcile must still be allowed to re-assert it.
+        routingModeApplied = false
+        viewModelScope.launch(Dispatchers.IO) {
+            if (_status.value != Status.Started) return@launch
+            applyRoutingMode(mode, previous)
+        }
+    }
+
+    /**
+     * Re-assert the stored mode on a freshly started core.
+     *
+     * The kernel also persists the mode (`cache.db`, bucket `clash_mode`) and restores it at
+     * start, which normally lands on the same value. It is not treated as authoritative,
+     * because it can legitimately disagree: a raw config brings its own mode list, and a stored
+     * mode that is not in that list is dropped on restore. The persisted app setting is the
+     * user's intent, so it wins - and re-sending an unchanged value is free, since the kernel's
+     * `SetMode` returns early when the mode is already current.
+     *
+     * Called from the status tick, which is the first moment the core is genuinely serving: the
+     * `SetClashMode` RPC answers `invalid argument` until the service reports STARTED, so
+     * sending from `onConnected()` would race the very state this is reconciling against.
+     * Guarded so the 1 Hz status stream does not re-send it every second.
+     */
+    private fun reconcileRoutingMode() {
+        if (routingModeApplied) return
+        routingModeApplied = true
+        viewModelScope.launch(Dispatchers.IO) {
+            applyRoutingMode(_routingMode.value, previous = null)
+        }
+    }
+
+    /** Send [mode] to the running core; [previous] is rolled back to only when it is non-null. */
+    private suspend fun applyRoutingMode(mode: RoutingMode, previous: RoutingMode?) {
+        runCatching {
+            CommandTarget.standaloneClient().setClashMode(mode.wire)
+        }.onSuccess {
+            com.interstellar.proxy.core.AppLog.log(
+                "ui",
+                str(com.interstellar.proxy.R.string.vm_routing_mode_applied, mode.wire),
+            )
+        }.onFailure {
+            // Roll back ONLY a change the user just made. A reconcile failure has no previous
+            // state to restore (the stored value is the intent, and the core may simply not be
+            // ready for it), so it keeps the setting and reports.
+            if (previous != null) {
+                Settings.routingMode = previous.wire
+                _routingMode.value = previous
+            } else {
+                routingModeApplied = false
+            }
+            _message.value = str(
+                com.interstellar.proxy.R.string.vm_routing_mode_failed,
+                mode.wire,
+                it.message ?: "",
+            )
         }
     }
 
