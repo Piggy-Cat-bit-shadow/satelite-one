@@ -99,6 +99,8 @@
     <string name="dash_route_rule">Rule</string>
     <string name="dash_route_global">Global</string>
     <string name="dash_route_direct">Direct</string>
+    <!-- Announced for a mode the active config does not declare; no dialog -->
+    <string name="dash_route_unavailable">Not declared by the active config</string>
     <string name="dash_caption_session">Session</string>
     <string name="dash_caption_session_hint">Connected for · tap for details</string>
     <string name="dash_caption_traffic">Traffic</string>

@@ -111,7 +111,11 @@ fun DashboardPage(
     val connectedAt by viewModel.connectedAt.collectAsState()
     val history by viewModel.history.collectAsState()
     val proxyScope by viewModel.proxyScope.collectAsState()
-    val routingMode by viewModel.routingMode.collectAsState()
+    // The mode shown is the kernel's own report whenever there is a kernel; the stored preset
+    // covers the VPN-off case. Both come from the ViewModel — nothing is remembered here, so a
+    // configuration change cannot snap the control back to a stale value.
+    val routingMode by viewModel.activeRoutingMode.collectAsState()
+    val availableRoutingModes by viewModel.availableRoutingModes.collectAsState()
     val running = status == Status.Started
     val runtime by viewModel.runtime.collectAsState()
     // raw configs may not name any group "proxy" — fall back to the first selector
@@ -323,6 +327,7 @@ fun DashboardPage(
             // Settings.routingMode),失败由定位层回滚并提示。
             RoutingModeSelector(
                 selected = routingMode,
+                available = availableRoutingModes,
                 onSelect = { viewModel.setRoutingMode(it) },
             )
 
@@ -678,6 +683,7 @@ private fun RuntimeRow(label: String, value: String) {
 @Composable
 private fun RoutingModeSelector(
     selected: RoutingMode,
+    available: List<RoutingMode>,
     onSelect: (RoutingMode) -> Unit,
 ) {
     val colors = LocalInterstellarColors.current
@@ -705,6 +711,10 @@ private fun RoutingModeSelector(
                 .padding(3.dp)
                 .selectableGroup(),
         ) {
+            // Every mode is always DRAWN, so the control does not change shape as configs come
+            // and go; a mode the active config cannot honour is shown disabled. Dropping it
+            // would leave the user unable to see why their choice is not available.
+            //
             // `stringResource` is @Composable, so it cannot be called from a non-composable
             // lambda passed to forEach. Each segment is therefore its own composable, which is
             // also what keeps a selection change from recomposing the whole row's text.
@@ -713,6 +723,7 @@ private fun RoutingModeSelector(
                     mode = mode,
                     axisLabel = label,
                     selected = mode == selected,
+                    enabled = mode in available,
                     onSelect = {
                         haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                         onSelect(mode)
@@ -729,6 +740,7 @@ private fun RowScope.RoutingModeSegment(
     mode: RoutingMode,
     axisLabel: String,
     selected: Boolean,
+    enabled: Boolean,
     onSelect: () -> Unit,
 ) {
     val colors = LocalInterstellarColors.current
@@ -739,6 +751,9 @@ private fun RowScope.RoutingModeSegment(
             RoutingMode.DIRECT -> R.string.dash_route_direct
         },
     )
+    // Only reachable when the core is up and its mode list omits this mode - i.e. the active
+    // config declares no `clash_mode` rule for it, which in practice means a raw user config.
+    val unavailableHint = stringResource(R.string.dash_route_unavailable)
     Box(
         contentAlignment = Alignment.Center,
         modifier = Modifier
@@ -748,16 +763,25 @@ private fun RowScope.RoutingModeSegment(
             .background(if (selected) colors.primary else Color.Transparent)
             .selectable(
                 selected = selected,
+                enabled = enabled,
                 role = Role.RadioButton,
                 onClick = { if (!selected) onSelect() },
             )
             // "规则" alone does not say what it changes, so the axis is part of the
-            // announcement rather than only the value.
-            .semantics { contentDescription = "$axisLabel: $text" },
+            // announcement rather than only the value - and an unavailable segment says why,
+            // instead of leaving a screen-reader user with a control that silently does nothing.
+            .semantics {
+                contentDescription =
+                    if (enabled) "$axisLabel: $text" else "$axisLabel: $text ($unavailableHint)"
+            },
     ) {
         Text(
             text,
-            color = if (selected) colors.bgDeep else colors.textSecondary,
+            color = when {
+                !enabled -> colors.textTertiary
+                selected -> colors.bgDeep
+                else -> colors.textSecondary
+            },
             fontSize = 12.sp,
             fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
             maxLines = 1,

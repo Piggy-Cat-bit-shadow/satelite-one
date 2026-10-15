@@ -97,6 +97,8 @@
     <string name="dash_route_rule">规则</string>
     <string name="dash_route_global">全局</string>
     <string name="dash_route_direct">直连</string>
+    <!-- 配置未声明该模式(内核 mode list 里没有)时的无障碍说明,不弹窗 -->
+    <string name="dash_route_unavailable">当前配置未声明此模式</string>
     <string name="dash_caption_session">会话</string>
     <string name="dash_caption_session_hint">已连接时长 · 连接详情</string>
     <string name="dash_caption_traffic">流量</string>

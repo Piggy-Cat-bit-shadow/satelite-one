@@ -76,22 +76,32 @@ class RoutingModeWiringTest {
     // --- the control chain: intent -> persistence -> runtime command ----------------------
 
     @Test
-    fun `setRoutingMode persists the intent before it is shown or sent`() {
+    fun `setRoutingMode persists the preset before it is acted on`() {
         // The order is the design, not an accident. A change made while the VPN is stopped is
-        // applied at the next start, and the only thing that survives that gap is the stored
-        // value - so if the setting is written after the (skipped) send, a stop/start between
-        // the two loses the user's choice silently. Persisting first also means a failed send
-        // leaves the intent intact for the reconcile to retry.
+        // applied when a core attaches, and the only thing that survives that gap is the stored
+        // preset - so if the setting were written after the check, a stop/start in between would
+        // lose the user's choice silently. Persisting first also means a send that fails leaves
+        // the intent intact for the next attach.
         val body = code(bodyOf(viewModelSource, "fun setRoutingMode("))
         val persist = body.indexOf("Settings.routingMode =")
-        val publish = body.indexOf("_routingMode.value =")
-        assertTrue("`setRoutingMode` no longer persists the mode", persist >= 0)
-        assertTrue("`setRoutingMode` no longer publishes it to the UI", publish >= 0)
+        val gate = body.indexOf("Status.Started")
+        assertTrue("`setRoutingMode` no longer persists the preset", persist >= 0)
         assertTrue(
-            "`setRoutingMode` publishes to the UI before it persists: a process death in that " +
-                "window would leave the dashboard showing a mode the app never stored, and the " +
-                "next start would silently disagree with what the user saw.",
-            persist < publish,
+            "`setRoutingMode` no longer checks whether a core is running, so it would either " +
+                "command nothing or command a service that is not there",
+            gate >= 0,
+        )
+        assertTrue(
+            "`setRoutingMode` decides whether to send before it persists: a process death in " +
+                "that window would leave the dashboard showing a mode the app never stored, and " +
+                "the next attach would silently disagree with what the user saw.",
+            persist < gate,
+        )
+        // The preset must be what the user sees while there is no kernel to ask. Without this
+        // the control would appear frozen at the last kernel-reported mode with the VPN off.
+        assertTrue(
+            "`setRoutingMode` no longer shows the choice while no core is reporting",
+            body.contains("_activeRoutingMode.value = mode"),
         )
     }
 
@@ -103,19 +113,19 @@ class RoutingModeWiringTest {
         // the enum name would rely on the font of tolerance the enum exists to remove.
         val body = code(bodyOf(viewModelSource, "fun setRoutingMode("))
         assertTrue(
-            "`setRoutingMode` no longer routes through applyRoutingMode(), so the send and its " +
+            "`setRoutingMode` no longer routes through sendRoutingMode(), so the send and its " +
                 "failure handling are no longer the single implementation this test binds",
-            body.contains("applyRoutingMode("),
+            body.contains("sendRoutingMode("),
         )
-        val apply = code(bodyOf(viewModelSource, "private suspend fun applyRoutingMode("))
+        val send = code(bodyOf(viewModelSource, "private suspend fun sendRoutingMode("))
         assertTrue(
             "the clash-mode RPC no longer sends `mode.wire`; the wire spelling is now derived " +
                 "somewhere else and can drift from the one the generated config declares",
-            apply.contains("setClashMode(mode.wire)"),
+            send.contains("setClashMode(mode.wire)"),
         )
         assertTrue(
             "the clash-mode RPC is no longer the runtime CommandClient call",
-            apply.contains("CommandTarget.standaloneClient()"),
+            send.contains("CommandTarget.standaloneClient()"),
         )
         // No accidental second control channel: this is the same one-shot client every other
         // runtime command uses (selectOutbound, urlTest, serviceReload).
@@ -138,212 +148,221 @@ class RoutingModeWiringTest {
         )
     }
 
-    @Test
-    fun `a change is never suppressed by an earlier reconcile`() {
-        // `routingModeApplied` is the once-per-session guard for the reconcile. If a user
-        // change did not clear it, the guard would swallow the very switch the user just made
-        // and the core would keep the previous mode - the "UI says Direct, traffic says Rule"
-        // defect, caused by the guard itself.
-        val body = code(bodyOf(viewModelSource, "fun setRoutingMode("))
-        assertTrue(
-            "`setRoutingMode` no longer clears routingModeApplied, so a mode chosen after the " +
-                "start-up reconcile would be dropped",
-            body.contains("routingModeApplied = false"),
-        )
-    }
-
-    // --- lifecycle: a mode chosen while stopped must survive ---------------------------------
+    // --- the kernel is the running state, and it says so itself ------------------------------
 
     @Test
-    fun `the stored mode is re-asserted once the core is serving`() {
-        // The kernel persists the mode itself, but that cache is NOT the user's intent: a raw
-        // config brings its own mode list, and a stored mode that is not in it is discarded on
-        // restore. The app setting is authoritative, so it is re-sent - and the kernel's
-        // SetMode returns early when the value already matches, so re-sending is free.
+    fun `the ClashMode channel is actually subscribed`() {
+        // The defect this binds: `CommandClient.ConnectionType.ClashMode` and both clash-mode
+        // handler hooks existed but were never subscribed or overridden, so the whole channel
+        // was dead code and the app had no way to learn what the kernel was doing. Everything
+        // else in this class depends on that channel being live.
         assertTrue(
-            "reconcileRoutingMode() is gone: a mode chosen while the VPN was stopped would " +
-                "only be applied if the kernel's own cache happened to agree",
-            viewModelCode.contains("reconcileRoutingMode()"),
+            "the main command client no longer subscribes to ClashMode, so the kernel's mode " +
+                "and mode list never reach the app and the UI is back to guessing",
+            viewModelCode.contains("CommandClient.ConnectionType.ClashMode"),
         )
     }
 
     @Test
-    fun `the reconcile is driven by the status tick, not by the connect callback`() {
-        // Measured against the pinned core: `daemon.StartedService.SetClashMode` returns
-        // os.ErrInvalid unless the service status is STARTED. A StatusMessage is only emitted
-        // once the tun is up, so the status handler is the first moment the RPC can succeed;
-        // sending from onConnected() instead would race the very state being reconciled.
-        val statusHandler = code(bodyOf(viewModelSource, "override fun updateStatus("))
+    fun `both kernel clash-mode callbacks are consumed`() {
+        // initializeClashMode carries modeList + currentMode; updateClashMode carries every later
+        // change. Between them they are the whole answer to "what can this config do" and "what
+        // is it doing", so neither may be dropped.
+        val initialize = code(bodyOf(viewModelSource, "override fun initializeClashMode("))
         assertTrue(
-            "the routing-mode reconcile is no longer triggered from the status tick, so it can " +
-                "run before the service reports STARTED and fail with `invalid argument`",
-            statusHandler.contains("reconcileRoutingMode()"),
-        )
-        val onConnected = code(bodyOf(viewModelSource, "override fun onConnected()"))
-        assertTrue(
-            "the reconcile was moved into onConnected(), which fires as soon as the command " +
-                "socket attaches - before the service is STARTED, where SetClashMode is rejected",
-            !onConnected.contains("reconcileRoutingMode()"),
-        )
-    }
-
-    @Test
-    fun `the reconcile runs once per session`() {
-        // The status stream ticks at 1 Hz. Without the guard this would issue a command socket
-        // connect and an RPC every second for the life of the tunnel.
-        val body = code(bodyOf(viewModelSource, "private fun reconcileRoutingMode()"))
-        assertTrue(
-            "`reconcileRoutingMode` lost its once-per-session guard and now re-sends on every " +
-                "1 Hz status tick",
-            body.contains("if (routingModeApplied) return"),
-        )
-    }
-
-    @Test
-    fun `a failing reconcile retries slowly instead of once a second`() {
-        // A failed reconcile re-arms `routingModeApplied`, which is right (otherwise one failure
-        // would mean "never applied for this core") but is not sufficient on its own: each
-        // attempt opens its own command socket, so a core that stays Started while the command
-        // path is unavailable would be dialed once per second for the life of the tunnel. The
-        // spacing is what makes the retry affordable, so it is bound here.
-        val body = code(bodyOf(viewModelSource, "private fun reconcileRoutingMode()"))
-        assertTrue(
-            "`reconcileRoutingMode` no longer rate-limits its retries, so a persistent failure " +
-                "re-opens a command socket on every 1 Hz status tick",
-            body.contains("ROUTING_MODE_RETRY_AFTER_NANOS"),
-        )
-        // The interval must be an elapsed-time measurement. `currentTimeMillis` would let a
-        // wall-clock correction shorten the window, which is the one thing a backoff must not
-        // allow.
-        assertTrue(
-            "`reconcileRoutingMode` measures its interval on the wall clock instead of a " +
-                "monotonic source",
-            body.contains("System.nanoTime()") && !body.contains("System.currentTimeMillis()"),
+            "initializeClashMode no longer feeds the mode list, so the capability is lost",
+            initialize.contains("onKernelModeList("),
         )
         assertTrue(
-            "the retry interval is declared but no longer bounds anything",
-            viewModelCode.contains("ROUTING_MODE_RETRY_AFTER_NANOS ="),
+            "initializeClashMode no longer feeds the current mode, so the app never learns " +
+                "what the core restored",
+            initialize.contains("onKernelMode("),
+        )
+        assertTrue(
+            "the once-per-attach preset alignment is no longer requested on initialize",
+            initialize.contains("alignPreset = true"),
+        )
+        val update = code(bodyOf(viewModelSource, "override fun updateClashMode("))
+        assertTrue(
+            "updateClashMode no longer feeds the current mode, so a mode changed by anything " +
+                "other than this app is invisible",
+            update.contains("onKernelMode("),
+        )
+        assertTrue(
+            "updateClashMode must only observe: aligning the preset on every mode report would " +
+                "fight the kernel for control of the mode",
+            update.contains("alignPreset = false"),
         )
     }
 
     @Test
-    fun `a fresh core is allowed to be told again`() {
-        // Same ownership rule as selectionRestoreAttempted, reset in the same place: a new core
-        // is a new runtime, and a guard left set across a restart would skip the re-assert. The
-        // backoff timestamp is reset with it, so a core that starts within the retry window is
-        // still told immediately rather than waiting out the previous core's backoff.
-        val body = code(bodyOf(viewModelSource, "private fun markStopped()"))
+    fun `the capability list prefers the kernel over the compiled-in enum`() {
+        // `availableRoutingModes` is a capability statement, and only the kernel can make it:
+        // it derives the list from the ACTIVE config's clash_mode rules. Hard-coding all three
+        // is what makes a raw config with no mode rules look like it supports Direct.
+        val body = code(bodyOf(viewModelSource, "private fun onKernelModeList("))
         assertTrue(
-            "`markStopped` no longer clears routingModeApplied, so after the first stop/start " +
-                "the routing mode would never be re-applied to the new core",
-            body.contains("routingModeApplied = false"),
+            "onKernelModeList no longer publishes what the kernel reported",
+            body.contains("_availableRoutingModes.value"),
         )
         assertTrue(
-            "`markStopped` no longer clears the retry timestamp, so a restart inside the backoff " +
-                "window would leave the new core on the kernel's own cached mode",
-            body.contains("routingModeLastAttemptNanos = 0L"),
+            "onKernelModeList no longer maps the kernel's strings through RoutingMode",
+            body.contains("RoutingMode.fromWire"),
+        )
+        // An EMPTY report means "no information", not "nothing available". Treating it as an
+        // empty capability set would grey out all three segments on a config whose mode list
+        // merely failed to arrive - a fabricated restriction.
+        assertTrue(
+            "onKernelModeList acts on an empty list; an empty answer means the query did not " +
+                "land, not that nothing is supported",
+            body.contains("modeList.isEmpty()"),
         )
     }
 
     @Test
-    fun `a failed send cannot leave the dashboard claiming a mode the core refused`() {
-        // The policy is rollback-and-report, and both halves matter. Rolling back without
-        // reporting hides a real failure; reporting without rolling back leaves the UI showing
-        // a mode the kernel rejected. The reconcile path has nothing to roll back to (the
-        // stored value IS the intent), so it re-arms instead - also asserted, because a guard
-        // left set after a failed reconcile would mean "retry never".
-        val apply = code(bodyOf(viewModelSource, "private suspend fun applyRoutingMode("))
-        assertTrue("a failed switch no longer rolls the UI state back", apply.contains("Settings.routingMode = previous.wire"))
-        assertTrue("a failed switch no longer rolls the stored value back", apply.contains("_routingMode.value = previous"))
-        assertTrue("a failed switch is no longer reported", apply.contains("vm_routing_mode_failed"))
+    fun `the dashboard shows what the kernel reports, not what was stored`() {
+        // Two different questions: Settings answers "what should be selected with no core?",
+        // the kernel answers "what is routing traffic right now?". If the UI read the stored
+        // value while a core was up, a mode the kernel refused would keep looking applied.
         assertTrue(
-            "a failed reconcile no longer re-arms the guard, so the mode would never be " +
-                "retried for the life of that core",
-            apply.contains("routingModeApplied = false"),
+            "the dashboard no longer reads the running mode from the ViewModel",
+            dashboardCode.contains("viewModel.activeRoutingMode.collectAsState()"),
+        )
+        assertTrue(
+            "the dashboard no longer reads the capability list from the ViewModel",
+            dashboardCode.contains("viewModel.availableRoutingModes.collectAsState()"),
+        )
+        assertTrue(
+            "the dashboard reads the stored preset as if it were the running mode, so a mode " +
+                "the kernel does not support would still look active",
+            !dashboardCode.contains("viewModel.presetRoutingMode.collectAsState()"),
         )
     }
 
-    // --- rapid taps: the late failure of an abandoned tap ------------------------------------
-
     @Test
-    fun `a superseded failure cannot roll back the mode the user moved on to`() {
-        // Rapid taps leave two RPCs in flight, and the FIRST can fail after the second has
-        // already published a newer mode - a dial that waits for the command socket and then
-        // loses it is enough. Rolling back on that late failure would restore the abandoned
-        // mode *after* the newer SetClashMode succeeded, so the dashboard and the stored
-        // intent would show one mode while the core ran another. This is the defect that
-        // makes "quick switching" worse than slow switching, so the staleness check is bound.
-        val apply = code(bodyOf(viewModelSource, "private suspend fun applyRoutingMode("))
-        // Parameters are part of the SIGNATURE, not the body: `bodyOf` starts at the opening
-        // brace, so a parameter check has to read the declaration instead. (This file already
-        // made that mistake once, on RoutingModeSelector.)
-        val signature = viewModelSource
-            .substringAfter("private suspend fun applyRoutingMode(")
+    fun `a mode the config cannot honour is offered as unavailable rather than hidden`() {
+        // The segments are always drawn so the control does not change shape as configs come
+        // and go; an unsupported one is disabled and says why. Hiding it would leave the user
+        // unable to see that their choice is unavailable.
+        val selector = code(bodyOf(dashboardSource, "private fun RoutingModeSelector("))
+        // Parameters are part of the SIGNATURE, not the body - `bodyOf` starts at the opening
+        // brace, so this has to read the declaration.
+        val selectorSignature = dashboardSource
+            .substringAfter("private fun RoutingModeSelector(")
             .substringBefore(") {")
         assertTrue(
-            "`applyRoutingMode` no longer takes the mode the UI is expecting, so a failure " +
-                "carrying a superseded mode is indistinguishable from a current one. " +
-                "Signature was: $signature",
-            signature.contains("expected: RoutingMode?"),
+            "RoutingModeSelector no longer takes the kernel's capability list. Signature was: " +
+                "$selectorSignature",
+            selectorSignature.contains("available: List<RoutingMode>"),
         )
         assertTrue(
-            "`applyRoutingMode` no longer compares the failing mode against the CURRENT " +
-                "selection, so a late failure undoes a newer choice",
-            apply.contains("_routingMode.value != expected"),
+            "the selector no longer passes availability down to the segments",
+            selector.contains("enabled = mode in available"),
         )
-        // The stale branch must return before the rollback, not after it.
-        val staleGuard = apply.indexOf("_routingMode.value != expected")
-        val rollback = apply.indexOf("Settings.routingMode = previous.wire")
         assertTrue(
-            "the staleness guard sits after the rollback, which makes it decorative: the " +
-                "abandoned mode has already been restored by the time it is consulted",
-            staleGuard >= 0 && rollback > staleGuard,
+            "the selector no longer draws every mode, so the control changes shape per config",
+            selector.contains("RoutingMode.entries.forEach"),
+        )
+        val segment = code(bodyOf(dashboardSource, "private fun RowScope.RoutingModeSegment("))
+        assertTrue(
+            "the segment no longer disables itself, so an unsupported mode is clickable and " +
+                "silently does nothing",
+            segment.contains("enabled = enabled"),
+        )
+        assertTrue(
+            "an unavailable segment no longer explains itself to a screen reader",
+            segment.contains("dash_route_unavailable"),
+        )
+    }
+
+    // --- lifecycle: a preset chosen while stopped must survive --------------------------------
+
+    @Test
+    fun `the preset is aligned once, on the kernel's own initialize report`() {
+        // The kernel persists and restores its own mode, so on attaching it is reporting real
+        // state. The single moment the app may close the gap between "chosen while the VPN was
+        // off" and "what the core came up with" is that report - which is a kernel-initiated
+        // callback, so there is no polling, no backoff and no dial storm to bound.
+        assertTrue(
+            "the preset is no longer aligned at all: a mode chosen with the VPN off would only " +
+                "take effect if the kernel's own cache happened to agree",
+            viewModelCode.contains("presetAligned"),
+        )
+        val body = code(bodyOf(viewModelSource, "private fun onKernelMode("))
+        assertTrue(
+            "the alignment no longer checks that the preset is actually available, so it can " +
+                "command a mode the kernel will silently ignore",
+            body.contains("_availableRoutingModes.value.contains(preset)"),
+        )
+        assertTrue(
+            "the alignment no longer skips a kernel already on the preset",
+            body.contains("preset == kernelMode"),
+        )
+        assertTrue(
+            "the alignment is no longer guarded to once per attach, so a reconnect could " +
+                "re-apply a preset the user has since changed",
+            body.contains("if (presetAligned) return"),
         )
     }
 
     @Test
-    fun `a user change hands the send its own mode as the staleness token`() {
-        // The token must be the mode just selected. Passing `previous` instead would invert the
-        // guard: a failure would be honoured exactly when the user has already moved on, which
-        // is the case it exists to discard.
-        val body = code(bodyOf(viewModelSource, "fun setRoutingMode("))
+    fun `the old inference machinery is gone`() {
+        // The status-tick reconcile and its backoff existed only because the kernel's own state
+        // channel was not wired. With the channel live they are complexity that re-derives
+        // state the kernel already pushes - and the backoff in particular could leave the UI
+        // asserting a mode the core had refused. Their return must be a red build.
         assertTrue(
-            "`setRoutingMode` no longer marks the user's send with the mode being selected",
-            body.contains("expected = mode"),
+            "the status-tick reconcile is back; the kernel's initialize/update callbacks are " +
+                "the authority now",
+            !viewModelCode.contains("reconcileRoutingMode"),
+        )
+        assertTrue(
+            "the reconcile backoff is back",
+            !viewModelCode.contains("ROUTING_MODE_RETRY_AFTER_NANOS"),
+        )
+        assertTrue(
+            "a failed-send rollback is back; the running mode is the kernel's to report, so " +
+                "rolling it back locally re-derives state the kernel owns",
+            !viewModelCode.contains("applyRoutingMode"),
         )
     }
 
     @Test
-    fun `the reconcile reports without rolling anything back`() {
-        // A reconcile has no earlier state to restore - the stored value IS the user's intent -
-        // so it must not carry a staleness token either, or a reconcile that fails while the
-        // user is choosing a new mode would be dropped and never retried.
-        val body = code(bodyOf(viewModelSource, "private fun reconcileRoutingMode()"))
+    fun `a core going away drops the reported mode instead of freezing it`() {
+        // Otherwise the dashboard keeps showing the mode of a core that no longer exists, and
+        // the next attach would look like it had already reported.
+        val body = code(bodyOf(viewModelSource, "private fun markStopped()"))
         assertTrue(
-            "the reconcile no longer disables the staleness check",
-            body.contains("expected = null"),
+            "markStopped no longer clears the kernel-reported mode, so a dead core's mode stays " +
+                "on screen",
+            body.contains("_kernelRoutingMode.value = null"),
         )
         assertTrue(
-            "the reconcile no longer disables rollback",
-            body.contains("previous = null"),
+            "markStopped no longer resets the capability list, so a raw config's restriction " +
+                "would survive into the next, unrelated config",
+            body.contains("_availableRoutingModes.value = RoutingMode.entries.toList()"),
+        )
+        assertTrue(
+            "markStopped no longer allows the next attach to align the preset again",
+            body.contains("presetAligned = false"),
         )
     }
 
     @Test
     fun `mode commands cannot interleave on the one command socket`() {
-        // The staleness check decides WHICH failures matter; it cannot make the core apply the
-        // taps in order. Rapid taps otherwise race on a single command socket, so the mode the
-        // core ends on could be the second-to-last one the user tapped.
-        val apply = code(bodyOf(viewModelSource, "private suspend fun applyRoutingMode("))
+        // Serialisation is what keeps rapid taps reaching the core in the order they were made.
+        // The kernel is the state authority, so a reordered pair would be *reported* honestly -
+        // but the user would still get the wrong mode.
+        val send = code(bodyOf(viewModelSource, "private suspend fun sendRoutingMode("))
         assertTrue(
             "the clash-mode RPC is no longer serialised, so concurrent sends can reach the " +
                 "core out of the order the user tapped them in",
-            apply.contains("routingModeSend.withLock"),
+            send.contains("routingModeSend.withLock"),
         )
         assertTrue(
             "the RPC must be INSIDE the lock; wrapping only the surrounding work would not " +
                 "order the calls themselves",
-            apply.indexOf("routingModeSend.withLock") < apply.indexOf("setClashMode(mode.wire)"),
+            send.indexOf("routingModeSend.withLock") < send.indexOf("setClashMode(mode.wire)"),
         )
     }
 
@@ -357,7 +376,7 @@ class RoutingModeWiringTest {
         assertTrue(
             "the dashboard no longer binds the routing mode to ViewModel state, so it can " +
                 "survive a recomposition only by accident",
-            dashboardCode.contains("viewModel.routingMode.collectAsState()"),
+            dashboardCode.contains("viewModel.activeRoutingMode.collectAsState()"),
         )
         assertTrue(
             "the dashboard no longer renders the routing-mode selector at all",

@@ -392,19 +392,41 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     val selectedOutboundTag: StateFlow<String> = _selectedOutboundTag
 
     /**
-     * Routing mode (Rule / Global / Direct) — the UI's view of `Settings.routingMode`.
+     * Routing mode (Rule / Global / Direct) as the *user's intent*.
      *
-     * A separate axis from [selectedOutboundTag]: that one picks *which* outbound the
-     * selector points at, this one decides whether the route rules run at all. They are
-     * both persisted, both restored on construction, and neither is derived from the other.
+     * A separate axis from [selectedOutboundTag]: that one picks *which* outbound the selector
+     * points at, this one decides whether the route rules run at all.
      *
-     * Seeded from the persisted value, not from the core: the core is not necessarily
-     * running, and on a cold start the UI must be able to render the mode the user chose
-     * before anything has been attached. Reconciliation with the kernel happens once the
-     * service is up — see [reconcileRoutingMode].
+     * This is a PRESET, not the running state. When the core is up the authoritative mode comes
+     * from the kernel ([kernelRoutingMode]); Settings only has to answer "what should be
+     * selected while there is no core to ask?", and it is written on every user change so that
+     * answer survives a restart. Nothing else derives a routing decision from it.
      */
-    private val _routingMode = MutableStateFlow(RoutingMode.fromWire(Settings.routingMode) ?: RoutingMode.DEFAULT)
-    val routingMode: StateFlow<RoutingMode> = _routingMode
+    private val _presetRoutingMode =
+        MutableStateFlow(RoutingMode.fromWire(Settings.routingMode) ?: RoutingMode.DEFAULT)
+
+    /**
+     * The routing mode the kernel is actually on, or null while it has not said.
+     *
+     * Null is a real state, not "Rule": it means no core is attached or none has reported yet.
+     * Collapsing it to Rule is what would make the dashboard claim a mode nobody confirmed.
+     */
+    private val _kernelRoutingMode = MutableStateFlow<RoutingMode?>(null)
+
+    /**
+     * Modes the control may offer. Until the kernel reports, every mode stays selectable: the
+     * preset has to be choosable with the VPN off, and an unreported list is not evidence that
+     * a mode is unsupported.
+     */
+    private val _availableRoutingModes = MutableStateFlow(RoutingMode.entries.toList())
+    val availableRoutingModes: StateFlow<List<RoutingMode>> = _availableRoutingModes
+
+    private val _activeRoutingMode = MutableStateFlow(_presetRoutingMode.value)
+
+    /**
+     * The mode the UI shows: what the kernel reports when it has reported, otherwise the preset.
+     */
+    val activeRoutingMode: StateFlow<RoutingMode> = _activeRoutingMode
 
     /** Nodes page layout: grid (default) or list; persisted. */
     private val _nodesGridView = MutableStateFlow(Settings.nodesGridView)
@@ -484,9 +506,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         const val STARTING_TIMEOUT_MS = 15_000L
         const val SOCKET_DROP_TIMEOUT_MS = 400L
 
-        /** Minimum spacing between failed routing-mode reconciles; see [reconcileRoutingMode]. */
-        const val ROUTING_MODE_RETRY_AFTER_NANOS = 30_000_000_000L
-
         /** Sentinel delay for timed-out / unreachable nodes (url-test). */
         const val TIMEOUT_DELAY = 65535
     }
@@ -498,6 +517,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             CommandClient.ConnectionType.Groups,
             // delay updates stream through outbounds, not the groups snapshot
             CommandClient.ConnectionType.Outbounds,
+            // The kernel's routing mode IS state the UI must not re-derive. Subscribing here
+            // turns the previously dead ClashMode plumbing into the single read path: the mode
+            // list says which routing modes the ACTIVE config can honour, and updateClashMode
+            // says which one the kernel is actually on. Both are pushed, so the app never has to
+            // guess or poll - and a mode it cannot apply stops looking applied.
+            CommandClient.ConnectionType.ClashMode,
         ),
         object : CommandClient.Handler {
             override fun onConnected() {
@@ -527,19 +552,40 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 if (uiLifetime.mayReportSocketLoss(probing)) applySocketDrop()
             }
 
-            override fun updateStatus(status: StatusMessage) {
+            /**
+             * The kernel's mode list plus the mode it restored: sent once per attach.
+             *
+             * This is the only capability statement the app has, and it is authoritative because
+             * the kernel derives it from the ACTIVE config (`clashmode.CalculateModeList` scans
+             * the route and DNS rules for `clash_mode` values). A generated config declares
+             * Direct and Global, so all three modes appear; a raw config that declares none
+             * yields `["Rule"]` - and that is exactly the case the UI must not pretend
+             * otherwise about, because `SetClashMode` is a silent no-op for a mode that is not
+             * in the list.
+             *
+             * `unknown` and `only Rule` are therefore kept distinguishable: an empty list means
+             * the kernel did not report (a raw config with no mode rules still reports `Rule`),
+             * so nothing is disabled on a list we never received.
+             */
+            override fun initializeClashMode(modeList: List<String>, currentMode: String) {
                 if (probing) return
+                onKernelModeList(modeList)
+                onKernelMode(currentMode, alignPreset = true)
+            }
+
+            /** The kernel changed its mode - by our command, or by anything else. */
+            override fun updateClashMode(newMode: String) {
+                if (probing) return
+                onKernelMode(newMode, alignPreset = false)
+            }
+
+            override fun updateStatus(status: StatusMessage) {                if (probing) return
                 // Status ticks only after the tun is actually running — this is
                 // what promotes Starting → Started, so a socket bounce during
                 // boot cannot flash Stopped.
                 if (_status.value == Status.Starting) {
                     markStarted()
                 }
-                // First tick after the tun is up: the SetClashMode RPC answers
-                // "invalid argument" until the service reports STARTED, so the stored
-                // routing mode is (re-)asserted here rather than from onConnected().
-                // Guarded internally, so the 1 Hz stream sends it once per session.
-                reconcileRoutingMode()
                 _speed.value = SpeedState(
                     uplinkPerSecond = status.uplink,
                     downlinkPerSecond = status.downlink,
@@ -851,11 +897,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         autoTested = false
         // A fresh core must be allowed to restore the stored pick again.
         selectionRestoreAttempted = false
-        // Same reason, and the same place: a fresh core must be told the routing mode
-        // again, and the next request-level reconcile must be allowed to fire. The backoff
-        // timestamp goes with it - a new core must not inherit the old one's waiting period.
-        routingModeApplied = false
-        routingModeLastAttemptNanos = 0L
+        // A core is gone, so the kernel is no longer reporting a mode: drop the reported state
+        // and forget the alignment. What the dashboard shows in the gap is the preset, which is
+        // what the next attach will ask for - not the mode of the core that just died.
+        presetAligned = false
+        _kernelRoutingMode.value = null
+        _availableRoutingModes.value = RoutingMode.entries.toList()
+        _activeRoutingMode.value = _presetRoutingMode.value
         if (_status.value != Status.Stopped) {
             _status.value = Status.Stopped
         }
@@ -1098,130 +1146,123 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ---- routing mode ----
+    //
+    // The app does not track the routing mode by inference any more. The kernel already owns it
+    // and already pushes it: `CommandClient.ConnectionType.ClashMode` delivers
+    // `initializeClashMode(modeList, currentMode)` once per attach and `updateClashMode(newMode)`
+    // on every change. Everything below consumes those two callbacks, so there is one authority
+    // and no reconciliation heuristic:
+    //
+    //   kernel modeList  -> which modes the ACTIVE config can honour  (capability)
+    //   kernel currentMode -> the mode actually routing traffic       (running state)
+    //   Settings.routingMode -> the preset for when there is no kernel (intent, one-way)
 
-    /**
-     * True once the stored mode has been pushed to the core for the current session.
-     *
-     * Reset where `selectionRestoreAttempted` is reset (the stop paths) for the same reason:
-     * one push per core, so a later user choice is never overwritten by a stale reconcile.
-     * Written from the UI thread and read from the command client's callback thread, so it is
-     * published rather than hoped for.
-     */
-    @Volatile
-    private var routingModeApplied = false
-
-    /**
-     * Monotonic timestamp of the last reconcile attempt; 0 = none yet.
-     *
-     * `System.nanoTime`, not `currentTimeMillis`: this measures an elapsed interval, and a
-     * wall-clock correction must not be able to shorten it.
-     */
-    @Volatile
-    private var routingModeLastAttemptNanos = 0L
-
-    /**
-     * The ONE place a routing mode change is decided, persisted and sent.
-     *
-     * Deliberately shaped like [selectNode]: persist the intent first, then send it to a core
-     * that is already running, then report a failure instead of hiding it. The order matters
-     * because the two cases must both end up correct:
-     *
-     *  - **core running** - the intent is persisted and the kernel is switched in place. No
-     *    config reload, no service restart: the kernel's clash-mode Manager is runtime state
-     *    and a route rule reads it per connection.
-     *  - **core stopped** - nothing is sent, because there is nothing to send it to. The value
-     *    is persisted and [reconcileRoutingMode] applies it when the core next comes up, so the
-     *    choice is never silently dropped.
-     *
-     * Persisting even when the send fails is the deliberate choice: this is a *user intent*, and
-     * [reconcileRoutingMode] retries it on the next start. The failure is surfaced rather than
-     * swallowed, and the traffic effect is stated in the message, so "UI says Direct while the
-     * core still routes Rule" cannot pass unnoticed.
-     *
-     * Unlike [selectNode] this does not rewrite the active config: the generated config already
-     * declares every mode the UI offers, and a raw config is never rewritten at all.
-     */
-    fun setRoutingMode(mode: RoutingMode) {
-        val previous = _routingMode.value
-        if (mode == previous) return
-        // Intent first, so a stop/start in between cannot lose it.
-        Settings.routingMode = mode.wire
-        _routingMode.value = mode
-        // A change is a fresh decision: a reconcile already done for this session must not
-        // suppress the push below, a later reconcile must still be allowed to re-assert it, and
-        // a retry still inside its backoff window must not delay the send the user just asked for.
-        routingModeApplied = false
-        routingModeLastAttemptNanos = 0L
-        viewModelScope.launch(Dispatchers.IO) {
-            if (_status.value != Status.Started) return@launch
-            applyRoutingMode(mode, previous = previous, expected = mode)
-        }
-    }
-
-    /**
-     * Re-assert the stored mode on a freshly started core.
-     *
-     * The kernel also persists the mode (`cache.db`, bucket `clash_mode`) and restores it at
-     * start, which normally lands on the same value. It is not treated as authoritative,
-     * because it can legitimately disagree: a raw config brings its own mode list, and a stored
-     * mode that is not in that list is dropped on restore. The persisted app setting is the
-     * user's intent, so it wins - and re-sending an unchanged value is free, since the kernel's
-     * `SetMode` returns early when the mode is already current.
-     *
-     * Called from the status tick, which is the first moment the core is genuinely serving: the
-     * `SetClashMode` RPC answers `invalid argument` until the service reports STARTED, so
-     * sending from `onConnected()` would race the very state this is reconciling against.
-     * Guarded so the 1 Hz status stream does not re-send it every second.
-     */
-    private fun reconcileRoutingMode() {
-        if (routingModeApplied) return
-        // Backoff, not a bare flag. `routingModeApplied` has to be re-armed when a reconcile
-        // fails, or a single failure would mean "never applied for this core". But a re-armed
-        // flag on its own is worse than the failure: the status stream ticks at 1 Hz, and each
-        // attempt opens its own command socket, so a core that stays Started while the command
-        // path is unavailable would have the app dialing it once a second for the life of the
-        // tunnel. The delay keeps the retry and drops the hammering - and because it is anchored
-        // on a monotonic clock, a wall-clock jump cannot make it fire early.
-        val now = System.nanoTime()
-        val last = routingModeLastAttemptNanos
-        if (last != 0L && now - last < ROUTING_MODE_RETRY_AFTER_NANOS) return
-        routingModeLastAttemptNanos = now
-        routingModeApplied = true
-        viewModelScope.launch(Dispatchers.IO) {
-            applyRoutingMode(_routingMode.value, previous = null, expected = null)
-        }
-    }
-
-    /** Serialises mode RPCs; see [applyRoutingMode] for why ordering is not enough on its own. */
+    /** Serialises mode commands so concurrent taps cannot reach the core out of order. */
     private val routingModeSend = Mutex()
 
     /**
-     * Send [mode] to the running core.
+     * Record what the kernel says it can honour.
      *
-     * @param previous rolled back to when this is a user change that failed; null for a reconcile,
-     *   which has no earlier value to restore because the stored mode IS the intent.
-     * @param expected the mode the UI is showing when this send's failure is allowed to matter.
-     *   Null disables the check (reconcile).
-     *
-     * # Why a send that failed can still be the wrong thing to act on
-     *
-     * Rapid taps are real: tapping 全局 then 直连 leaves two RPCs in flight, and the FIRST one can
-     * fail after the second has already published the newer mode - a dial that has to wait for the
-     * command socket, then loses it, is enough. Rolling back on that late failure would restore a
-     * mode the user has already moved past, and it would do so *after* the newer `SetClashMode`
-     * succeeded, leaving the dashboard and the stored intent on the abandoned value while the core
-     * runs the newer one. So a failure is only allowed to roll anything back while [mode] is still
-     * the current selection; a stale failure is logged and dropped.
-     *
-     * The mutex is the other half. It cannot replace the check - the late failure arrives after the
-     * lock is released - but it keeps the RPCs from interleaving on one command socket, so the order
-     * the user tapped in is the order the core applies.
+     * An empty list is treated as "no information" rather than "nothing available": the kernel
+     * answers with the mode list of the running config, and a config with no `clash_mode` rule
+     * still yields `["Rule"]`. An empty answer therefore means the query did not land, and
+     * disabling everything on the strength of it would be a fabricated restriction.
      */
-    private suspend fun applyRoutingMode(
-        mode: RoutingMode,
-        previous: RoutingMode?,
-        expected: RoutingMode?,
-    ) {
+    private fun onKernelModeList(modeList: List<String>) {
+        if (modeList.isEmpty()) return
+        val known = modeList.mapNotNull { RoutingMode.fromWire(it) }
+        if (known.isEmpty()) return
+        _availableRoutingModes.value = known
+    }
+
+    /**
+     * Record the mode the kernel is on, and optionally align the preset to it.
+     *
+     * # Why the kernel wins here
+     *
+     * The kernel persists its own mode (`cache.db`, bucket `clash_mode`) and restores it at
+     * start, so on a fresh attach it is reporting real restored state. That is the state the
+     * user is actually getting, and the dashboard must show it rather than a stored guess - the
+     * two agreeing is the normal case, and where they disagree the kernel is the one carrying
+     * traffic. Adopting it also means a mode set by anything else (another client, a raw
+     * config's own default) is reflected instead of being silently contradicted.
+     *
+     * # `alignPreset`
+     *
+     * True only for the once-per-attach initialize callback, which is the single moment the app
+     * is allowed to close the gap between "what was chosen while the VPN was off" and "what the
+     * core came up with". If the preset names a mode the kernel can honour and is not already on
+     * it, it is sent - so a preset chosen with the VPN down still takes effect. Every other
+     * report only observes.
+     *
+     * This is deliberately not a retry loop: it fires on a kernel-initiated callback, so there is
+     * no polling, no backoff, and no possibility of a dial storm. A send that fails leaves the
+     * kernel as the reported truth and is surfaced once.
+     */
+    private fun onKernelMode(rawMode: String, alignPreset: Boolean) {
+        val kernelMode = RoutingMode.fromWire(rawMode)
+        com.interstellar.proxy.core.AppLog.log(
+            "ui",
+            "kernel routing mode: ${rawMode.ifBlank { "(none)" }} " +
+                "→ ${kernelMode?.wire ?: "unrecognised"} " +
+                "(available: ${_availableRoutingModes.value.joinToString(",") { it.wire }})",
+        )
+        _kernelRoutingMode.value = kernelMode
+        if (kernelMode != null) {
+            _activeRoutingMode.value = kernelMode
+        }
+        if (!alignPreset) return
+        val preset = _presetRoutingMode.value
+        // Nothing to align when the kernel cannot honour the preset, when it already agrees, or
+        // when it did not report a mode this client understands.
+        if (kernelMode == null || preset == kernelMode) return
+        if (!_availableRoutingModes.value.contains(preset)) return
+        // Already applied once for this attach: the initialize callback can be re-delivered on a
+        // reconnect, and re-sending a decision the user has since changed would undo it.
+        if (presetAligned) return
+        presetAligned = true
+        viewModelScope.launch(Dispatchers.IO) { sendRoutingMode(preset) }
+    }
+
+    /** One preset alignment per attach; reset whenever a core goes away. */
+    @Volatile
+    private var presetAligned = false
+
+    /**
+     * The ONE place a user's routing-mode choice is acted on.
+     *
+     * The preset is written unconditionally, because it has to be answerable with the VPN off -
+     * but it is only *asserted* over a running core. With no core the choice is simply the next
+     * preset, and [onKernelMode] applies it when one attaches.
+     *
+     * There is no optimistic running-state update and no rollback, because the running state is
+     * not this function's to claim: it is whatever `updateClashMode` reports. If the kernel
+     * refuses the mode - a raw config whose mode list does not contain it, where `SetClashMode`
+     * is a silent no-op - the UI keeps showing the mode the kernel is really on, and the preset
+     * stands as intent. That is the honest outcome; inventing a rollback would only re-derive
+     * state the kernel already owns.
+     */
+    fun setRoutingMode(mode: RoutingMode) {
+        if (mode == _presetRoutingMode.value) return
+        Settings.routingMode = mode.wire
+        _presetRoutingMode.value = mode
+        // A fresh choice is a fresh decision: allow the next attach to align it even if an
+        // earlier one already consumed this session's alignment.
+        presetAligned = false
+        if (_status.value != Status.Started) {
+            // No core to command. The preset is the visible value until one reports.
+            if (_kernelRoutingMode.value == null) _activeRoutingMode.value = mode
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) { sendRoutingMode(mode) }
+    }
+
+    /**
+     * Send [mode] on the existing runtime channel. No reload, no restart, no second control
+     * channel: the kernel's clash-mode manager is runtime state and a route rule reads it per
+     * connection.
+     */
+    private suspend fun sendRoutingMode(mode: RoutingMode) {
         runCatching {
             routingModeSend.withLock {
                 CommandTarget.standaloneClient().setClashMode(mode.wire)
@@ -1232,25 +1273,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 str(com.interstellar.proxy.R.string.vm_routing_mode_applied, mode.wire),
             )
         }.onFailure {
-            if (expected != null && _routingMode.value != expected) {
-                // Superseded by a newer tap. Acting on this would undo a choice the user made
-                // after it, so it is reported where failures are diagnosed and nowhere else.
-                com.interstellar.proxy.core.AppLog.log(
-                    "ui",
-                    "routing mode $mode.wire failed after being superseded " +
-                        "(now ${_routingMode.value.wire}): ${it.message ?: ""}",
-                )
-                return@onFailure
-            }
-            // Roll back ONLY a change the user just made. A reconcile failure has no previous
-            // state to restore (the stored value is the intent, and the core may simply not be
-            // ready for it), so it keeps the setting and reports.
-            if (previous != null) {
-                Settings.routingMode = previous.wire
-                _routingMode.value = previous
-            } else {
-                routingModeApplied = false
-            }
             _message.value = str(
                 com.interstellar.proxy.R.string.vm_routing_mode_failed,
                 mode.wire,
