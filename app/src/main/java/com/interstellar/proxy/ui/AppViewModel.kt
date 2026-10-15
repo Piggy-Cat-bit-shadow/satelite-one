@@ -31,6 +31,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import com.interstellar.proxy.data.subscription.str
@@ -483,6 +484,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         const val STARTING_TIMEOUT_MS = 15_000L
         const val SOCKET_DROP_TIMEOUT_MS = 400L
 
+        /** Minimum spacing between failed routing-mode reconciles; see [reconcileRoutingMode]. */
+        const val ROUTING_MODE_RETRY_AFTER_NANOS = 30_000_000_000L
+
         /** Sentinel delay for timed-out / unreachable nodes (url-test). */
         const val TIMEOUT_DELAY = 65535
     }
@@ -848,8 +852,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         // A fresh core must be allowed to restore the stored pick again.
         selectionRestoreAttempted = false
         // Same reason, and the same place: a fresh core must be told the routing mode
-        // again, and the next request-level reconcile must be allowed to fire.
+        // again, and the next request-level reconcile must be allowed to fire. The backoff
+        // timestamp goes with it - a new core must not inherit the old one's waiting period.
         routingModeApplied = false
+        routingModeLastAttemptNanos = 0L
         if (_status.value != Status.Stopped) {
             _status.value = Status.Stopped
         }
@@ -1105,6 +1111,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private var routingModeApplied = false
 
     /**
+     * Monotonic timestamp of the last reconcile attempt; 0 = none yet.
+     *
+     * `System.nanoTime`, not `currentTimeMillis`: this measures an elapsed interval, and a
+     * wall-clock correction must not be able to shorten it.
+     */
+    @Volatile
+    private var routingModeLastAttemptNanos = 0L
+
+    /**
      * The ONE place a routing mode change is decided, persisted and sent.
      *
      * Deliberately shaped like [selectNode]: persist the intent first, then send it to a core
@@ -1133,11 +1148,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         Settings.routingMode = mode.wire
         _routingMode.value = mode
         // A change is a fresh decision: a reconcile already done for this session must not
-        // suppress the push below, and a later reconcile must still be allowed to re-assert it.
+        // suppress the push below, a later reconcile must still be allowed to re-assert it, and
+        // a retry still inside its backoff window must not delay the send the user just asked for.
         routingModeApplied = false
+        routingModeLastAttemptNanos = 0L
         viewModelScope.launch(Dispatchers.IO) {
             if (_status.value != Status.Started) return@launch
-            applyRoutingMode(mode, previous)
+            applyRoutingMode(mode, previous = previous, expected = mode)
         }
     }
 
@@ -1158,22 +1175,73 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      */
     private fun reconcileRoutingMode() {
         if (routingModeApplied) return
+        // Backoff, not a bare flag. `routingModeApplied` has to be re-armed when a reconcile
+        // fails, or a single failure would mean "never applied for this core". But a re-armed
+        // flag on its own is worse than the failure: the status stream ticks at 1 Hz, and each
+        // attempt opens its own command socket, so a core that stays Started while the command
+        // path is unavailable would have the app dialing it once a second for the life of the
+        // tunnel. The delay keeps the retry and drops the hammering - and because it is anchored
+        // on a monotonic clock, a wall-clock jump cannot make it fire early.
+        val now = System.nanoTime()
+        val last = routingModeLastAttemptNanos
+        if (last != 0L && now - last < ROUTING_MODE_RETRY_AFTER_NANOS) return
+        routingModeLastAttemptNanos = now
         routingModeApplied = true
         viewModelScope.launch(Dispatchers.IO) {
-            applyRoutingMode(_routingMode.value, previous = null)
+            applyRoutingMode(_routingMode.value, previous = null, expected = null)
         }
     }
 
-    /** Send [mode] to the running core; [previous] is rolled back to only when it is non-null. */
-    private suspend fun applyRoutingMode(mode: RoutingMode, previous: RoutingMode?) {
+    /** Serialises mode RPCs; see [applyRoutingMode] for why ordering is not enough on its own. */
+    private val routingModeSend = Mutex()
+
+    /**
+     * Send [mode] to the running core.
+     *
+     * @param previous rolled back to when this is a user change that failed; null for a reconcile,
+     *   which has no earlier value to restore because the stored mode IS the intent.
+     * @param expected the mode the UI is showing when this send's failure is allowed to matter.
+     *   Null disables the check (reconcile).
+     *
+     * # Why a send that failed can still be the wrong thing to act on
+     *
+     * Rapid taps are real: tapping 全局 then 直连 leaves two RPCs in flight, and the FIRST one can
+     * fail after the second has already published the newer mode - a dial that has to wait for the
+     * command socket, then loses it, is enough. Rolling back on that late failure would restore a
+     * mode the user has already moved past, and it would do so *after* the newer `SetClashMode`
+     * succeeded, leaving the dashboard and the stored intent on the abandoned value while the core
+     * runs the newer one. So a failure is only allowed to roll anything back while [mode] is still
+     * the current selection; a stale failure is logged and dropped.
+     *
+     * The mutex is the other half. It cannot replace the check - the late failure arrives after the
+     * lock is released - but it keeps the RPCs from interleaving on one command socket, so the order
+     * the user tapped in is the order the core applies.
+     */
+    private suspend fun applyRoutingMode(
+        mode: RoutingMode,
+        previous: RoutingMode?,
+        expected: RoutingMode?,
+    ) {
         runCatching {
-            CommandTarget.standaloneClient().setClashMode(mode.wire)
+            routingModeSend.withLock {
+                CommandTarget.standaloneClient().setClashMode(mode.wire)
+            }
         }.onSuccess {
             com.interstellar.proxy.core.AppLog.log(
                 "ui",
                 str(com.interstellar.proxy.R.string.vm_routing_mode_applied, mode.wire),
             )
         }.onFailure {
+            if (expected != null && _routingMode.value != expected) {
+                // Superseded by a newer tap. Acting on this would undo a choice the user made
+                // after it, so it is reported where failures are diagnosed and nowhere else.
+                com.interstellar.proxy.core.AppLog.log(
+                    "ui",
+                    "routing mode $mode.wire failed after being superseded " +
+                        "(now ${_routingMode.value.wire}): ${it.message ?: ""}",
+                )
+                return@onFailure
+            }
             // Roll back ONLY a change the user just made. A reconcile failure has no previous
             // state to restore (the stored value is the intent, and the core may simply not be
             // ready for it), so it keeps the setting and reports.

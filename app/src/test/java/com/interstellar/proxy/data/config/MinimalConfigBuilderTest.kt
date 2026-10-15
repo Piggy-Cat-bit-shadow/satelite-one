@@ -242,6 +242,32 @@ class MinimalConfigBuilderTest {
         check(again == Json.parseToJsonElement(text)) { "the generated config does not round-trip" }
     }
 
+    /**
+     * Switching the routing mode must not need a config reload.
+     *
+     * The whole design rests on the mode being runtime state: the generator emits rules that
+     * match on the mode, never the mode itself. If a future change let the selected mode reach
+     * the generator (a mode-dependent `final`, a baked-in `detour`, a `default_mode`), then
+     * every mode switch would have to reload the service to take effect - which is exactly the
+     * defect the previous implementation shipped, and it would also mean `setRoutingMode`
+     * silently doing nothing until the next restart.
+     *
+     * Byte-for-byte equality is the assertion because anything weaker (equal rule counts, equal
+     * outbound tags) would not notice exactly that kind of injection.
+     */
+    @Test
+    fun `the generated config is identical whatever the ui mode is`() {
+        val baseline = MinimalConfigBuilder.build(nodes, MinimalConfigBuilder.BuildOptions())
+        // The mode is not a BuildOptions parameter at all - that is the point - so this is a
+        // negative assertion about the generator's surface, plus a guard on the output.
+        check(!MinimalConfigBuilder.BuildOptions::class.java.declaredFields.any { it.name.contains("mode", true) }) {
+            "BuildOptions grew a mode field: the mode must stay runtime state"
+        }
+        check(MinimalConfigBuilder.build(nodes, MinimalConfigBuilder.BuildOptions()) == baseline) {
+            "config generation is not deterministic"
+        }
+    }
+
     // ---- no app-side policy ----
 
     @Test

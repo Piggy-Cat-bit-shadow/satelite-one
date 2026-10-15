@@ -200,14 +200,48 @@ class RoutingModeWiringTest {
     }
 
     @Test
+    fun `a failing reconcile retries slowly instead of once a second`() {
+        // A failed reconcile re-arms `routingModeApplied`, which is right (otherwise one failure
+        // would mean "never applied for this core") but is not sufficient on its own: each
+        // attempt opens its own command socket, so a core that stays Started while the command
+        // path is unavailable would be dialed once per second for the life of the tunnel. The
+        // spacing is what makes the retry affordable, so it is bound here.
+        val body = code(bodyOf(viewModelSource, "private fun reconcileRoutingMode()"))
+        assertTrue(
+            "`reconcileRoutingMode` no longer rate-limits its retries, so a persistent failure " +
+                "re-opens a command socket on every 1 Hz status tick",
+            body.contains("ROUTING_MODE_RETRY_AFTER_NANOS"),
+        )
+        // The interval must be an elapsed-time measurement. `currentTimeMillis` would let a
+        // wall-clock correction shorten the window, which is the one thing a backoff must not
+        // allow.
+        assertTrue(
+            "`reconcileRoutingMode` measures its interval on the wall clock instead of a " +
+                "monotonic source",
+            body.contains("System.nanoTime()") && !body.contains("System.currentTimeMillis()"),
+        )
+        assertTrue(
+            "the retry interval is declared but no longer bounds anything",
+            viewModelCode.contains("ROUTING_MODE_RETRY_AFTER_NANOS ="),
+        )
+    }
+
+    @Test
     fun `a fresh core is allowed to be told again`() {
         // Same ownership rule as selectionRestoreAttempted, reset in the same place: a new core
-        // is a new runtime, and a guard left set across a restart would skip the re-assert.
+        // is a new runtime, and a guard left set across a restart would skip the re-assert. The
+        // backoff timestamp is reset with it, so a core that starts within the retry window is
+        // still told immediately rather than waiting out the previous core's backoff.
         val body = code(bodyOf(viewModelSource, "private fun markStopped()"))
         assertTrue(
             "`markStopped` no longer clears routingModeApplied, so after the first stop/start " +
                 "the routing mode would never be re-applied to the new core",
             body.contains("routingModeApplied = false"),
+        )
+        assertTrue(
+            "`markStopped` no longer clears the retry timestamp, so a restart inside the backoff " +
+                "window would leave the new core on the kernel's own cached mode",
+            body.contains("routingModeLastAttemptNanos = 0L"),
         )
     }
 
@@ -226,6 +260,90 @@ class RoutingModeWiringTest {
             "a failed reconcile no longer re-arms the guard, so the mode would never be " +
                 "retried for the life of that core",
             apply.contains("routingModeApplied = false"),
+        )
+    }
+
+    // --- rapid taps: the late failure of an abandoned tap ------------------------------------
+
+    @Test
+    fun `a superseded failure cannot roll back the mode the user moved on to`() {
+        // Rapid taps leave two RPCs in flight, and the FIRST can fail after the second has
+        // already published a newer mode - a dial that waits for the command socket and then
+        // loses it is enough. Rolling back on that late failure would restore the abandoned
+        // mode *after* the newer SetClashMode succeeded, so the dashboard and the stored
+        // intent would show one mode while the core ran another. This is the defect that
+        // makes "quick switching" worse than slow switching, so the staleness check is bound.
+        val apply = code(bodyOf(viewModelSource, "private suspend fun applyRoutingMode("))
+        // Parameters are part of the SIGNATURE, not the body: `bodyOf` starts at the opening
+        // brace, so a parameter check has to read the declaration instead. (This file already
+        // made that mistake once, on RoutingModeSelector.)
+        val signature = viewModelSource
+            .substringAfter("private suspend fun applyRoutingMode(")
+            .substringBefore(") {")
+        assertTrue(
+            "`applyRoutingMode` no longer takes the mode the UI is expecting, so a failure " +
+                "carrying a superseded mode is indistinguishable from a current one. " +
+                "Signature was: $signature",
+            signature.contains("expected: RoutingMode?"),
+        )
+        assertTrue(
+            "`applyRoutingMode` no longer compares the failing mode against the CURRENT " +
+                "selection, so a late failure undoes a newer choice",
+            apply.contains("_routingMode.value != expected"),
+        )
+        // The stale branch must return before the rollback, not after it.
+        val staleGuard = apply.indexOf("_routingMode.value != expected")
+        val rollback = apply.indexOf("Settings.routingMode = previous.wire")
+        assertTrue(
+            "the staleness guard sits after the rollback, which makes it decorative: the " +
+                "abandoned mode has already been restored by the time it is consulted",
+            staleGuard >= 0 && rollback > staleGuard,
+        )
+    }
+
+    @Test
+    fun `a user change hands the send its own mode as the staleness token`() {
+        // The token must be the mode just selected. Passing `previous` instead would invert the
+        // guard: a failure would be honoured exactly when the user has already moved on, which
+        // is the case it exists to discard.
+        val body = code(bodyOf(viewModelSource, "fun setRoutingMode("))
+        assertTrue(
+            "`setRoutingMode` no longer marks the user's send with the mode being selected",
+            body.contains("expected = mode"),
+        )
+    }
+
+    @Test
+    fun `the reconcile reports without rolling anything back`() {
+        // A reconcile has no earlier state to restore - the stored value IS the user's intent -
+        // so it must not carry a staleness token either, or a reconcile that fails while the
+        // user is choosing a new mode would be dropped and never retried.
+        val body = code(bodyOf(viewModelSource, "private fun reconcileRoutingMode()"))
+        assertTrue(
+            "the reconcile no longer disables the staleness check",
+            body.contains("expected = null"),
+        )
+        assertTrue(
+            "the reconcile no longer disables rollback",
+            body.contains("previous = null"),
+        )
+    }
+
+    @Test
+    fun `mode commands cannot interleave on the one command socket`() {
+        // The staleness check decides WHICH failures matter; it cannot make the core apply the
+        // taps in order. Rapid taps otherwise race on a single command socket, so the mode the
+        // core ends on could be the second-to-last one the user tapped.
+        val apply = code(bodyOf(viewModelSource, "private suspend fun applyRoutingMode("))
+        assertTrue(
+            "the clash-mode RPC is no longer serialised, so concurrent sends can reach the " +
+                "core out of the order the user tapped them in",
+            apply.contains("routingModeSend.withLock"),
+        )
+        assertTrue(
+            "the RPC must be INSIDE the lock; wrapping only the surrounding work would not " +
+                "order the calls themselves",
+            apply.indexOf("routingModeSend.withLock") < apply.indexOf("setClashMode(mode.wire)"),
         )
     }
 
