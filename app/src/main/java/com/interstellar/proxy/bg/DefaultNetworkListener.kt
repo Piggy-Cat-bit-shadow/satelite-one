@@ -11,6 +11,7 @@ package com.interstellar.proxy.bg
 
 import android.annotation.TargetApi
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
@@ -123,6 +124,19 @@ object DefaultNetworkListener {
             runBlocking { networkActor.send(NetworkMessage.Update(network)) }
         }
 
+        /**
+         * Address, route and DNS changes arrive here, not through onCapabilitiesChanged.
+         *
+         * A Wi-Fi that reassociates on the same interface name can keep the same Network object and
+         * the same capabilities while its LinkProperties (IPv4 address, DNS servers, default route)
+         * change. Without this override the core would keep the old index and the old environment
+         * fingerprint until something unrelated happened to fire, so the transition would be missed
+         * on exactly the roam this listener exists to follow.
+         */
+        override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+            runBlocking { networkActor.send(NetworkMessage.Update(network)) }
+        }
+
         override fun onLost(network: Network) = runBlocking {
             networkActor.send(NetworkMessage.Lost(network))
         }
@@ -133,10 +147,11 @@ object DefaultNetworkListener {
         NetworkRequest.Builder().apply {
             addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
-            if (Build.VERSION.SDK_INT == 23) {
-                removeCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-                removeCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL)
-            }
+            // VALIDATED is what distinguishes "has an IP stack" from "reaches the internet". A
+            // captive-portal or no-internet Wi-Fi advertises INTERNET but not VALIDATED, and treating
+            // it as usable kept the tunnel pointed at the dead link during exactly the handover this
+            // request is meant to follow. minSdk is 24, so the capability is always available.
+            addCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
         }.build()
     private val mainHandler = Handler(Looper.getMainLooper())
 

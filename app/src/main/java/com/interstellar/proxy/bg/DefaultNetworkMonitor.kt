@@ -65,14 +65,35 @@ object DefaultNetworkMonitor {
         InterstellarApplication.connectivity.getNetworkCapabilities(network)
             ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
 
+    /**
+     * A network the tunnel can actually use, not merely one that has an IP stack.
+     *
+     * INTERNET is advertised by a captive portal and by a Wi-Fi whose upstream is gone; VALIDATED is
+     * the system's own "this reaches the internet" answer. Treating the former as usable kept
+     * [defaultNetwork] pointed at a dead Wi-Fi during exactly the Wi-Fi-to-cellular handover this
+     * object exists to follow. minSdk is 24, so VALIDATED is always available.
+     */
+    private fun isUsable(network: Network): Boolean {
+        if (isVpn(network)) return false
+        val capabilities =
+            InterstellarApplication.connectivity.getNetworkCapabilities(network) ?: return false
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    }
+
     private fun physicalNetwork(): Network? {
         val cm = InterstellarApplication.connectivity
-        cm.activeNetwork?.let { if (!isVpn(it)) return it }
-        return cm.allNetworks.firstOrNull { network ->
-            !isVpn(network) &&
-                cm.getNetworkCapabilities(network)
-                    ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+        val active = cm.activeNetwork
+        if (active != null && !isVpn(active)) {
+            // The system default is the network a protected socket will actually use. If it exists
+            // but is not usable, the honest answer is "no network": picking a different, validated
+            // network here would tell the core to bind to cellular while the system still routes
+            // every protected socket over the unvalidated Wi-Fi. The default will move on its own.
+            return if (isUsable(active)) active else null
         }
+        // No physical default visible (or the default is our own VPN): the fallback may use any
+        // validated physical network, because there is no competing system default to contradict it.
+        return cm.allNetworks.firstOrNull { isUsable(it) }
     }
 
     /**
@@ -86,8 +107,12 @@ object DefaultNetworkMonitor {
      */
     suspend fun start(owner: Any) {
         DefaultNetworkListener.start(owner) { network ->
-            if (network != null && isVpn(network)) return@start
-            publishDefaultNetwork(network ?: physicalNetwork())
+            // A delivery for our own VPN or for an unusable network is not an answer about the
+            // physical path: resolve one instead of keeping a stale default. Returning early here
+            // (the previous behaviour) left `defaultNetwork` naming a network the callback had just
+            // told us is not the one in use.
+            val physical = if (network != null && isUsable(network)) network else physicalNetwork()
+            publishDefaultNetwork(physical)
         }
         defaultNetwork = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             physicalNetwork()
