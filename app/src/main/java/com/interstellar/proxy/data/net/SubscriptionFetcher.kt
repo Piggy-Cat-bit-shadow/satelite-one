@@ -10,7 +10,8 @@ import java.util.concurrent.TimeUnit
 
 /**
  * Downloads subscription content, ported from interstellar-proxy's services/import.rs:
- * UA masquerades as clash-verge so panels return the subscription-userinfo header.
+ * the request carries the stable `sing-box/1.15.0` identity so panels can recognise
+ * the subscription client.
  *
  * When the core is running, requests go through the local mixed inbound
  * (127.0.0.1:2080) so they ride the selected node; falls back to direct.
@@ -188,5 +189,5 @@ object SubscriptionFetcher {
         return s.trim()
     }
 
-    private const val USER_AGENT = "Jiejiebox/0.5 clash-verge/v2.5 flclash/1 Android"
+    private const val USER_AGENT = "sing-box/1.15.0"
 }

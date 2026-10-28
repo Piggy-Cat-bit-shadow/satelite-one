@@ -38,7 +38,7 @@ UI 采用「航空航天玻璃 + 任务控制台」设计语言：深空底色�
 ### 订阅
 
 - **多格式导入**：Clash YAML / 分享链接（ss·vmess·vless·trojan·hysteria2·tuic·anytls…）/ Base64 自动嗅探
-- **导入体验**：URL（伪装 clash-verge UA，解析 `subscription-userinfo`）/ 文本导入，
+- **导入体验**：URL（使用 `sing-box/1.15.0` UA，解析 `subscription-userinfo`）/ 文本导入，
   进行中显示进度条且可取消，失败原因在对话框内直接展示并保留输入
 - **流量与到期**：`Subscription-Userinfo` 的 upload / download / total / expire 按订阅分别保存，
   首页与订阅页显示已用 / 剩余 / 总量与到期日；缺 header、缺 total、缺 expire 或格式异常时优雅降级
