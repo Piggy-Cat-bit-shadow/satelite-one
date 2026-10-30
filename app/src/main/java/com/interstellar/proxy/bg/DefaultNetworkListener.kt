@@ -145,17 +145,39 @@ object DefaultNetworkListener {
     private var fallback = false
     private val request =
         NetworkRequest.Builder().apply {
-            addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
-            // VALIDATED is what distinguishes "has an IP stack" from "reaches the internet". A
-            // captive-portal or no-internet Wi-Fi advertises INTERNET but not VALIDATED, and treating
-            // it as usable kept the tunnel pointed at the dead link during exactly the handover this
-            // request is meant to follow. minSdk is 24, so the capability is always available.
-            addCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+            DefaultNetworkRequestCapabilities.values.forEach { addCapability(it) }
         }.build()
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    /**
+     * Register the callback, and never let a refusal take the process down.
+     *
+     * This body runs inside [networkActor], which is a `GlobalScope` coroutine: an exception thrown
+     * here is caught by the coroutine machinery and delivered to the uncaught-exception handler, not
+     * to whichever caller happened to send the `Start` message. `BoxService.startService`'s
+     * `try { ... } catch (e: Exception)` around `DefaultNetworkMonitor.start` therefore cannot see
+     * it - the process is killed instead of the start being abandoned.
+     *
+     * That is exactly what a rejected request did: `ConnectivityService` refuses a request that names
+     * a capability it reserves for its own classification, and the resulting
+     * `IllegalArgumentException` crashed the app the moment the VPN was switched on. The request no
+     * longer names one, and this catch is the second line of defence: an unexpected refusal degrades
+     * the monitor to [fallback] (the active network) with a log line, and the tunnel still starts.
+     */
     private fun register() {
+        try {
+            registerRequest()
+        } catch (e: Exception) {
+            fallback = true
+            android.util.Log.e(
+                "InterstellarUI",
+                "default network registration failed; falling back to the active network",
+                e,
+            )
+        }
+    }
+
+    private fun registerRequest() {
         when (Build.VERSION.SDK_INT) {
             in 31..Int.MAX_VALUE ->
                 @TargetApi(31)
@@ -200,4 +222,33 @@ object DefaultNetworkListener {
             InterstellarApplication.connectivity.unregisterNetworkCallback(Callback)
         }
     }
+}
+
+/**
+ * The capabilities the default-network request is allowed to ask the framework for.
+ *
+ * ## A request is not a capability check
+ *
+ * `VALIDATED` is what separates "has an IP stack" from "reaches the internet", and the monitor still
+ * requires it - but it must be *read from the callback* (`NetworkCapabilities.hasCapability`), never
+ * *requested*. `ConnectivityService.ensureRequestableCapabilities` rejects a `NetworkRequest` that
+ * names a capability reserved for the platform's own classification:
+ *
+ *     java.lang.IllegalArgumentException: Cannot request network with VALIDATED
+ *         at android.net.IConnectivityManager$Stub$Proxy.requestNetwork
+ *         at android.net.ConnectivityManager.registerBestMatchingNetworkCallback
+ *
+ * Requesting it crashed the process on every VPN start from 0.1.28 on, on every Android that takes
+ * the request path (API 28+). `CAPTIVE_PORTAL` is reserved by the same rule, so it is pinned out here
+ * too: the point is not the two names, it is that this list stays requestable.
+ *
+ * `INTERNET` keeps the callback on networks that have an IP stack at all; `NOT_RESTRICTED` keeps it on
+ * networks the profile may use. Both are documented requestable capabilities.
+ */
+internal object DefaultNetworkRequestCapabilities {
+    val values: IntArray =
+        intArrayOf(
+            NetworkCapabilities.NET_CAPABILITY_INTERNET,
+            NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED,
+        )
 }
