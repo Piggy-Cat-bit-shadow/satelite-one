@@ -170,7 +170,7 @@ object SubscriptionRepository {
     }
 
     @Synchronized
-    fun upsert(subscription: Subscription) {
+    fun upsert(subscription: Subscription, regenerate: Boolean = true) {
         val index = subscriptions.indexOfFirst { it.id == subscription.id }
         if (index >= 0) {
             subscriptions[index] = subscription
@@ -179,7 +179,9 @@ object SubscriptionRepository {
         }
         if (activeSubscriptionId.isBlank()) activeSubscriptionId = subscription.id
         save()
-        if (affectsActivePool(subscription.id, activeSubscriptionId, Settings.mixEnabled, Settings.mixSubscriptionIds)) {
+        if (regenerate &&
+            affectsActivePool(subscription.id, activeSubscriptionId, Settings.mixEnabled, Settings.mixSubscriptionIds)
+        ) {
             regenerateActiveConfig()
         }
     }
@@ -424,7 +426,7 @@ object SubscriptionRepository {
      * Fetches a URL subscription and updates the store.
      * Returns a user-facing message, or null when the sub is not refreshable.
      */
-    suspend fun refresh(id: String): String? = withContext(Dispatchers.IO) {
+    suspend fun refresh(id: String, regenerate: Boolean = true): String? = withContext(Dispatchers.IO) {
         val sub = get(id) ?: return@withContext null
         val url = sub.url ?: return@withContext str(com.interstellar.proxy.R.string.vm_local_no_refresh)
         try {
@@ -441,6 +443,7 @@ object SubscriptionRepository {
                             expireSeconds = result.expireSeconds,
                             lastUpdated = System.currentTimeMillis(),
                         ),
+                        regenerate = regenerate,
                     )
                     commit.error
                 }
@@ -459,6 +462,7 @@ object SubscriptionRepository {
                                     expireSeconds = result.expireSeconds,
                                     lastUpdated = System.currentTimeMillis(),
                                 ),
+                                regenerate = regenerate,
                             )
                             str(com.interstellar.proxy.R.string.repo_refreshed, sub.name, parsed.nodes.size)
                         }
@@ -477,6 +481,7 @@ object SubscriptionRepository {
                                         expireSeconds = result.expireSeconds,
                                         lastUpdated = System.currentTimeMillis(),
                                     ),
+                                    regenerate = regenerate,
                                 )
                                 str(
                                     com.interstellar.proxy.R.string.repo_refreshed_raw,
@@ -495,8 +500,8 @@ object SubscriptionRepository {
     }
 
     /** Refreshes every URL subscription, keeping the selected node when possible. */
-    suspend fun refreshAll(): List<String> = withContext(Dispatchers.IO) {
-        subscriptions.filter { it.url != null }.map { refresh(it.id) }.filterNotNull()
+    suspend fun refreshAll(regenerate: Boolean = true): List<String> = withContext(Dispatchers.IO) {
+        subscriptions.filter { it.url != null }.map { refresh(it.id, regenerate) }.filterNotNull()
     }
 
     fun selectNode(nodeId: String) {

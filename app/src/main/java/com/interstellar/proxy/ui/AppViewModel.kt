@@ -1212,27 +1212,28 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Starts the core from whatever config is on disk, without regenerating it. */
     private suspend fun startStoredConfig(): Boolean {
-        if (_status.value == Status.Started) return true
         val content = ConfigStore.readActiveConfig() ?: return false
         if (content.isBlank()) return false
-        _status.value = Status.Starting
-        armStartingWatchdog(STARTING_TIMEOUT_MS)
-        com.interstellar.proxy.bg.BoxService.start()
-        if (uiLifetime.wantsClient()) {
-            runCatching { commandClient.connect() }
-        }
+        // A failed reload already released the old Box (`stopAndAlert`), and the status may not have
+        // converged to Stopped yet - so "looks started" is not evidence that anything is running.
+        // The applied revision is: only the restore path reaches here with a mismatch.
+        if (CoreRuntime.appliedConfigRevision == ConfigStore.activeConfigRevision()) return true
+        // Reuse the production start path: it sets Starting, arms the watchdog, starts the service,
+        // connects the UI client and lets the binder promote Starting -> Started.
+        startProxy()
         var waited = 0L
-        while (waited < 20_000) {
-            delay(200)
-            waited += 200
-            when (_status.value) {
-                Status.Started -> return true
-                Status.Stopped -> return false
-                else -> Unit
-            }
+        while (waited < 25_000) {
+            delay(250)
+            waited += 250
+            if (_status.value == Status.Started) return true
+            if (waited > 4_000 && _status.value == Status.Stopped) return false
         }
         return false
     }
+
+    /** True when the live Box is serving exactly [revision] and no later write moved past it. */
+    private fun servingCommittedRevision(revision: Long): Boolean =
+        ConfigStore.activeConfigRevision() == revision && CoreRuntime.appliedConfigRevision == revision
 
     /**
      * Applies the active config a manual update just regenerated.
@@ -1276,10 +1277,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     if (restored) ActiveConfigOutcome.Restored else ActiveConfigOutcome.Failed
                 }
 
-                // The Box was replaced between the write and the reload: the reload reached an
-                // instance that no longer owns this result, so it is not reported as applied here.
+                // The reload itself replaces the kernel Box, so ownership is judged by what the
+                // live instance is SERVING: this exact revision. A third write or reload between
+                // our request and its completion makes it stale, and it is not reported as applied.
                 is ReloadOutcome.Applied ->
-                    if (!SubscriptionUpdateCoordinator.stillOwns(start, instanceSnapshot(), expectedRevision)) {
+                    if (!servingCommittedRevision(outcome.revision)) {
                         ActiveConfigOutcome.Superseded
                     } else {
                         ActiveConfigOutcome.Reloaded
@@ -1296,9 +1298,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun refreshProvidersNow(timeoutMilliseconds: Long = 30_000): ProviderRefreshSummary? {
         if (_status.value != Status.Started) return null
         return runCatching {
-            ProviderRefresh.parse(
-                CommandTarget.standaloneClient().refreshRemoteProviders("", timeoutMilliseconds).value,
-            )
+            val raw = CommandTarget.standaloneClient().refreshRemoteProviders("", timeoutMilliseconds).value
+            // The raw summary is the only record of what the kernel actually decided (statuses,
+            // pending tags, restartRequired); it is kept for diagnostics on the app's log page.
+            com.interstellar.proxy.core.AppLog.log("provider", "refresh result: $raw")
+            ProviderRefresh.parse(raw)
         }.getOrNull()
     }
 
@@ -1396,17 +1400,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
         var providerHalf: Pair<String, UiToast.Kind>? = null
         if (report.providers) {
-            // Re-check ownership at the RPC boundary: between the config half and this call the
-            // user may have switched profile, stopped the core, or changed the mix pool.
-            val owns = SubscriptionUpdateCoordinator.stillOwns(
-                start,
-                instanceSnapshot(),
-                ConfigStore.activeConfigRevision(),
-            )
-            providerHalf = if (owns) {
-                providerMessage(refreshProvidersNow())
-            } else {
-                str(com.interstellar.proxy.R.string.vm_provider_superseded) to UiToast.Kind.Error
+            // A restore is part of THIS operation: it rewrote the active config (back to the last
+            // good one) and restarted the core, so the revision the provider RPC has to match is the
+            // restored one, not the one the failed reload was asked for.
+            val providerRevision =
+                if (configOutcome == ActiveConfigOutcome.Restored) ConfigStore.activeConfigRevision() else expectedRevision
+            // The provider RPC must reach the instance that is serving the revision this operation
+            // committed: a different revision means another write or reload happened in between, and
+            // a stopped core is "unavailable" rather than "superseded".
+            providerHalf = when {
+                _status.value != Status.Started -> providerMessage(refreshProvidersNow())
+                !servingCommittedRevision(providerRevision) ->
+                    str(com.interstellar.proxy.R.string.vm_provider_superseded) to UiToast.Kind.Error
+                else -> providerMessage(refreshProvidersNow())
             }
         }
 
@@ -2052,6 +2058,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                 expireSeconds = result.expireSeconds,
                                 lastUpdated = System.currentTimeMillis(),
                             ),
+                            regenerate = false,
                         )
                     }
 
@@ -2069,6 +2076,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                         expireSeconds = result.expireSeconds,
                                         lastUpdated = System.currentTimeMillis(),
                                     ),
+                                    regenerate = false,
                                 )
                                 updated = true
                             }
@@ -2084,6 +2092,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                             expireSeconds = result.expireSeconds,
                                             lastUpdated = System.currentTimeMillis(),
                                         ),
+                                        regenerate = false,
                                     )
                                     updated = true
                                 } else {
@@ -2108,24 +2117,38 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
             // The revision this operation committed (unchanged when it committed nothing): a later
             // writer moves past it and makes this result stale, even under the same profile id.
-            val expectedRevision = ConfigStore.activeConfigRevision()
-            val owns = SubscriptionUpdateCoordinator.ownsInstance(
+            var owns = SubscriptionUpdateCoordinator.ownsInstance(
                 affectsActive,
                 start,
                 instanceSnapshot(),
-                expectedRevision,
+                ConfigStore.activeConfigRevision(),
             )
             if (affectsActive && !owns) {
+                // Nothing was written to the active config: the subscription's bytes are stored, but
+                // the disk still describes the instance that actually ran (the violation this check
+                // exists for was a write that happened BEFORE it).
                 showToast(
                     str(com.interstellar.proxy.R.string.vm_update_superseded, sub.name),
                     UiToast.Kind.Error,
                 )
                 return@launch
             }
+            if (owns && affectsActive && updated) {
+                // Commit the new active config only now that this attempt is known to own the live
+                // instance; a result that lost it must not leave the file ahead of the Box.
+                SubscriptionRepository.regenerateActiveConfig()
+                commitError = commitError ?: SubscriptionRepository.takeConfigError()
+                owns = SubscriptionUpdateCoordinator.stillOwns(
+                    start,
+                    instanceSnapshot(),
+                    ConfigStore.activeConfigRevision(),
+                )
+            }
+            val expectedRevision = ConfigStore.activeConfigRevision()
             val report = SubscriptionUpdateCoordinator.report(
                 owns,
                 configUpdated = updated,
-                configError = commitError ?: if (updated) SubscriptionRepository.takeConfigError() else null,
+                configError = commitError,
             )
             if (report.providers || report.configError != null) {
                 reportManualUpdateOutcome(
@@ -2201,6 +2224,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                                     expireSeconds = result.expireSeconds,
                                                     lastUpdated = System.currentTimeMillis(),
                                                 ),
+                                                regenerate = false,
                                             )
                                             refusals.add(commit.error)
                                             false
@@ -2220,6 +2244,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                                             expireSeconds = result.expireSeconds,
                                                             lastUpdated = System.currentTimeMillis(),
                                                         ),
+                                                        regenerate = false,
                                                     )
                                                     true
                                                 }
@@ -2235,6 +2260,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                                                 expireSeconds = result.expireSeconds,
                                                                 lastUpdated = System.currentTimeMillis(),
                                                             ),
+                                                            regenerate = false,
                                                         )
                                                         true
                                                     } else {
@@ -2259,23 +2285,33 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 _activeSubscriptionId.value = SubscriptionRepository.activeSubscriptionId
             }
             // Same ownership rule as the single-item update: a batch whose result is appended after
-            // another profile became active may keep the downloaded bytes, but must not reload or
-            // refresh the instance that profile owns.
-            val expectedRevision = ConfigStore.activeConfigRevision()
-            val owns = SubscriptionUpdateCoordinator.ownsInstance(
+            // another profile became active may keep the downloaded bytes, but must not rewrite the
+            // active config, reload, or refresh the instance that profile owns.
+            var owns = SubscriptionUpdateCoordinator.ownsInstance(
                 affectsActive,
                 start,
                 instanceSnapshot(),
-                expectedRevision,
+                ConfigStore.activeConfigRevision(),
             )
             if (affectsActive && !owns) {
                 showToast(str(com.interstellar.proxy.R.string.vm_update_all_superseded), UiToast.Kind.Error)
                 return@launch
             }
+            var configError = refusals.firstOrNull()
+            if (owns && affectsActive && ok > 0) {
+                SubscriptionRepository.regenerateActiveConfig()
+                configError = configError ?: SubscriptionRepository.takeConfigError()
+                owns = SubscriptionUpdateCoordinator.stillOwns(
+                    start,
+                    instanceSnapshot(),
+                    ConfigStore.activeConfigRevision(),
+                )
+            }
+            val expectedRevision = ConfigStore.activeConfigRevision()
             val report = SubscriptionUpdateCoordinator.report(
                 owns,
                 configUpdated = ok > 0,
-                configError = refusals.firstOrNull(),
+                configError = configError,
             )
             if (report.providers || report.configError != null) {
                 reportManualUpdateOutcome(

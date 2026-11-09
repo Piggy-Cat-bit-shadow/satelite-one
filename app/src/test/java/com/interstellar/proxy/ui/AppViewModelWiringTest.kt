@@ -676,7 +676,7 @@ class AppViewModelWiringTest {
         )
         assertInBody(
             "fun refreshSubscription(",
-            "configError = commitError ?:",
+            "configError = commitError,",
             "`refreshSubscription()` no longer carries the refusal into the report.",
         )
         assertInBody(
@@ -686,8 +686,27 @@ class AppViewModelWiringTest {
         )
         assertInBody(
             "fun refreshAll()",
-            "configError = refusals.firstOrNull(),",
+            "configError = configError,",
             "`refreshAll()` no longer carries the refusal into the report.",
+        )
+        // The write must come AFTER the ownership check: writing first is what let a late result
+        // leave the file (and the next start) describing a different profile than the live Box.
+        val single = bodyOf("fun refreshSubscription(")
+        val ownsSingle = single.indexOf("ownsInstance(")
+        val commitSingle = single.indexOf("SubscriptionRepository.regenerateActiveConfig()")
+        assertTrue("`refreshSubscription()` no longer defers the active-config commit", commitSingle >= 0)
+        assertTrue(
+            "`refreshSubscription()` commits the active config before it checks ownership, so a late " +
+                "result rewrites active.json for an instance it no longer owns.",
+            ownsSingle < commitSingle,
+        )
+        val batch = bodyOf("fun refreshAll()")
+        val ownsBatch = batch.indexOf("ownsInstance(")
+        val commitBatch = batch.indexOf("SubscriptionRepository.regenerateActiveConfig()")
+        assertTrue("`refreshAll()` no longer defers the active-config commit", commitBatch >= 0)
+        assertTrue(
+            "`refreshAll()` commits the active config before it checks ownership.",
+            ownsBatch < commitBatch,
         )
     }
 

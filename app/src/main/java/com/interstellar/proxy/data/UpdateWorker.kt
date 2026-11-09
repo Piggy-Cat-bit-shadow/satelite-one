@@ -25,26 +25,34 @@ class UpdateWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         // batch it committed is only applied while its revision is still the current one.
         val start = instanceSnapshot()
         val activeBefore = ConfigStore.readActiveConfig()
-        val messages = SubscriptionRepository.refreshAll()
-        // Same contract as a manual update: only a changed active config needs a
-        // hot-reload, while the provider refresh runs even when the body did not
-        // change (a remote document may have).
-        val changed = SubscriptionUpdateCoordinator.configChanged(
-            activeBefore,
-            ConfigStore.readActiveConfig(),
+        val messages = SubscriptionRepository.refreshAll(regenerate = false)
+        var owns = SubscriptionUpdateCoordinator.stillOwns(
+            start,
+            instanceSnapshot(),
+            ConfigStore.activeConfigRevision(),
         )
-        val expectedRevision = ConfigStore.activeConfigRevision()
-        val owns = SubscriptionUpdateCoordinator.stillOwns(start, instanceSnapshot(), expectedRevision)
         android.util.Log.i(
             "InterstellarUI",
-            "UpdateWorker: gen=${start.engineGeneration} rev=$expectedRevision changed=$changed " +
-                "messages=${messages.size} owns=$owns",
+            "UpdateWorker: gen=${start.engineGeneration} messages=${messages.size} owns=$owns",
         )
         if (!owns) {
             android.util.Log.i("InterstellarUI", "UpdateWorker: result superseded by a newer instance")
             return Result.success()
         }
         if (messages.isEmpty() || !Settings.tileActive) return Result.success()
+        // Commit the fetched bytes only after the ownership check, then decide whether the config
+        // actually changed; only a changed config needs a hot reload.
+        SubscriptionRepository.regenerateActiveConfig()
+        val changed = SubscriptionUpdateCoordinator.configChanged(
+            activeBefore,
+            ConfigStore.readActiveConfig(),
+        )
+        val expectedRevision = ConfigStore.activeConfigRevision()
+        owns = SubscriptionUpdateCoordinator.stillOwns(start, instanceSnapshot(), expectedRevision)
+        if (!owns) {
+            android.util.Log.i("InterstellarUI", "UpdateWorker: commit superseded; nothing applied")
+            return Result.success()
+        }
         if (changed) {
             val rpc = runCatching { CommandTarget.standaloneClient().serviceReload() }
             val verdict = BoxService.lastReload

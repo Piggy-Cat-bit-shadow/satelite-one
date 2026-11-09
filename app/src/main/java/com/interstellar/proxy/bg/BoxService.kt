@@ -415,6 +415,11 @@ class BoxService(private val service: Service, private val platformInterface: Pl
     suspend fun serviceReload0() {
         val content = ConfigStore.readActiveConfig()
         val revision = ConfigStore.activeConfigRevision()
+        // A reload replaces the kernel Box even when the bytes are identical
+        // (`daemon.StartedService.StartOrReloadService` closes the old instance before building the
+        // next), so this IS a new engine generation: a result started against the previous instance
+        // must not act on this one, and A -> B -> A must not pass an id-only ownership check.
+        CoreRuntime.onEngineStarted()
         if (content == null) {
             recordReload(
                 ReloadVerdict(false, "empty configuration", revision, CoreRuntime.engineGeneration, System.currentTimeMillis()),
