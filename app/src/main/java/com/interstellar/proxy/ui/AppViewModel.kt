@@ -1125,6 +1125,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         val counts = ProviderRefresh.counts(summary)
+        if (counts.total == 0) {
+            showToast(str(com.interstellar.proxy.R.string.vm_provider_none), UiToast.Kind.Success)
+            return
+        }
         showToast(
             str(
                 com.interstellar.proxy.R.string.vm_provider_summary,
