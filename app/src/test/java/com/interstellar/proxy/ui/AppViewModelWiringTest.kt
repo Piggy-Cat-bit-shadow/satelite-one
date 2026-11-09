@@ -552,4 +552,79 @@ class AppViewModelWiringTest {
         )
         assertTrue("`suspendUiClient()` consults the gate but no longer acts on its answer.", body.contains("return"))
     }
+
+    // --- the two results of an update are independent -----------------------------------------------
+
+    /**
+     * A subscription whose download fails must still refresh the running instance's providers.
+     *
+     * The defect this binds, measured on the emulator before the fix: `refreshSubscription` guarded
+     * the whole report on `updated`, so `HTTP 500` produced one error toast, no provider request
+     * reached the old provider's address, and the node-source half of the update disappeared
+     * entirely. The decision is therefore taken BEFORE the fetch, and the report takes it from
+     * [com.interstellar.proxy.data.SubscriptionUpdateCoordinator.report] rather than from `updated`.
+     */
+    @Test
+    fun `a failed download still reaches the provider half of a manual update`() {
+        val body = bodyOf("fun refreshSubscription(")
+        val decide = body.indexOf("affectsActiveConfig(")
+        val fetch = body.indexOf("SubscriptionFetcher.fetch(")
+        assertTrue("`refreshSubscription()` no longer decides whether the update affects the active pool", decide >= 0)
+        assertTrue("`refreshSubscription()` no longer fetches the subscription", fetch >= 0)
+        assertTrue(
+            "`refreshSubscription()` decides whether the update affects the active pool AFTER the fetch, " +
+                "so the decision can only be taken from a successful download - the failed-download " +
+                "branch returns without refreshing the instance that is still running.",
+            decide < fetch,
+        )
+        assertInBody(
+            "fun refreshSubscription(",
+            "SubscriptionUpdateCoordinator.report(affectsActive, configUpdated = updated)",
+            "`refreshSubscription()` no longer derives the reported halves from both the pool decision and " +
+                "the download result; tying them back to `updated` alone silences the provider refresh " +
+                "whenever the subscription download fails.",
+        )
+    }
+
+    @Test
+    fun `a batch in which every download failed still reports the provider half`() {
+        val body = bodyOf("fun refreshAll()")
+        val decide = body.indexOf("affectsActiveConfig(")
+        val launch = body.indexOf("coroutineScope {")
+        assertTrue("`refreshAll()` no longer decides whether the batch affects the active pool", decide >= 0)
+        assertTrue("`refreshAll()` no longer runs the batch", launch >= 0)
+        assertTrue(
+            "`refreshAll()` decides whether the batch affects the active pool after the fetches, so a " +
+                "batch whose downloads all failed is indistinguishable from one that touched nothing.",
+            decide < launch,
+        )
+        assertInBody(
+            "fun refreshAll()",
+            "SubscriptionUpdateCoordinator.report(affectsActive, configUpdated = ok > 0)",
+            "`refreshAll()` no longer separates the pool decision from the batch's success count, so a " +
+                "failed batch skips the provider refresh of the instance that is still running.",
+        )
+    }
+
+    /**
+     * The helper must keep the halves independent; collapsing them re-introduces the same defect one
+     * call deeper, where the call-site assertions above cannot see it.
+     */
+    @Test
+    fun `the outcome helper gates the config and provider halves separately`() {
+        val signature = "private suspend fun reportManualUpdateOutcome("
+        assertInBody(
+            signature,
+            "if (report.config)",
+            "the config half is reported unconditionally, so a failed download now claims a config " +
+                "result it never produced.",
+        )
+        assertInBody(
+            signature,
+            "if (report.providers)",
+            "the provider half is gated by something else than the pool decision - the failed-download " +
+                "branch stops refreshing the running instance's remote node sources.",
+        )
+    }
 }
+

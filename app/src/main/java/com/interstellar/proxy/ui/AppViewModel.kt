@@ -17,6 +17,7 @@ import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.data.SubscriptionRepository
 import com.interstellar.proxy.data.SubscriptionUpdateCoordinator
 import com.interstellar.proxy.data.SubscriptionUpdateCoordinator.ActiveConfigAction
+import com.interstellar.proxy.data.SubscriptionUpdateCoordinator.UpdateReport
 import com.interstellar.proxy.data.config.MinimalConfigBuilder
 import com.interstellar.proxy.data.model.RoutingMode
 import com.interstellar.proxy.data.net.SubscriptionFetcher
@@ -1143,17 +1144,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     /**
      * Reports the two outcomes of a manual update that touched the active pool:
-     * the config application and the provider refresh. Providers are refreshed
-     * even when the config bytes did not change, so an unchanged subscription
-     * still gets a fresh remote document.
+     * the config application and the provider refresh.
+     *
+     * The halves come from [UpdateReport], which keeps them independent: providers are refreshed
+     * for every attempt that targets the active pool, so an unchanged subscription — and a
+     * subscription whose download failed outright — still gets a fresh remote document on the
+     * instance that is actually running. A failure there is reported next to the subscription
+     * failure instead of replacing it.
      */
-    private suspend fun reportManualUpdateOutcome(activeBefore: String?) {
-        reportActiveConfig(applyActiveConfigIfChanged(activeBefore))
-        if (_status.value == Status.Started) {
-            reportProviders(refreshProvidersNow())
-        } else {
-            reportProviders(null)
-        }
+    private suspend fun reportManualUpdateOutcome(activeBefore: String?, report: UpdateReport) {
+        if (report.config) reportActiveConfig(applyActiveConfigIfChanged(activeBefore))
+        if (report.providers) reportProviders(refreshProvidersNow())
     }
 
     /** Re-reads whatever config is on disk (startup / core switch). */
@@ -1740,6 +1741,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             if (fromPull) _refreshing.value = true
             _busy.value = true
             val activeBefore = ConfigStore.readActiveConfig()
+            // Decided before the attempt, not from its result: a failed download leaves this
+            // subscription in the running instance's pool, and that instance's providers still
+            // need a refresh.
+            val affectsActive = SubscriptionUpdateCoordinator.affectsActiveConfig(
+                listOf(id),
+                SubscriptionRepository.activeSubscriptionId,
+                Settings.mixEnabled,
+                Settings.mixSubscriptionIds,
+            )
             var updated = false
             try {
                 val result = SubscriptionFetcher.fetch(url)
@@ -1789,16 +1799,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 _subscriptions.value = SubscriptionRepository.subscriptions.toList()
                 _activeSubscriptionId.value = SubscriptionRepository.activeSubscriptionId
             }
-            if (updated &&
-                SubscriptionUpdateCoordinator.affectsActiveConfig(
-                    listOf(id),
-                    SubscriptionRepository.activeSubscriptionId,
-                    Settings.mixEnabled,
-                    Settings.mixSubscriptionIds,
-                )
-            ) {
-                reportManualUpdateOutcome(activeBefore)
-            }
+            val report = SubscriptionUpdateCoordinator.report(affectsActive, configUpdated = updated)
+            if (report.providers) reportManualUpdateOutcome(activeBefore, report)
         }
     }
 
@@ -1813,6 +1815,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             _refreshing.value = true
             _busy.value = true
             val activeBefore = ConfigStore.readActiveConfig()
+            // Same rule as the single-item update: decided before the attempt, so a batch in which
+            // every download failed still refreshes the running instance's providers.
+            val affectsActive = SubscriptionUpdateCoordinator.affectsActiveConfig(
+                subs.map { it.id },
+                SubscriptionRepository.activeSubscriptionId,
+                Settings.mixEnabled,
+                Settings.mixSubscriptionIds,
+            )
             val semaphore = kotlinx.coroutines.sync.Semaphore(3)
             var ok = 0
             try {
@@ -1878,16 +1888,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 _subscriptions.value = SubscriptionRepository.subscriptions.toList()
                 _activeSubscriptionId.value = SubscriptionRepository.activeSubscriptionId
             }
-            if (ok > 0 &&
-                SubscriptionUpdateCoordinator.affectsActiveConfig(
-                    subs.map { it.id },
-                    SubscriptionRepository.activeSubscriptionId,
-                    Settings.mixEnabled,
-                    Settings.mixSubscriptionIds,
-                )
-            ) {
-                reportManualUpdateOutcome(activeBefore)
-            }
+            val report = SubscriptionUpdateCoordinator.report(affectsActive, configUpdated = ok > 0)
+            if (report.providers) reportManualUpdateOutcome(activeBefore, report)
         }
     }
 

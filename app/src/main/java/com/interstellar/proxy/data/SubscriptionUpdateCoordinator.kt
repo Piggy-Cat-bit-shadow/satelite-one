@@ -31,6 +31,29 @@ object SubscriptionUpdateCoordinator {
 
     fun configChanged(before: String?, after: String?): Boolean = before != after
 
+    /** Which halves of an update result are reported. */
+    data class UpdateReport(
+        /** The config half: apply/reload what the fetch regenerated. */
+        val config: Boolean,
+        /** The provider half: refresh the live instance's remote node sources. */
+        val providers: Boolean,
+    )
+
+    /**
+     * The two results of one update attempt, decided independently.
+     *
+     * The halves are deliberately not tied together: [affected] decides whether this attempt
+     * concerns the running instance at all, while [configUpdated] only decides whether there is a
+     * config to apply. A download that failed, or a body that could not be parsed, leaves the
+     * running instance on its previous config — and that instance's remote providers must still be
+     * refreshed, because the node sources and the subscription download are different failures.
+     * An attempt that cannot affect the active pool reports nothing.
+     */
+    fun report(affected: Boolean, configUpdated: Boolean): UpdateReport = UpdateReport(
+        config = affected && configUpdated,
+        providers = affected,
+    )
+
     enum class ActiveConfigAction {
         /** The bytes on disk did not change; nothing to reload. */
         None,
