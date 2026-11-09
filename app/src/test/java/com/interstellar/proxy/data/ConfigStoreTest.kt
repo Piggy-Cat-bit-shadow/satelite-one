@@ -7,7 +7,6 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import java.nio.file.Files
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * The two store invariants the reload path relies on.
@@ -77,38 +76,37 @@ class ConfigStoreTest {
     /**
      * The property the old two-read path violated. A writer alternates two documents while a reader
      * snapshots; every snapshot must carry the revision of the bytes it returned.
+     *
+     * The counts are deliberately small. Each write touches two files, and a tight writer on a
+     * hosted runner's overlay filesystem starved the reader for minutes (the first version used
+     * 2,000 iterations and took 28 minutes on CI). A few hundred interleavings still exercise the
+     * lock without turning a unit test into a disk benchmark.
      */
     @Test
     fun `a concurrent writer cannot split the bytes from the revision inside a snapshot`() {
         ConfigStore.writeActiveConfig("A", "a")
-        val stop = AtomicBoolean(false)
         val writer = Thread {
-            var i = 0
-            while (!stop.get()) {
+            repeat(300) { i ->
                 if (i % 2 == 0) ConfigStore.writeActiveConfig("A", "a") else ConfigStore.writeActiveConfig("B", "b")
-                i++
             }
         }
         writer.start()
-        try {
-            repeat(2_000) {
-                val snapshot = ConfigStore.snapshot()
-                val content = snapshot.content
-                assertTrue("snapshot returned no content while the file exists", content != null)
-                assertEquals(
-                    "snapshot paired ${content?.take(1)} with revision ${snapshot.meta.revision}",
-                    ConfigStore.sha256(content!!),
-                    snapshot.meta.sha256,
-                )
-                assertEquals(
-                    "owner does not belong to the bytes in the same snapshot",
-                    if (content == "A") "a" else "b",
-                    snapshot.meta.ownerSubscriptionId,
-                )
-            }
-        } finally {
-            stop.set(true)
-            writer.join(5_000)
+        repeat(500) {
+            val snapshot = ConfigStore.snapshot()
+            val content = snapshot.content
+            assertTrue("snapshot returned no content while the file exists", content != null)
+            assertEquals(
+                "snapshot paired ${content?.take(1)} with revision ${snapshot.meta.revision}",
+                ConfigStore.sha256(content!!),
+                snapshot.meta.sha256,
+            )
+            assertEquals(
+                "owner does not belong to the bytes in the same snapshot",
+                if (content == "A") "a" else "b",
+                snapshot.meta.ownerSubscriptionId,
+            )
         }
+        writer.join(10_000)
+        assertTrue("writer did not finish", !writer.isAlive)
     }
 }
