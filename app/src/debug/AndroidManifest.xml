@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- Debug builds only: lets a test harness enqueue UpdateWorker once.
+             Periodic WorkManager work cannot be forced before its schedule. -->
+        <receiver
+            android:name=".debug.DebugUpdateWorkerReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.interstellar.proxy.debug.RUN_UPDATE_WORKER" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
