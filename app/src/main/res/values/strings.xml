@@ -59,6 +59,7 @@
     <string name="vm_config_apply_failed">配置已写入，但热重载失败</string>
     <string name="vm_provider_summary">Provider：发布 %1$d，未变 %2$d，失败 %3$d，跳过 %4$d</string>
     <string name="vm_provider_none">Provider：当前配置没有远程 Provider</string>
+<string name="vm_provider_partial">Provider：发布 %1$d，未变 %2$d，失败 %3$d，跳过 %4$d；%5$d 个节点待生效，%6$d 个 Provider 需重启</string>
     <string name="vm_provider_cancelled">Provider 刷新已取消</string>
     <string name="vm_provider_box_changed">内核实例已更换，Provider 刷新中止</string>
     <string name="vm_provider_unavailable">Provider 刷新不可用（内核未运行或命令失败）</string>

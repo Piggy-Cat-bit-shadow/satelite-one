@@ -1130,6 +1130,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             showToast(str(com.interstellar.proxy.R.string.vm_provider_none), UiToast.Kind.Success)
             return
         }
+        // A document the live graph refused comes back as `published` with pending tags and
+        // `restartRequired`; counting only `published` would present it as a clean success.
+        if (ProviderRefresh.partlyApplied(counts)) {
+            showToast(
+                str(
+                    com.interstellar.proxy.R.string.vm_provider_partial,
+                    counts.published,
+                    counts.unchanged,
+                    counts.failed,
+                    counts.skipped,
+                    counts.pendingTags,
+                    counts.restartRequired,
+                ),
+                UiToast.Kind.Error,
+            )
+            return
+        }
         showToast(
             str(
                 com.interstellar.proxy.R.string.vm_provider_summary,

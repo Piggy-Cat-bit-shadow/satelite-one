@@ -553,6 +553,35 @@ class AppViewModelWiringTest {
         assertTrue("`suspendUiClient()` consults the gate but no longer acts on its answer.", body.contains("return"))
     }
 
+    /**
+     * A refresh the live graph only partly accepted must not be shown as a clean success.
+     *
+     * The core reports that case as `published` plus `pendingTags`/`restartRequired`, so a client
+     * that only counts statuses prints "1 published, 0 failed" for a document whose group kept its
+     * previous members — invisible failure, which the original acceptance forbids.
+     */
+    @Test
+    fun `a partly applied provider refresh is reported before the plain summary`() {
+        val body = code(bodyOf("private fun reportProviders("))
+        val partial = body.indexOf("partlyApplied(")
+        val summary = body.indexOf("vm_provider_summary")
+        assertTrue(
+            "`reportProviders()` no longer checks whether the refresh was only partly applied",
+            partial >= 0,
+        )
+        assertTrue("`reportProviders()` no longer prints the plain provider summary", summary >= 0)
+        assertTrue(
+            "`reportProviders()` prints the plain summary before checking the partial case, so a " +
+                "document whose membership the live graph refused is presented as a clean success.",
+            partial < summary,
+        )
+        assertTrue(
+            "`reportProviders()` no longer reports the partial case as an error; its result would read " +
+                "like any other successful refresh.",
+            body.substring(partial).contains("UiToast.Kind.Error"),
+        )
+    }
+
     // --- the two results of an update are independent -----------------------------------------------
 
     /**
