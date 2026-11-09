@@ -93,6 +93,63 @@ class ProviderRefreshTest {
         assertFalse(ProviderRefresh.partlyApplied(counts))
     }
 
+    /**
+     * The shape the pinned core actually puts on the wire.
+     *
+     * `CommandClient.refreshRemoteProviders` marshals the protobuf response with Go's
+     * `encoding/json`, which uses the generated `json:"..."` tags: `pending_tags`,
+     * `restart_required`, `box_changed`, `requested_revision`, `applied_revision`. This fixture is
+     * copied from that shape (and from the fixed AAR's recorded `provider refresh result` line), not
+     * from a hand-written camelCase summary. A client that decodes only camelCase silently drops the
+     * partial-application fields, which makes a rejected group look like a clean publish.
+     */
+    @Test
+    fun `decodes the snake_case wire shape the pinned core returns`() {
+        val summary = ProviderRefresh.parse(
+            """
+            {"results":[{"tag":"pp","status":"published","requested_revision":4,"applied_revision":4,
+              "pending_tags":["node-a","node-b"],"restart_required":true,"reason":"group rejected"}],
+             "cancelled":false,"box_changed":true}
+            """.trimIndent(),
+        )
+        requireNotNull(summary)
+        assertEquals(true, summary.boxChanged)
+        val result = summary.results.single()
+        assertEquals(listOf("node-a", "node-b"), result.pendingTags)
+        assertEquals(true, result.restartRequired)
+        assertEquals(4L, result.requestedRevision)
+        assertEquals(4L, result.appliedRevision)
+        val counts = ProviderRefresh.counts(summary)
+        assertEquals(2, counts.pendingTags)
+        assertEquals(1, counts.restartRequired)
+        assertTrue(ProviderRefresh.partlyApplied(counts))
+    }
+
+    @Test
+    fun `decodes the snake_case cancellation flag`() {
+        val summary = ProviderRefresh.parse("""{"results":[],"cancelled":true,"box_changed":false}""")
+        requireNotNull(summary)
+        assertEquals(true, summary.cancelled)
+        assertEquals(false, summary.boxChanged)
+    }
+
+    /**
+     * The camelCase spelling was only ever the client's own test fixture. It is kept decodable so an
+     * older local summary (or a future protojson-based core) does not turn into an empty success,
+     * but it is not the shape this client is verified against.
+     */
+    @Test
+    fun `keeps the legacy camelCase names decodable`() {
+        val summary = ProviderRefresh.parse(
+            """{"results":[{"tag":"pp","status":"published","pendingTags":["a"],"restartRequired":true}],"cancelled":true,"boxChanged":true}""",
+        )
+        requireNotNull(summary)
+        assertEquals(listOf("a"), summary.results.single().pendingTags)
+        assertEquals(true, summary.results.single().restartRequired)
+        assertEquals(true, summary.cancelled)
+        assertEquals(true, summary.boxChanged)
+    }
+
     @Test
     fun `a 304-style unchanged result keeps its own count`() {
         val summary = ProviderRefresh.parse("""{"results":[{"tag":"pp","status":"unchanged"}]}""")
