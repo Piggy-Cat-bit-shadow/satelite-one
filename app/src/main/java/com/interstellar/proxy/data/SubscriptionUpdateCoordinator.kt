@@ -31,6 +31,58 @@ object SubscriptionUpdateCoordinator {
 
     fun configChanged(before: String?, after: String?): Boolean = before != after
 
+    /**
+     * Identity of the running instance and of the config generation it was asked for.
+     *
+     * The subscription id alone cannot identify a Box: A → B → A, "stop and start the same
+     * subscription", and a changed mix pool all leave the id equal while the instance (or the
+     * config it runs) is a different one. The engine generation and the config revision are what
+     * make those three cases distinguishable, and they are captured together, before a request is
+     * sent, so every later boundary can compare against a real identity instead of a name.
+     */
+    data class InstanceSnapshot(
+        val activeSubscriptionId: String,
+        val mixEnabled: Boolean,
+        val mixSubscriptionIds: Set<String>,
+        val engineGeneration: Long,
+        val configRevision: Long,
+    )
+
+    /**
+     * Whether the instance captured in [start] is still the one that owns this operation's result.
+     *
+     * [expectedRevision] is the config revision this operation itself committed (or the start
+     * revision when it committed nothing). A revision that moved past it was written by someone
+     * else, so the result is stale even when the subscription id and the engine are the same - for
+     * example a mix membership change while the fetch was in flight. A blank active id is never an
+     * owner, and a new Box (generation bump) invalidates every result that outlived it.
+     */
+    fun stillOwns(
+        start: InstanceSnapshot,
+        current: InstanceSnapshot,
+        expectedRevision: Long = start.configRevision,
+    ): Boolean {
+        if (start.activeSubscriptionId.isBlank()) return false
+        if (start.activeSubscriptionId != current.activeSubscriptionId) return false
+        if (start.mixEnabled != current.mixEnabled) return false
+        if (start.mixSubscriptionIds != current.mixSubscriptionIds) return false
+        if (start.engineGeneration != current.engineGeneration) return false
+        return current.configRevision == expectedRevision
+    }
+
+    /**
+     * [stillOwns] plus "this attempt concerned the active pool at all".
+     *
+     * An update that never targeted the active pool reports nothing, no matter how the user
+     * switched profiles while it was in flight.
+     */
+    fun ownsInstance(
+        affectedAtStart: Boolean,
+        start: InstanceSnapshot,
+        current: InstanceSnapshot,
+        expectedRevision: Long = start.configRevision,
+    ): Boolean = affectedAtStart && stillOwns(start, current, expectedRevision)
+
     /** Which halves of an update result are reported. */
     data class UpdateReport(
         /** The config half: apply/reload what the fetch regenerated. */
@@ -40,9 +92,10 @@ object SubscriptionUpdateCoordinator {
         /**
          * Why the fetched body was refused before it could become the active config, or null.
          *
-         * The repository validates the candidate with libbox and keeps the previous active config
-         * when it is refused; this carries that verdict to the initiator so a download that
-         * "succeeded" but produced an unusable body is not reported as a config result.
+         * The repository validates the candidate with libbox and keeps the previous body and
+         * active config when it is refused; this carries that verdict to the initiator so a
+         * download that "succeeded" but produced an unusable body is not reported as a config
+         * result.
          */
         val configError: String? = null,
     )
@@ -55,34 +108,22 @@ object SubscriptionUpdateCoordinator {
      * config to apply. A download that failed, or a body that could not be parsed, leaves the
      * running instance on its previous config — and that instance's remote providers must still be
      * refreshed, because the node sources and the subscription download are different failures.
-     * An attempt that cannot affect the active pool reports nothing. A body the repository refused
-     * ([configError]) is not a config result either, but it does not suppress the provider half.
+     * An attempt that cannot affect the active pool reports nothing.
+     *
+     * [configError] does not suppress the config half: in a batch, one subscription's body can be
+     * refused while another one's bytes were committed, and that committed config still has to be
+     * applied. The error is a separate fact about one candidate, not a statement that nothing
+     * changed.
      */
     fun report(
         affected: Boolean,
         configUpdated: Boolean,
         configError: String? = null,
     ): UpdateReport = UpdateReport(
-        config = affected && configUpdated && configError == null,
+        config = affected && configUpdated,
         providers = affected,
         configError = configError,
     )
-
-    /**
-     * Whether an update that started while [activeIdAtStart] was active may still apply and report.
-     *
-     * A fetch can outlive the profile it was started for. When the user activates another profile
-     * in the meantime, the running instance is now built from that profile: reloading it because
-     * "the active config changed" and then refreshing its providers would attribute one
-     * subscription's result to another, and would reload a Box nobody asked to touch. The
-     * subscription's own bytes are still stored by the caller — this only decides whether the
-     * result may act on the live instance.
-     */
-    fun ownsInstance(
-        affectedAtStart: Boolean,
-        activeIdAtStart: String,
-        activeIdNow: String,
-    ): Boolean = affectedAtStart && activeIdAtStart.isNotBlank() && activeIdAtStart == activeIdNow
 
     enum class ActiveConfigAction {
         /** The bytes on disk did not change; nothing to reload. */

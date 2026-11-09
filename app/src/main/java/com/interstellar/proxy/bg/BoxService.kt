@@ -30,6 +30,7 @@ import com.interstellar.proxy.core.CoreOverrides
 import com.interstellar.proxy.core.ProxyCore
 import com.interstellar.proxy.core.SystemProxyState
 import com.interstellar.proxy.data.ConfigStore
+import com.interstellar.proxy.data.CoreRuntime
 import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.ktx.hasPermission
 import kotlinx.coroutines.DelicateCoroutinesApi
@@ -44,6 +45,32 @@ class BoxService(private val service: Service, private val platformInterface: Pl
     CoreHost {
     companion object {
         private const val TAG = "BoxService"
+
+        /**
+         * Verdict of the last config application attempted by this process's Box.
+         *
+         * `CommandServerHandler.serviceReload()` returns void, so the command RPC cannot report a
+         * refused reload: the failure is handled inside [serviceReload0], which stops the service.
+         * The caller still has to know whether the revision it wrote is the one the Box is serving,
+         * so the verdict is recorded here with the revision it applied (or failed to apply), and
+         * the caller compares that against the revision it wrote. Without this, "the RPC returned"
+         * was being reported as "the config was applied".
+         */
+        data class ReloadVerdict(
+            val success: Boolean,
+            val error: String?,
+            val configRevision: Long,
+            val engineGeneration: Long,
+            val atMillis: Long,
+        )
+
+        @Volatile
+        var lastReload: ReloadVerdict? = null
+            private set
+
+        private fun recordReload(verdict: ReloadVerdict) {
+            lastReload = verdict
+        }
 
         /**
          * A refused publish is retried at most this many times.
@@ -185,6 +212,9 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             runCatching { created.shutdown() }
             return CoreStartResult.Superseded
         }
+        // A published Box is a new instance: every result that was started against the previous
+        // one is now stale, even when the subscription id it carried is active again.
+        CoreRuntime.onEngineStarted()
         return CoreStartResult.Published
     }
 
@@ -279,6 +309,8 @@ class BoxService(private val service: Service, private val platformInterface: Pl
         }
         DefaultNetworkMonitor.stop(this)
         runCatching { running?.shutdown() }
+        // The instance is gone: a start that publishes next is a different engine generation.
+        CoreRuntime.onEngineReleased()
         } finally {
             // Always released, including when a step above throws: leaving the teardown
             // marked in-flight would block every future publish for the process lifetime.
@@ -304,9 +336,13 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             try {
                 core?.applyConfig(content, buildOverrides())
             } catch (e: Exception) {
+                CoreRuntime.onApplyFailed(e.message)
                 stopAndAlert(Alert.CreateService, e.message)
                 return
             }
+            // The Box is running exactly these bytes; the revision is what a later "was my config
+            // applied?" check compares against.
+            CoreRuntime.onConfigApplied(ConfigStore.activeConfigRevision())
 
             if (core?.needWifiState() == true) {
                 val wifiPermission =
@@ -378,13 +414,28 @@ class BoxService(private val service: Service, private val platformInterface: Pl
 
     suspend fun serviceReload0() {
         val content = ConfigStore.readActiveConfig()
+        val revision = ConfigStore.activeConfigRevision()
         if (content == null) {
+            recordReload(
+                ReloadVerdict(false, "empty configuration", revision, CoreRuntime.engineGeneration, System.currentTimeMillis()),
+            )
+            CoreRuntime.onApplyFailed("empty configuration")
             stopAndAlert(Alert.EmptyConfiguration)
             return
         }
         try {
             core?.applyConfig(content, buildOverrides())
         } catch (e: Exception) {
+            // The kernel releases the old Box BEFORE it builds the replacement
+            // (`daemon.StartedService.StartOrReloadService`), so by the time this throws there is no
+            // old instance left to keep serving. What the client can still do is (a) tell the truth
+            // about the failure instead of reporting an applied config, and (b) keep the previous
+            // document on disk so the caller can restore it and start again. Both are done here and
+            // by the caller; an uninterrupted swap needs the kernel-side atomic replace.
+            recordReload(
+                ReloadVerdict(false, e.message, revision, CoreRuntime.engineGeneration, System.currentTimeMillis()),
+            )
+            CoreRuntime.onApplyFailed(e.message)
             stopAndAlert(Alert.CreateService, e.message)
             return
         }
@@ -397,10 +448,19 @@ class BoxService(private val service: Service, private val platformInterface: Pl
                     android.Manifest.permission.ACCESS_BACKGROUND_LOCATION
                 }
             if (!service.hasPermission(wifiPermission)) {
+                val reason = "location permission missing"
+                recordReload(
+                    ReloadVerdict(false, reason, revision, CoreRuntime.engineGeneration, System.currentTimeMillis()),
+                )
+                CoreRuntime.onApplyFailed(reason)
                 stopAndAlert(Alert.RequestLocationPermission)
                 return
             }
         }
+        recordReload(
+            ReloadVerdict(true, null, revision, CoreRuntime.engineGeneration, System.currentTimeMillis()),
+        )
+        CoreRuntime.onConfigApplied(revision)
     }
 
     /**

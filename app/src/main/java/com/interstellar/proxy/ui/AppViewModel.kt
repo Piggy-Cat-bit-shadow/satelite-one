@@ -11,6 +11,7 @@ import androidx.lifecycle.viewModelScope
 import com.interstellar.proxy.constant.Action
 import com.interstellar.proxy.constant.Status
 import com.interstellar.proxy.data.ConfigStore
+import com.interstellar.proxy.data.CoreRuntime
 import com.interstellar.proxy.data.ProviderRefresh
 import com.interstellar.proxy.data.ProviderRefreshSummary
 import com.interstellar.proxy.data.Settings
@@ -180,8 +181,15 @@ internal fun eligibleUrlTestTags(items: List<CoreGroupItem>): List<String> =
         .filter { it.isNotBlank() }
         .distinct()
 
-/** Transient feedback pill (subscription updates etc.). */
-data class UiToast(val text: String, val kind: Kind) {
+/**
+ * Transient feedback pill (subscription updates etc.).
+ *
+ * [secondary] carries the second half of a two-result operation (the config result and the
+ * provider result of one update) so the two arrive in ONE pill. Two `showToast` calls in a row
+ * used to race: the second replaced the first before it could be read, which is how a refused
+ * config body disappeared behind the provider summary.
+ */
+data class UiToast(val text: String, val kind: Kind, val secondary: String? = null) {
     enum class Kind { Success, Error }
 }
 
@@ -486,6 +494,51 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             delay(2800)
             _toast.value = null
         }
+    }
+
+    /**
+     * One operation, two results, one pill.
+     *
+     * The config half is the primary line because it decides what the core is running; the provider
+     * half follows as the secondary line. The pill is an error as soon as either half failed - a
+     * refused config must not look green because the provider refresh happened to succeed.
+     */
+    fun showUpdateToast(primary: Pair<String, UiToast.Kind>?, secondary: Pair<String, UiToast.Kind>?) {
+        if (primary == null && secondary == null) return
+        val first = primary ?: secondary!!
+        val second = if (primary == null) null else secondary
+        _toast.value = UiToast(
+            text = first.first,
+            kind = if (first.second == UiToast.Kind.Error || second?.second == UiToast.Kind.Error) {
+                UiToast.Kind.Error
+            } else {
+                UiToast.Kind.Success
+            },
+            secondary = second?.first,
+        )
+        toastClearJob?.cancel()
+        toastClearJob = viewModelScope.launch {
+            delay(3600)
+            _toast.value = null
+        }
+    }
+
+    /**
+     * Subscriptions with an update in flight, so a double tap coalesces into one request.
+     *
+     * The set is the whole concurrency contract for one subscription: the second tap is ignored
+     * (not queued, not sent) while the first fetch is running. Two operations that target the same
+     * ACTIVE pool from different entry points (single vs. update-all) are not serialised here -
+     * they are separated by the instance snapshot each one carries, so only the one that still owns
+     * the instance at its boundary may act on the Box.
+     */
+    private val updatesInFlight: MutableSet<String> =
+        java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
+    private fun beginUpdate(id: String): Boolean = updatesInFlight.add(id)
+
+    private fun endUpdate(id: String) {
+        updatesInFlight.remove(id)
     }
 
 
@@ -1019,9 +1072,18 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     /**
      * Regenerates the active config from current settings (node pick, mix pool,
      * system proxy…) and hot-reloads the running core.
+     *
+     * The reload only runs for the revision this call committed, and a refusal by the core is
+     * reported (and the previous document restored) instead of being swallowed as a successful
+     * reload.
      */
     fun refreshProxyConfig() {
         viewModelScope.launch(Dispatchers.IO) {
+            val start = instanceSnapshot()
+            val before = ConfigStore.readActiveConfig()
+            val ownerBefore = ConfigStore.readActiveConfigOwner()
+            val activeId = start.activeSubscriptionId
+            val rawBefore = activeId.takeIf { it.isNotBlank() }?.let { SubscriptionRepository.readRawBody(it) }
             val config = SubscriptionRepository.regenerateActiveConfig()
             if (config == null) {
                 _message.value = SubscriptionRepository.lastConfigError
@@ -1033,8 +1095,28 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             // in-flight start already consumed the previous config and no
             // reload fires — wait for the start to settle, then apply
             waitForStartSettle()
-            if (_status.value == Status.Started) {
-                runCatching { CommandTarget.standaloneClient().serviceReload() }
+            if (_status.value != Status.Started) return@launch
+            val expectedRevision = ConfigStore.activeConfigRevision()
+            if (!SubscriptionUpdateCoordinator.stillOwns(start, instanceSnapshot(), expectedRevision)) return@launch
+            if (!SubscriptionUpdateCoordinator.configChanged(before, config)) return@launch
+            when (val outcome = reloadVerdict()) {
+                is ReloadOutcome.Applied -> Unit
+                is ReloadOutcome.Failed -> {
+                    val restored = restoreAfterFailedReload(
+                        previousConfig = before,
+                        previousOwner = ownerBefore,
+                        rawOwnerId = activeId.takeIf { it.isNotBlank() },
+                        previousRaw = rawBefore,
+                        failure = outcome.error,
+                    )
+                    _message.value = str(
+                        if (restored) {
+                            com.interstellar.proxy.R.string.vm_config_apply_restored
+                        } else {
+                            com.interstellar.proxy.R.string.vm_config_apply_failed
+                        },
+                    )
+                }
             }
         }
     }
@@ -1054,7 +1136,103 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** What happened to the active config after a manual subscription update. */
-    private enum class ActiveConfigOutcome { Unchanged, Reloaded, SavedOnly, Failed }
+    private enum class ActiveConfigOutcome { Unchanged, Reloaded, SavedOnly, Failed, Restored, Superseded }
+
+    /** What the core said about the revision this client asked it to apply. */
+    private sealed interface ReloadOutcome {
+        data class Applied(val revision: Long) : ReloadOutcome
+        data class Failed(val error: String?, val revision: Long) : ReloadOutcome
+    }
+
+    /** Identity of the live instance plus the config generation it was asked to serve. */
+    private fun instanceSnapshot(): SubscriptionUpdateCoordinator.InstanceSnapshot =
+        SubscriptionUpdateCoordinator.InstanceSnapshot(
+            activeSubscriptionId = SubscriptionRepository.activeSubscriptionId,
+            mixEnabled = Settings.mixEnabled,
+            mixSubscriptionIds = Settings.mixSubscriptionIds,
+            engineGeneration = CoreRuntime.engineGeneration,
+            configRevision = ConfigStore.activeConfigRevision(),
+        )
+
+    /**
+     * Asks the core to reload and reads back whether THAT revision is what it is serving.
+     *
+     * `serviceReload()` is void on the wire, so a returned RPC is not a verdict: the failure path
+     * stops the service inside the handler. The recorded verdict carries the revision the handler
+     * actually applied, which is what makes "Configuration applied" an observation instead of an
+     * assumption.
+     */
+    private fun reloadVerdict(): ReloadOutcome {
+        val revision = ConfigStore.activeConfigRevision()
+        val rpc = runCatching { CommandTarget.standaloneClient().serviceReload() }
+        if (rpc.isFailure) {
+            return ReloadOutcome.Failed(rpc.exceptionOrNull()?.message, revision)
+        }
+        val verdict = com.interstellar.proxy.bg.BoxService.lastReload
+            ?: return ReloadOutcome.Failed(str(com.interstellar.proxy.R.string.vm_config_apply_unconfirmed), revision)
+        if (verdict.configRevision != revision) {
+            // Another config was written between our write and the reload, so this verdict is about
+            // a different document.
+            return ReloadOutcome.Failed(str(com.interstellar.proxy.R.string.vm_config_apply_unconfirmed), revision)
+        }
+        return if (verdict.success) {
+            ReloadOutcome.Applied(revision)
+        } else {
+            ReloadOutcome.Failed(verdict.error, revision)
+        }
+    }
+
+    /**
+     * Puts the previous document back after the core refused a config, and starts the core from it.
+     *
+     * The kernel releases the old Box before building the replacement, so an uninterrupted swap is
+     * not available to the client: what it CAN do is keep the old bytes and bring a Box back with
+     * them. Both the subscription's retained body and the active config are restored, so a later
+     * start (and the next subscription read) sees the good document, not the refused one.
+     */
+    private suspend fun restoreAfterFailedReload(
+        previousConfig: String?,
+        previousOwner: String?,
+        rawOwnerId: String?,
+        previousRaw: String?,
+        failure: String?,
+    ): Boolean {
+        android.util.Log.w("InterstellarUI", "core refused the new config: $failure")
+        if (rawOwnerId != null) {
+            SubscriptionRepository.restoreRawBody(rawOwnerId, previousRaw)
+        }
+        if (previousConfig == null) return false
+        val revision = ConfigStore.writeActiveConfig(previousConfig, previousOwner)
+        com.interstellar.proxy.core.AppLog.log(
+            "config",
+            "refused new config" + (failure?.let { " ($it)" } ?: "") + "; restored previous revision=$revision",
+        )
+        return startStoredConfig()
+    }
+
+    /** Starts the core from whatever config is on disk, without regenerating it. */
+    private suspend fun startStoredConfig(): Boolean {
+        if (_status.value == Status.Started) return true
+        val content = ConfigStore.readActiveConfig() ?: return false
+        if (content.isBlank()) return false
+        _status.value = Status.Starting
+        armStartingWatchdog(STARTING_TIMEOUT_MS)
+        com.interstellar.proxy.bg.BoxService.start()
+        if (uiLifetime.wantsClient()) {
+            runCatching { commandClient.connect() }
+        }
+        var waited = 0L
+        while (waited < 20_000) {
+            delay(200)
+            waited += 200
+            when (_status.value) {
+                Status.Started -> return true
+                Status.Stopped -> return false
+                else -> Unit
+            }
+        }
+        return false
+    }
 
     /**
      * Applies the active config a manual update just regenerated.
@@ -1063,10 +1241,25 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      * the core is running is hot-reloaded; a change while it is stopped is only
      * persisted (it applies on the next start); no change never reloads. This is
      * the "配置" half of the two results a manual update reports.
+     *
+     * Every boundary is checked against [start]: the bytes may only be installed while this attempt
+     * still owns the instance, the reload may only run for the revision it committed, and a reload
+     * that the core refused is restored from the previous document instead of being reported as
+     * applied.
      */
-    private suspend fun applyActiveConfigIfChanged(before: String?): ActiveConfigOutcome {
+    private suspend fun applyActiveConfigIfChanged(
+        before: String?,
+        previousOwner: String?,
+        rawOwnerId: String?,
+        previousRaw: String?,
+        start: SubscriptionUpdateCoordinator.InstanceSnapshot,
+        expectedRevision: Long,
+    ): ActiveConfigOutcome {
         waitForStartSettle()
         val after = ConfigStore.readActiveConfig() ?: return ActiveConfigOutcome.Failed
+        if (!SubscriptionUpdateCoordinator.stillOwns(start, instanceSnapshot(), expectedRevision)) {
+            return ActiveConfigOutcome.Superseded
+        }
         return when (
             SubscriptionUpdateCoordinator.action(
                 changed = SubscriptionUpdateCoordinator.configChanged(before, after),
@@ -1075,9 +1268,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         ) {
             ActiveConfigAction.None -> ActiveConfigOutcome.Unchanged
             ActiveConfigAction.SavedOnly -> ActiveConfigOutcome.SavedOnly
-            ActiveConfigAction.Reload ->
-                runCatching { CommandTarget.standaloneClient().serviceReload() }
-                    .fold({ ActiveConfigOutcome.Reloaded }, { ActiveConfigOutcome.Failed })
+            ActiveConfigAction.Reload -> when (val outcome = reloadVerdict()) {
+                is ReloadOutcome.Failed -> {
+                    val restored = restoreAfterFailedReload(
+                        before, previousOwner, rawOwnerId, previousRaw, outcome.error,
+                    )
+                    if (restored) ActiveConfigOutcome.Restored else ActiveConfigOutcome.Failed
+                }
+
+                // The Box was replaced between the write and the reload: the reload reached an
+                // instance that no longer owns this result, so it is not reported as applied here.
+                is ReloadOutcome.Applied ->
+                    if (!SubscriptionUpdateCoordinator.stillOwns(start, instanceSnapshot(), expectedRevision)) {
+                        ActiveConfigOutcome.Superseded
+                    } else {
+                        ActiveConfigOutcome.Reloaded
+                    }
+            }
         }
     }
 
@@ -1095,68 +1302,57 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }.getOrNull()
     }
 
-    private fun reportActiveConfig(outcome: ActiveConfigOutcome) {
-        when (outcome) {
-            ActiveConfigOutcome.Unchanged -> showToast(
-                str(com.interstellar.proxy.R.string.vm_config_unchanged), UiToast.Kind.Success,
-            )
-            ActiveConfigOutcome.Reloaded -> showToast(
-                str(com.interstellar.proxy.R.string.vm_config_reloaded), UiToast.Kind.Success,
-            )
-            ActiveConfigOutcome.SavedOnly -> showToast(
-                str(com.interstellar.proxy.R.string.vm_config_saved), UiToast.Kind.Success,
-            )
-            ActiveConfigOutcome.Failed -> showToast(
-                str(com.interstellar.proxy.R.string.vm_config_apply_failed), UiToast.Kind.Error,
-            )
-        }
+    /** The config half of an update result, as text for the combined pill. */
+    private fun activeConfigMessage(outcome: ActiveConfigOutcome): Pair<String, UiToast.Kind> = when (outcome) {
+        ActiveConfigOutcome.Unchanged ->
+            str(com.interstellar.proxy.R.string.vm_config_unchanged) to UiToast.Kind.Success
+        ActiveConfigOutcome.Reloaded ->
+            str(com.interstellar.proxy.R.string.vm_config_reloaded) to UiToast.Kind.Success
+        ActiveConfigOutcome.SavedOnly ->
+            str(com.interstellar.proxy.R.string.vm_config_saved) to UiToast.Kind.Success
+        ActiveConfigOutcome.Failed ->
+            str(com.interstellar.proxy.R.string.vm_config_apply_failed) to UiToast.Kind.Error
+        ActiveConfigOutcome.Restored ->
+            str(com.interstellar.proxy.R.string.vm_config_apply_restored) to UiToast.Kind.Error
+        ActiveConfigOutcome.Superseded ->
+            str(com.interstellar.proxy.R.string.vm_config_apply_superseded) to UiToast.Kind.Error
     }
 
-    private fun reportProviders(summary: ProviderRefreshSummary?) {
+    /** The provider half of an update result, as text for the combined pill. */
+    private fun providerMessage(summary: ProviderRefreshSummary?): Pair<String, UiToast.Kind> {
         if (summary == null) {
-            showToast(str(com.interstellar.proxy.R.string.vm_provider_unavailable), UiToast.Kind.Error)
-            return
+            return str(com.interstellar.proxy.R.string.vm_provider_unavailable) to UiToast.Kind.Error
         }
         if (summary.boxChanged) {
-            showToast(str(com.interstellar.proxy.R.string.vm_provider_box_changed), UiToast.Kind.Error)
-            return
+            return str(com.interstellar.proxy.R.string.vm_provider_box_changed) to UiToast.Kind.Error
         }
         if (summary.cancelled) {
-            showToast(str(com.interstellar.proxy.R.string.vm_provider_cancelled), UiToast.Kind.Error)
-            return
+            return str(com.interstellar.proxy.R.string.vm_provider_cancelled) to UiToast.Kind.Error
         }
         val counts = ProviderRefresh.counts(summary)
         if (counts.total == 0) {
-            showToast(str(com.interstellar.proxy.R.string.vm_provider_none), UiToast.Kind.Success)
-            return
+            return str(com.interstellar.proxy.R.string.vm_provider_none) to UiToast.Kind.Success
         }
         // A document the live graph refused comes back as `published` with pending tags and
         // `restartRequired`; counting only `published` would present it as a clean success.
         if (ProviderRefresh.partlyApplied(counts)) {
-            showToast(
-                str(
-                    com.interstellar.proxy.R.string.vm_provider_partial,
-                    counts.published,
-                    counts.unchanged,
-                    counts.failed,
-                    counts.skipped,
-                    counts.pendingTags,
-                    counts.restartRequired,
-                ),
-                UiToast.Kind.Error,
-            )
-            return
-        }
-        showToast(
-            str(
-                com.interstellar.proxy.R.string.vm_provider_summary,
+            return str(
+                com.interstellar.proxy.R.string.vm_provider_partial,
                 counts.published,
                 counts.unchanged,
                 counts.failed,
                 counts.skipped,
-            ),
-            if (counts.failed > 0 || counts.busy > 0) UiToast.Kind.Error else UiToast.Kind.Success,
-        )
+                counts.pendingTags,
+                counts.restartRequired,
+            ) to UiToast.Kind.Error
+        }
+        return str(
+            com.interstellar.proxy.R.string.vm_provider_summary,
+            counts.published,
+            counts.unchanged,
+            counts.failed,
+            counts.skipped,
+        ) to if (counts.failed > 0 || counts.busy > 0) UiToast.Kind.Error else UiToast.Kind.Success
     }
 
     /**
@@ -1167,17 +1363,54 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      * for every attempt that targets the active pool, so an unchanged subscription — and a
      * subscription whose download failed outright — still gets a fresh remote document on the
      * instance that is actually running. A failure there is reported next to the subscription
-     * failure instead of replacing it.
+     * failure instead of replacing it: both lines are composed here and shown in ONE pill, because
+     * two `showToast` calls raced and the later one always won.
      */
-    private suspend fun reportManualUpdateOutcome(activeBefore: String?, report: UpdateReport) {
-        if (report.configError != null) {
+    private suspend fun reportManualUpdateOutcome(
+        activeBefore: String?,
+        ownerBefore: String?,
+        activeIdBefore: String,
+        rawBefore: String?,
+        start: SubscriptionUpdateCoordinator.InstanceSnapshot,
+        expectedRevision: Long,
+        report: UpdateReport,
+    ) {
+        var configOutcome: ActiveConfigOutcome? = null
+        if (report.config) {
+            configOutcome = applyActiveConfigIfChanged(
+                before = activeBefore,
+                previousOwner = ownerBefore,
+                rawOwnerId = activeIdBefore.takeIf { it.isNotBlank() },
+                previousRaw = rawBefore,
+                start = start,
+                expectedRevision = expectedRevision,
+            )
+        }
+        val configHalf: Pair<String, UiToast.Kind>? = when {
             // The body was downloaded but the repository refused it as a config: the previous
             // active config is still on disk and still serving. Say that, not "unchanged".
-            showToast(report.configError, UiToast.Kind.Error)
-        } else if (report.config) {
-            reportActiveConfig(applyActiveConfigIfChanged(activeBefore))
+            report.configError != null -> report.configError to UiToast.Kind.Error
+            configOutcome != null -> activeConfigMessage(configOutcome)
+            else -> null
         }
-        if (report.providers) reportProviders(refreshProvidersNow())
+
+        var providerHalf: Pair<String, UiToast.Kind>? = null
+        if (report.providers) {
+            // Re-check ownership at the RPC boundary: between the config half and this call the
+            // user may have switched profile, stopped the core, or changed the mix pool.
+            val owns = SubscriptionUpdateCoordinator.stillOwns(
+                start,
+                instanceSnapshot(),
+                ConfigStore.activeConfigRevision(),
+            )
+            providerHalf = if (owns) {
+                providerMessage(refreshProvidersNow())
+            } else {
+                str(com.interstellar.proxy.R.string.vm_provider_superseded) to UiToast.Kind.Error
+            }
+        }
+
+        showUpdateToast(configHalf, providerHalf)
     }
 
     /** Re-reads whatever config is on disk (startup / core switch). */
@@ -1699,7 +1932,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         // stamp the subscription id on nodes up front so mix source labels work
         val subId = SubscriptionRepository.newSubscriptionId()
-        val format = SubscriptionRepository.saveRawBody(subId, body)
+        val commit = SubscriptionRepository.commitFetchedBody(subId, body)
+        if (commit is SubscriptionRepository.BodyCommit.Refused) {
+            // An import is a promise that the subscription can be used; a body the core refuses
+            // cannot be that, so it is rejected instead of being stored as a broken profile.
+            _message.value = commit.error
+            _addSubError.value = commit.error
+            SubscriptionRepository.rawFileOf(subId).delete()
+            return
+        }
+        val format = (commit as SubscriptionRepository.BodyCommit.Accepted).format
         when (val parsed = SubscriptionParser.parse(body, subId)) {
             is SubscriptionParser.Result.Nodes -> {
                 val sub = SubscriptionRepository.Subscription(
@@ -1754,37 +1996,56 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _mixSubscriptionIds.value = Settings.mixSubscriptionIds
     }
 
+    /**
+     * One manual update, from download to the two results.
+     *
+     * The whole operation is bound to the instance it started against ([start]): the download
+     * commits its body through the repository's validator (a refused body never replaces the
+     * subscription's last good one), the config half re-checks ownership before it writes/reloads,
+     * and the provider half re-checks it again at the RPC boundary. A result that lost ownership
+     * keeps its downloaded bytes but touches neither the Box nor the UI result of another profile.
+     */
     fun refreshSubscription(id: String, fromPull: Boolean = false) {
         val sub = SubscriptionRepository.get(id) ?: return
         val url = sub.url ?: run {
             showToast(str(com.interstellar.proxy.R.string.vm_local_no_refresh), UiToast.Kind.Error)
             return
         }
+        // Coalesce a double tap: the second tap joins nothing, it is ignored while the first is
+        // still in flight. The alternative (queueing) would run the fetch twice for one request the
+        // user meant to send once, and would apply two commits of the same body.
+        if (!beginUpdate(id)) {
+            showToast(str(com.interstellar.proxy.R.string.vm_update_in_progress, sub.name), UiToast.Kind.Error)
+            return
+        }
         viewModelScope.launch(Dispatchers.IO) {
             if (fromPull) _refreshing.value = true
             _busy.value = true
+            val start = instanceSnapshot()
             val activeBefore = ConfigStore.readActiveConfig()
-            // The repository records why a fetched body was refused as a config; the verdict is taken
-            // once, after the commit attempt, so this update reports it and no later one inherits it.
-            // Both the pool decision and the owner of the live instance are captured before the
-            // request: a fetch can outlive the profile it was started for (see ownsInstance).
-            val activeIdAtStart = SubscriptionRepository.activeSubscriptionId
+            val ownerBefore = ConfigStore.readActiveConfigOwner()
+            val activeIdBefore = start.activeSubscriptionId
+            // The retained body of the subscription whose config is live, so a runtime refusal can
+            // put it back together with the config bytes.
+            val rawBefore = activeIdBefore.takeIf { it.isNotBlank() }?.let { SubscriptionRepository.readRawBody(it) }
             val affectsActive = SubscriptionUpdateCoordinator.affectsActiveConfig(
                 listOf(id),
-                activeIdAtStart,
-                Settings.mixEnabled,
-                Settings.mixSubscriptionIds,
+                start.activeSubscriptionId,
+                start.mixEnabled,
+                start.mixSubscriptionIds,
             )
             var updated = false
+            var commitError: String? = null
             try {
                 val result = SubscriptionFetcher.fetch(url)
-                val format = SubscriptionRepository.saveRawBody(id, result.body)
-                when (val parsed = SubscriptionParser.parse(result.body, id)) {
-                    is SubscriptionParser.Result.Nodes -> {
+                when (val commit = SubscriptionRepository.commitFetchedBody(id, result.body)) {
+                    is SubscriptionRepository.BodyCommit.Refused -> {
+                        // The candidate is refused; the subscription keeps its previous body. This
+                        // is a config failure, not a download failure - the provider half still runs
+                        // because the instance that is serving is untouched by it.
+                        commitError = commit.error
                         SubscriptionRepository.upsert(
                             sub.copy(
-                                nodes = parsed.nodes,
-                                configFormat = format,
                                 uploadBytes = result.uploadBytes,
                                 downloadBytes = result.downloadBytes,
                                 totalBytes = result.totalBytes,
@@ -1792,31 +2053,52 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                 lastUpdated = System.currentTimeMillis(),
                             ),
                         )
-                        updated = true
-                        showToast(str(com.interstellar.proxy.R.string.vm_refreshed, sub.name, parsed.nodes.size), UiToast.Kind.Success)
                     }
 
-                    SubscriptionParser.Result.Empty ->
-                        if (format != null) {
-                            SubscriptionRepository.upsert(
-                                sub.copy(
-                                    configFormat = format,
-                                    uploadBytes = result.uploadBytes,
-                                    downloadBytes = result.downloadBytes,
-                                    totalBytes = result.totalBytes,
-                                    expireSeconds = result.expireSeconds,
-                                    lastUpdated = System.currentTimeMillis(),
-                                ),
-                            )
-                            updated = true
-                            showToast(str(com.interstellar.proxy.R.string.vm_config_kept, sub.name), UiToast.Kind.Success)
-                        } else {
-                            showToast(str(com.interstellar.proxy.R.string.vm_refresh_unparsable, sub.name), UiToast.Kind.Error)
+                    is SubscriptionRepository.BodyCommit.Accepted -> {
+                        val format = commit.format
+                        when (val parsed = SubscriptionParser.parse(result.body, id)) {
+                            is SubscriptionParser.Result.Nodes -> {
+                                SubscriptionRepository.upsert(
+                                    sub.copy(
+                                        nodes = parsed.nodes,
+                                        configFormat = format,
+                                        uploadBytes = result.uploadBytes,
+                                        downloadBytes = result.downloadBytes,
+                                        totalBytes = result.totalBytes,
+                                        expireSeconds = result.expireSeconds,
+                                        lastUpdated = System.currentTimeMillis(),
+                                    ),
+                                )
+                                updated = true
+                            }
+
+                            SubscriptionParser.Result.Empty ->
+                                if (format != null) {
+                                    SubscriptionRepository.upsert(
+                                        sub.copy(
+                                            configFormat = format,
+                                            uploadBytes = result.uploadBytes,
+                                            downloadBytes = result.downloadBytes,
+                                            totalBytes = result.totalBytes,
+                                            expireSeconds = result.expireSeconds,
+                                            lastUpdated = System.currentTimeMillis(),
+                                        ),
+                                    )
+                                    updated = true
+                                } else {
+                                    showToast(
+                                        str(com.interstellar.proxy.R.string.vm_refresh_unparsable, sub.name),
+                                        UiToast.Kind.Error,
+                                    )
+                                }
                         }
+                    }
                 }
             } catch (e: Exception) {
                 showToast(str(com.interstellar.proxy.R.string.vm_refresh_failed, sub.name, e.message ?: ""), UiToast.Kind.Error)
             } finally {
+                endUpdate(id)
                 _busy.value = false
                 _refreshing.value = false
                 // upsert regenerated the active config behind refreshProxyConfig's back
@@ -1824,14 +2106,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 _subscriptions.value = SubscriptionRepository.subscriptions.toList()
                 _activeSubscriptionId.value = SubscriptionRepository.activeSubscriptionId
             }
-            // The result may only act on the live instance if this attempt still owns it: another
-            // profile activated while the fetch was in flight means the running Box is that
-            // profile's, so reloading it or refreshing its providers here would misattribute this
-            // result and reload a Box nobody asked to touch.
+            // The revision this operation committed (unchanged when it committed nothing): a later
+            // writer moves past it and makes this result stale, even under the same profile id.
+            val expectedRevision = ConfigStore.activeConfigRevision()
             val owns = SubscriptionUpdateCoordinator.ownsInstance(
                 affectsActive,
-                activeIdAtStart,
-                SubscriptionRepository.activeSubscriptionId,
+                start,
+                instanceSnapshot(),
+                expectedRevision,
             )
             if (affectsActive && !owns) {
                 showToast(
@@ -1843,49 +2125,76 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             val report = SubscriptionUpdateCoordinator.report(
                 owns,
                 configUpdated = updated,
-                configError = if (updated) SubscriptionRepository.takeConfigError() else null,
+                configError = commitError ?: if (updated) SubscriptionRepository.takeConfigError() else null,
             )
-            if (report.providers || report.configError != null) reportManualUpdateOutcome(activeBefore, report)
+            if (report.providers || report.configError != null) {
+                reportManualUpdateOutcome(
+                    activeBefore = activeBefore,
+                    ownerBefore = ownerBefore,
+                    activeIdBefore = activeIdBefore,
+                    rawBefore = rawBefore,
+                    start = start,
+                    expectedRevision = expectedRevision,
+                    report = report,
+                )
+            } else if (updated) {
+                // An update outside the active pool has no live result to report; the download
+                // itself is the outcome the user asked for.
+                showToast(str(com.interstellar.proxy.R.string.vm_config_kept, sub.name), UiToast.Kind.Success)
+            }
         }
     }
 
-    /** Refresh every URL subscription in parallel, then one aggregate toast. */
+    /**
+     * Refresh every URL subscription, then one aggregate result.
+     *
+     * A subscription with an individual update already in flight is skipped (the individual
+     * operation owns it and will report); the rest are fetched under the same repository validator
+     * as the single path. The batch carries one instance snapshot for all of it: either the whole
+     * batch still owns the live instance at its boundaries, or it acts on nothing but the stored
+     * bytes.
+     */
     fun refreshAll() {
         val subs = SubscriptionRepository.subscriptions.filter { it.url != null }
         if (subs.isEmpty()) {
             showToast(str(com.interstellar.proxy.R.string.vm_no_sub_to_update), UiToast.Kind.Error)
             return
         }
+        val targets = subs.filter { beginUpdate(it.id) }
+        if (targets.isEmpty()) {
+            showToast(str(com.interstellar.proxy.R.string.vm_no_sub_to_update), UiToast.Kind.Error)
+            return
+        }
         viewModelScope.launch(Dispatchers.IO) {
             _refreshing.value = true
             _busy.value = true
+            val start = instanceSnapshot()
             val activeBefore = ConfigStore.readActiveConfig()
-            // See refreshSubscription: the refusal verdict is taken by the operation that caused it.
-            // Same rule as the single-item update: the pool decision and the instance owner are
-            // captured before the requests, so a batch in which every download failed still
-            // refreshes the running instance's providers, and a batch that outlives the profile it
-            // started for does not touch the new one.
-            val activeIdAtStart = SubscriptionRepository.activeSubscriptionId
+            val ownerBefore = ConfigStore.readActiveConfigOwner()
+            val activeIdBefore = start.activeSubscriptionId
+            val rawBefore = activeIdBefore.takeIf { it.isNotBlank() }?.let { SubscriptionRepository.readRawBody(it) }
             val affectsActive = SubscriptionUpdateCoordinator.affectsActiveConfig(
-                subs.map { it.id },
-                activeIdAtStart,
-                Settings.mixEnabled,
-                Settings.mixSubscriptionIds,
+                targets.map { it.id },
+                start.activeSubscriptionId,
+                start.mixEnabled,
+                start.mixSubscriptionIds,
             )
             val semaphore = kotlinx.coroutines.sync.Semaphore(3)
             var ok = 0
+            val refusals = java.util.Collections.synchronizedList(mutableListOf<String>())
             try {
                 kotlinx.coroutines.coroutineScope {
-                    subs.forEach { sub ->
+                    targets.forEach { sub ->
                         launch {
                             semaphore.withPermit {
-                                val success = runCatching {
+                                runCatching {
                                     val result = SubscriptionFetcher.fetch(sub.url!!)
-                                    when (val parsed = SubscriptionParser.parse(result.body, sub.id)) {
-                                        is SubscriptionParser.Result.Nodes -> {
+                                    when (val commit = SubscriptionRepository.commitFetchedBody(sub.id, result.body)) {
+                                        is SubscriptionRepository.BodyCommit.Refused -> {
+                                            // Keep the subscription's previous body and update only
+                                            // its accounting; the refusal is reported, not hidden.
                                             SubscriptionRepository.upsert(
                                                 sub.copy(
-                                                    nodes = parsed.nodes,
                                                     uploadBytes = result.uploadBytes,
                                                     downloadBytes = result.downloadBytes,
                                                     totalBytes = result.totalBytes,
@@ -1893,43 +2202,55 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                                     lastUpdated = System.currentTimeMillis(),
                                                 ),
                                             )
-                                            true
+                                            refusals.add(commit.error)
+                                            false
                                         }
 
-                                        SubscriptionParser.Result.Empty -> {
-                                            val fmt = SubscriptionRepository.saveRawBody(sub.id, result.body)
-                                            if (fmt != null) {
-                                                SubscriptionRepository.upsert(
-                                                    sub.copy(
-                                                        configFormat = fmt,
-                                                        uploadBytes = result.uploadBytes,
-                                                        downloadBytes = result.downloadBytes,
-                                                        totalBytes = result.totalBytes,
-                                                        expireSeconds = result.expireSeconds,
-                                                        lastUpdated = System.currentTimeMillis(),
-                                                    ),
-                                                )
-                                                true
-                                            } else {
-                                                false
+                                        is SubscriptionRepository.BodyCommit.Accepted -> {
+                                            val fmt = commit.format
+                                            when (val parsed = SubscriptionParser.parse(result.body, sub.id)) {
+                                                is SubscriptionParser.Result.Nodes -> {
+                                                    SubscriptionRepository.upsert(
+                                                        sub.copy(
+                                                            nodes = parsed.nodes,
+                                                            configFormat = fmt,
+                                                            uploadBytes = result.uploadBytes,
+                                                            downloadBytes = result.downloadBytes,
+                                                            totalBytes = result.totalBytes,
+                                                            expireSeconds = result.expireSeconds,
+                                                            lastUpdated = System.currentTimeMillis(),
+                                                        ),
+                                                    )
+                                                    true
+                                                }
+
+                                                SubscriptionParser.Result.Empty -> {
+                                                    if (fmt != null) {
+                                                        SubscriptionRepository.upsert(
+                                                            sub.copy(
+                                                                configFormat = fmt,
+                                                                uploadBytes = result.uploadBytes,
+                                                                downloadBytes = result.downloadBytes,
+                                                                totalBytes = result.totalBytes,
+                                                                expireSeconds = result.expireSeconds,
+                                                                lastUpdated = System.currentTimeMillis(),
+                                                            ),
+                                                        )
+                                                        true
+                                                    } else {
+                                                        false
+                                                    }
+                                                }
                                             }
                                         }
                                     }
-                                }.getOrDefault(false)
-                                if (success) ok++
+                                }.getOrDefault(false).let { if (it) ok++ }
                             }
                         }
                     }
                 }
-                if (ok == subs.size) {
-                    showToast(str(com.interstellar.proxy.R.string.vm_updated_all, ok), UiToast.Kind.Success)
-                } else {
-                    showToast(
-                        str(com.interstellar.proxy.R.string.vm_updated_partial, ok, subs.size),
-                        if (ok > 0) UiToast.Kind.Success else UiToast.Kind.Error,
-                    )
-                }
             } finally {
+                targets.forEach { endUpdate(it.id) }
                 _busy.value = false
                 _refreshing.value = false
                 // upserts regenerated the active config behind refreshProxyConfig's back
@@ -1940,10 +2261,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             // Same ownership rule as the single-item update: a batch whose result is appended after
             // another profile became active may keep the downloaded bytes, but must not reload or
             // refresh the instance that profile owns.
+            val expectedRevision = ConfigStore.activeConfigRevision()
             val owns = SubscriptionUpdateCoordinator.ownsInstance(
                 affectsActive,
-                activeIdAtStart,
-                SubscriptionRepository.activeSubscriptionId,
+                start,
+                instanceSnapshot(),
+                expectedRevision,
             )
             if (affectsActive && !owns) {
                 showToast(str(com.interstellar.proxy.R.string.vm_update_all_superseded), UiToast.Kind.Error)
@@ -1952,9 +2275,28 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             val report = SubscriptionUpdateCoordinator.report(
                 owns,
                 configUpdated = ok > 0,
-                configError = if (ok > 0) SubscriptionRepository.takeConfigError() else null,
+                configError = refusals.firstOrNull(),
             )
-            if (report.providers || report.configError != null) reportManualUpdateOutcome(activeBefore, report)
+            if (report.providers || report.configError != null) {
+                reportManualUpdateOutcome(
+                    activeBefore = activeBefore,
+                    ownerBefore = ownerBefore,
+                    activeIdBefore = activeIdBefore,
+                    rawBefore = rawBefore,
+                    start = start,
+                    expectedRevision = expectedRevision,
+                    report = report,
+                )
+            } else {
+                if (ok == targets.size) {
+                    showToast(str(com.interstellar.proxy.R.string.vm_updated_all, ok), UiToast.Kind.Success)
+                } else {
+                    showToast(
+                        str(com.interstellar.proxy.R.string.vm_updated_partial, ok, targets.size),
+                        if (ok > 0) UiToast.Kind.Success else UiToast.Kind.Error,
+                    )
+                }
+            }
         }
     }
 
@@ -1998,10 +2340,101 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun activateSubscription(id: String) {
         if (id == _activeSubscriptionId.value) return
-        SubscriptionRepository.activeSubscriptionId = id
-        _activeSubscriptionId.value = id
-        // regenerate + hot-reload the running core
-        refreshProxyConfig()
+        viewModelScope.launch(Dispatchers.IO) {
+            _busy.value = true
+            val start = instanceSnapshot()
+            val previousId = SubscriptionRepository.activeSubscriptionId
+            val activeBefore = ConfigStore.readActiveConfig()
+            val ownerBefore = ConfigStore.readActiveConfigOwner()
+            val rawBefore = previousId.takeIf { it.isNotBlank() }?.let { SubscriptionRepository.readRawBody(it) }
+            val targetName = SubscriptionRepository.get(id)?.name ?: id
+            val previousName = SubscriptionRepository.get(previousId)?.name ?: previousId
+            try {
+                // Build and validate the candidate BEFORE the switch. Naming the new profile first
+                // and only then discovering that its config cannot run is what made the active
+                // card, the file on disk and the running Box name three different profiles.
+                val candidate = SubscriptionRepository.buildActiveConfig(
+                    activeId = id,
+                    mixEnabled = Settings.mixEnabled,
+                    mixIds = Settings.mixSubscriptionIds,
+                    commit = false,
+                )
+                if (candidate.content == null) {
+                    // Nothing was committed, so the active slot, the file and the Box still name
+                    // the previous subscription; only the refusal is new.
+                    showToast(
+                        str(
+                            com.interstellar.proxy.R.string.vm_activate_refused,
+                            targetName,
+                            candidate.error ?: str(com.interstellar.proxy.R.string.vm_config_update_failed),
+                            previousName,
+                        ),
+                        UiToast.Kind.Error,
+                    )
+                    return@launch
+                }
+                // Commit order: name the profile, then install its config. A reader that observes
+                // the new id can only ever observe the config that belongs to it.
+                SubscriptionRepository.activeSubscriptionId = id
+                _activeSubscriptionId.value = id
+                val revision = ConfigStore.writeActiveConfig(candidate.content, candidate.ownerId ?: id)
+                refreshStaticGroups()
+                if (_status.value != Status.Started && _status.value != Status.Starting) {
+                    showToast(str(com.interstellar.proxy.R.string.vm_config_saved), UiToast.Kind.Success)
+                    return@launch
+                }
+                waitForStartSettle()
+                // The switch ITSELF changes the active id, so the identity to hold the reload to is
+                // the one this method just committed: same new id, same mix pool, same engine, and
+                // exactly the revision written above. Comparing against the pre-switch snapshot
+                // would refuse every activation - which is what left the UI on B while the Box kept
+                // running A's config, with the old Box answering B's provider refresh.
+                val committed = start.copy(activeSubscriptionId = id, configRevision = revision)
+                if (!SubscriptionUpdateCoordinator.stillOwns(committed, instanceSnapshot(), revision)) {
+                    showToast(
+                        str(com.interstellar.proxy.R.string.vm_config_apply_superseded),
+                        UiToast.Kind.Error,
+                    )
+                    return@launch
+                }
+                when (val outcome = reloadVerdict()) {
+                    is ReloadOutcome.Applied ->
+                        showToast(str(com.interstellar.proxy.R.string.vm_config_reloaded), UiToast.Kind.Success)
+
+                    is ReloadOutcome.Failed -> {
+                        // The core refused the candidate: put the previous profile back, so the UI,
+                        // the file and the Box agree again, and bring its config back up.
+                        SubscriptionRepository.activeSubscriptionId = previousId
+                        _activeSubscriptionId.value = previousId
+                        val restored = restoreAfterFailedReload(
+                            previousConfig = activeBefore,
+                            previousOwner = ownerBefore,
+                            rawOwnerId = previousId.takeIf { it.isNotBlank() },
+                            previousRaw = rawBefore,
+                            failure = outcome.error,
+                        )
+                        showToast(
+                            str(
+                                if (restored) {
+                                    com.interstellar.proxy.R.string.vm_activate_refused_restored
+                                } else {
+                                    com.interstellar.proxy.R.string.vm_activate_refused
+                                },
+                                targetName,
+                                outcome.error ?: str(com.interstellar.proxy.R.string.vm_config_apply_failed),
+                                previousName,
+                            ),
+                            UiToast.Kind.Error,
+                        )
+                    }
+                }
+            } finally {
+                _busy.value = false
+                _subscriptions.value = SubscriptionRepository.subscriptions.toList()
+                _activeSubscriptionId.value = SubscriptionRepository.activeSubscriptionId
+                _mixSubscriptionIds.value = Settings.mixSubscriptionIds
+            }
+        }
     }
 
     /**

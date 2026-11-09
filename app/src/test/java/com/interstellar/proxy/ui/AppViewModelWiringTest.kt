@@ -562,21 +562,21 @@ class AppViewModelWiringTest {
      */
     @Test
     fun `a partly applied provider refresh is reported before the plain summary`() {
-        val body = code(bodyOf("private fun reportProviders("))
+        val body = code(bodyOf("private fun providerMessage("))
         val partial = body.indexOf("partlyApplied(")
         val summary = body.indexOf("vm_provider_summary")
         assertTrue(
-            "`reportProviders()` no longer checks whether the refresh was only partly applied",
+            "`providerMessage()` no longer checks whether the refresh was only partly applied",
             partial >= 0,
         )
-        assertTrue("`reportProviders()` no longer prints the plain provider summary", summary >= 0)
+        assertTrue("`providerMessage()` no longer prints the plain provider summary", summary >= 0)
         assertTrue(
-            "`reportProviders()` prints the plain summary before checking the partial case, so a " +
+            "`providerMessage()` prints the plain summary before checking the partial case, so a " +
                 "document whose membership the live graph refused is presented as a clean success.",
             partial < summary,
         )
         assertTrue(
-            "`reportProviders()` no longer reports the partial case as an error; its result would read " +
+            "`providerMessage()` no longer reports the partial case as an error; its result would read " +
                 "like any other successful refresh.",
             body.substring(partial).contains("UiToast.Kind.Error"),
         )
@@ -589,20 +589,24 @@ class AppViewModelWiringTest {
      * landing after the user activated B reloaded B (the active config "changed") and refreshed
      * B's providers, attributing B's state to A's operation. The owner of the live instance has to
      * be captured before the request and re-checked before the result is applied.
+     *
+     * The id alone is NOT that identity (A -> B -> A, a restart of the same profile and a mix
+     * change all leave it equal), so the capture is an instance snapshot: pool + engine generation
+     * + config revision.
      */
     @Test
     fun `a late update result is dropped when another profile became active`() {
         val body = bodyOf("fun refreshSubscription(")
-        val capture = body.indexOf("val activeIdAtStart = SubscriptionRepository.activeSubscriptionId")
+        val capture = body.indexOf("val start = instanceSnapshot()")
         val decide = body.indexOf("affectsActiveConfig(")
         val fetch = body.indexOf("SubscriptionFetcher.fetch(")
         val owns = body.indexOf("ownsInstance(")
-        assertTrue("`refreshSubscription()` no longer captures the active profile before the fetch", capture >= 0)
+        assertTrue("`refreshSubscription()` no longer captures the instance identity before the fetch", capture >= 0)
         assertTrue("`refreshSubscription()` no longer decides pool membership", decide >= 0)
         assertTrue("`refreshSubscription()` no longer fetches the subscription", fetch >= 0)
         assertTrue(
-            "`refreshSubscription()` captures the active profile after the pool decision or after the fetch, " +
-                "so the owner of the live instance is not known when the request starts",
+            "`refreshSubscription()` captures the instance identity after the pool decision or after the " +
+                "fetch, so the owner of the live instance is not known when the request starts",
             capture < decide && decide < fetch,
         )
         assertTrue(
@@ -622,11 +626,11 @@ class AppViewModelWiringTest {
     @Test
     fun `a batch that outlives its profile is dropped the same way`() {
         val body = bodyOf("fun refreshAll()")
-        val capture = body.indexOf("val activeIdAtStart = SubscriptionRepository.activeSubscriptionId")
+        val capture = body.indexOf("val start = instanceSnapshot()")
         val launch = body.indexOf("coroutineScope {")
         val owns = body.indexOf("ownsInstance(")
-        assertTrue("`refreshAll()` no longer captures the active profile before the batch", capture >= 0)
-        assertTrue("`refreshAll()` captures the active profile after the batch started", capture < launch)
+        assertTrue("`refreshAll()` no longer captures the instance identity before the batch", capture >= 0)
+        assertTrue("`refreshAll()` captures the instance identity after the batch started", capture < launch)
         assertTrue(
             "`refreshAll()` no longer re-checks instance ownership before applying the batch result, so a " +
                 "batch that lands after another profile became active reloads and refreshes that profile.",
@@ -644,40 +648,46 @@ class AppViewModelWiringTest {
 
     /**
      * A body that downloaded fine but was refused as a config must reach the initiator as that
-     * refusal. The repository already keeps the previous active config and records the verdict in
-     * `lastConfigError`; the update path used to ignore it and report the outcome as a config
-     * result, which claims a refresh that never happened.
+     * refusal, and it must not have replaced the subscription's previous body.
+     *
+     * The repository now refuses the candidate BEFORE it touches the disk (`commitFetchedBody`), so
+     * the refusal travels in the update's own result instead of a global error slot another
+     * operation can steal.
      */
     @Test
     fun `a refused body is reported instead of a config result`() {
         val signature = "private suspend fun reportManualUpdateOutcome("
         val body = code(bodyOf(signature))
-        val refusal = body.indexOf("report.configError")
-        val config = body.indexOf("if (report.config)")
         assertTrue(
             "`reportManualUpdateOutcome()` no longer looks at `report.configError`, so a refused body is " +
                 "reported as a config result the running instance never applied.",
-            refusal >= 0,
-        )
-        assertTrue(
-            "`reportManualUpdateOutcome()` checks the config half before the refusal, so the refusal can " +
-                "never be shown and the user sees an applied/unchanged config instead.",
-            refusal < config,
-        )
-        assertInBody(
-            signature,
-            "showToast(report.configError",
-            "the refusal is no longer surfaced to the user.",
+            body.contains("report.configError"),
         )
         assertInBody(
             "fun refreshSubscription(",
-            "configError = if (updated) SubscriptionRepository.takeConfigError() else null",
-            "`refreshSubscription()` no longer carries the repository's refusal verdict into the report.",
+            "when (val commit = SubscriptionRepository.commitFetchedBody(",
+            "`refreshSubscription()` no longer validates the downloaded body before it is stored, so a body " +
+                "the core refuses can overwrite the subscription's last good one.",
+        )
+        assertInBody(
+            "fun refreshSubscription(",
+            "is SubscriptionRepository.BodyCommit.Refused -> {",
+            "`refreshSubscription()` no longer handles the refused candidate as its own result.",
+        )
+        assertInBody(
+            "fun refreshSubscription(",
+            "configError = commitError ?:",
+            "`refreshSubscription()` no longer carries the refusal into the report.",
         )
         assertInBody(
             "fun refreshAll()",
-            "configError = if (ok > 0) SubscriptionRepository.takeConfigError() else null",
-            "`refreshAll()` no longer carries the repository's refusal verdict into the report.",
+            "is SubscriptionRepository.BodyCommit.Refused -> {",
+            "`refreshAll()` no longer keeps a refused candidate out of the subscription's stored body.",
+        )
+        assertInBody(
+            "fun refreshAll()",
+            "configError = refusals.firstOrNull(),",
+            "`refreshAll()` no longer carries the refusal into the report.",
         )
     }
 
@@ -752,5 +762,166 @@ class AppViewModelWiringTest {
                 "branch stops refreshing the running instance's remote node sources.",
         )
     }
-}
 
+    // --- A2: activation and application belong to the profile the UI names ---------------------------
+
+    /**
+     * The active profile may only be renamed AFTER its config was built and validated.
+     *
+     * The defect this binds: `activateSubscription` set the new id first and regenerated second; a
+     * subscription whose raw body the core refuses left the card pointing at B while the file and
+     * the Box still served A's config. The candidate is now built first, and a refused candidate
+     * rolls the id back.
+     */
+    @Test
+    fun `a subscription is only activated after its config was built and validated`() {
+        val body = bodyOf("fun activateSubscription(")
+        val build = body.indexOf("SubscriptionRepository.buildActiveConfig(")
+        val commitId = body.indexOf("SubscriptionRepository.activeSubscriptionId = id")
+        val refuse = body.indexOf("if (candidate.content == null)")
+        val rollback = body.indexOf("SubscriptionRepository.activeSubscriptionId = previousId")
+        assertTrue("`activateSubscription()` no longer builds the candidate config", build >= 0)
+        assertTrue("`activateSubscription()` no longer checks whether a candidate was produced", refuse >= 0)
+        assertTrue(
+            "`activateSubscription()` names the new profile before building its config, so a refused " +
+                "candidate leaves the UI, the file and the Box naming different profiles.",
+            build < commitId && refuse < commitId,
+        )
+        assertTrue(
+            "`activateSubscription()` does not put the previous profile back when the core refuses the " +
+                "candidate, so the UI keeps claiming a profile the Box never ran.",
+            rollback > commitId,
+        )
+        assertTrue(
+            "`activateSubscription()` no longer reports why the activation failed.",
+            body.contains("vm_activate_refused"),
+        )
+    }
+
+    /**
+     * "Applied" must be an observation of the core, not the return of a void RPC.
+     *
+     * `CommandClient.serviceReload()` returns void; the handler stops the service on failure. The
+     * verdict carries the revision it applied, and the ViewModel only reports Reloaded when that
+     * revision is the one it wrote.
+     */
+    @Test
+    fun `the reload verdict is read back from the core instead of assumed`() {
+        val body = code(bodyOf("private fun reloadVerdict()"))
+        assertTrue(
+            "`reloadVerdict()` no longer reads the verdict the Box recorded, so a refused reload is " +
+                "reported as an applied configuration.",
+            body.contains("BoxService.lastReload"),
+        )
+        assertTrue(
+            "`reloadVerdict()` no longer compares the applied revision with the one this client wrote.",
+            body.contains("verdict.configRevision != revision"),
+        )
+        assertTrue("`reloadVerdict()` no longer distinguishes success from failure.", body.contains("verdict.success"))
+        val apply = code(bodyOf("private suspend fun applyActiveConfigIfChanged("))
+        assertTrue(
+            "`applyActiveConfigIfChanged()` no longer treats a failed reload as a restore-and-restart case.",
+            apply.contains("restoreAfterFailedReload("),
+        )
+        assertTrue(
+            "`applyActiveConfigIfChanged()` no longer refuses to apply a config it does not own.",
+            apply.contains("ActiveConfigOutcome.Superseded"),
+        )
+    }
+
+    @Test
+    fun `a refused config restores the previous document and starts it`() {
+        val body = code(bodyOf("private suspend fun restoreAfterFailedReload("))
+        assertTrue(
+            "`restoreAfterFailedReload()` no longer puts the subscription's previous body back, so the next " +
+                "start (and the next activation) reuses the document the core refused.",
+            body.contains("restoreRawBody("),
+        )
+        assertTrue(
+            "`restoreAfterFailedReload()` no longer restores the previous active config.",
+            body.contains("writeActiveConfig("),
+        )
+        assertTrue(
+            "`restoreAfterFailedReload()` no longer brings a core up on the restored config, so a refused " +
+                "reload leaves the user disconnected even though the old config is known good.",
+            body.contains("startStoredConfig()"),
+        )
+    }
+
+    // --- one operation, one pill with both results ---------------------------------------------------
+
+    /**
+     * The two halves of one update are shown in ONE pill.
+     *
+     * Measured before the fix: the refusal toast and the provider summary were two `showToast` calls
+     * in a row, and the single toast slot meant the second always replaced the first. A two-line
+     * pill (`UiToast.secondary`) is what makes both results of one operation readable together.
+     */
+    @Test
+    fun `the two results of one update are shown in a single pill`() {
+        val body = code(bodyOf("private suspend fun reportManualUpdateOutcome("))
+        assertTrue(
+            "`reportManualUpdateOutcome()` no longer combines the halves into one pill.",
+            body.contains("showUpdateToast("),
+        )
+        assertTrue(
+            "`reportManualUpdateOutcome()` still fires separate toasts, so the later one replaces the other.",
+            !body.contains("showToast("),
+        )
+        assertTrue(
+            "the toast model no longer carries a second line, so both results cannot be shown together.",
+            source.contains("data class UiToast(val text: String, val kind: Kind, val secondary: String? = null)"),
+        )
+    }
+
+    /**
+     * A double tap is coalesced into the request already in flight, not sent twice.
+     */
+    @Test
+    fun `a double tap is coalesced instead of queued`() {
+        val body = bodyOf("fun refreshSubscription(")
+        val guard = body.indexOf("if (!beginUpdate(id))")
+        val launch = body.indexOf("viewModelScope.launch(")
+        assertTrue("`refreshSubscription()` no longer guards a subscription that is already updating", guard >= 0)
+        assertTrue(
+            "`refreshSubscription()` starts the second fetch before it checks whether one is already in flight, " +
+                "so a double tap issues two requests and two commits for one user action.",
+            guard < launch,
+        )
+        assertInBody(
+            "fun refreshSubscription(",
+            "endUpdate(id)",
+            "`refreshSubscription()` never releases the in-flight slot, so the subscription cannot be updated again.",
+        )
+        assertInBody(
+            "fun refreshSubscription(",
+            "vm_update_in_progress",
+            "the coalesced tap is swallowed silently; the user cannot tell why nothing happened.",
+        )
+    }
+
+    /**
+     * The periodic worker applies the same ownership rules as a manual update.
+     */
+    @Test
+    fun `the worker re-checks ownership and the reload verdict`() {
+        val worker = File("src/main/java/com/interstellar/proxy/data/UpdateWorker.kt").readText()
+        assertTrue(
+            "UpdateWorker no longer captures the instance identity before its batch, so a scheduled run that " +
+                "outlives its profile can reload another one.",
+            worker.contains("val start = instanceSnapshot()"),
+        )
+        assertTrue(
+            "UpdateWorker no longer re-checks ownership before it applies or refreshes.",
+            worker.contains("stillOwns(start, instanceSnapshot(), expectedRevision)"),
+        )
+        assertTrue(
+            "UpdateWorker reports a reload as applied without reading the core's verdict.",
+            worker.contains("BoxService.lastReload"),
+        )
+        assertTrue(
+            "UpdateWorker no longer compares the applied revision with the one it committed.",
+            worker.contains("verdict.configRevision == expectedRevision"),
+        )
+    }
+}

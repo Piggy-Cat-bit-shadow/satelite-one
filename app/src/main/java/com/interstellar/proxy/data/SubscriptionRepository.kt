@@ -14,7 +14,7 @@ import java.util.UUID
 
 /**
  * File-backed store for subscriptions, their nodes and the current selection.
- * Regenerates the active sing-box config on every mutation.
+ * Regenerates the active sing-box config on every mutation that can change it.
  */
 object SubscriptionRepository {
     private const val TAG = "SubscriptionRepo"
@@ -55,20 +55,65 @@ object SubscriptionRepository {
     /** Retained raw subscription body on disk (kept when it is a full core config). */
     fun rawFileOf(subscriptionId: String): File = File(dir, "$subscriptionId.raw")
 
+    /** Reads a subscription's retained raw body, or null when it has none. */
+    fun readRawBody(subscriptionId: String): String? =
+        runCatching { rawFileOf(subscriptionId).takeIf { it.isFile }?.readText() }.getOrNull()
+
+    /** Puts a previously retained body back (used to undo a candidate the core refused at runtime). */
+    fun restoreRawBody(subscriptionId: String, body: String?) {
+        val file = rawFileOf(subscriptionId)
+        if (body == null) {
+            runCatching { file.delete() }
+        } else {
+            runCatching { file.writeText(body) }
+        }
+    }
+
+    /** Outcome of deciding what to do with a downloaded subscription body. */
+    sealed interface BodyCommit {
+        /** The body was kept (a raw config) or the subscription is a node list again. */
+        data class Accepted(val format: String?) : BodyCommit
+
+        /** A sing-box body the core refuses; the subscription's previous body is still on disk. */
+        data class Refused(val error: String) : BodyCommit
+    }
+
     /**
-     * Persists the raw body and returns its detected format (null = plain
-     * node list, raw file removed). Airport configs use YAML anchors and
-     * provider-specific quirks, so the file is stored byte-for-byte (no
-     * re-serialization) and only fed to the matching core.
+     * Decides whether a downloaded body may replace the subscription's retained body.
+     *
+     * The candidate is validated with the same `Libbox.checkConfig` the apply path uses, BEFORE it
+     * touches the disk. A refused candidate must not overwrite the body of a subscription that has
+     * one: the previous body is that subscription's last good config, and replacing it with a body
+     * the core refuses is what left the next start with nothing to fall back to. A body that is not
+     * a raw core config (a node list) is accepted as "no raw body" and the stale file is dropped.
      */
-    fun saveRawBody(subscriptionId: String, body: String): String? {
-        val format = com.interstellar.proxy.data.subscription.RawConfigDetector.detect(body) ?: run {
+    fun commitFetchedBody(subscriptionId: String, body: String): BodyCommit {
+        val detected = com.interstellar.proxy.data.subscription.RawConfigDetector.detect(body)
+        if (detected == null) {
             rawFileOf(subscriptionId).delete()
-            return null
+            return BodyCommit.Accepted(null)
+        }
+        if (detected == com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX) {
+            val failure = runCatching { Libbox.checkConfig(body) }.exceptionOrNull()
+            if (failure != null) {
+                android.util.Log.e(TAG, "refusing fetched raw body: ${failure.message}")
+                return BodyCommit.Refused(str(com.interstellar.proxy.R.string.repo_raw_check_failed, failure.message ?: ""))
+            }
         }
         runCatching { rawFileOf(subscriptionId).writeText(body) }
-        return format.wire
+        return BodyCommit.Accepted(detected.wire)
     }
+
+    /**
+     * Retains [body] as the subscription's raw body and returns its detected format (null = plain
+     * node list). Kept for the import path; a body the core refuses is refused here too, so an
+     * invalid document is never imported as if it were a working profile.
+     */
+    fun saveRawBody(subscriptionId: String, body: String): String? =
+        when (val commit = commitFetchedBody(subscriptionId, body)) {
+            is BodyCommit.Accepted -> commit.format
+            is BodyCommit.Refused -> null
+        }
 
     var subscriptions: MutableList<Subscription> = load()
         private set
@@ -111,6 +156,19 @@ object SubscriptionRepository {
 
     fun get(id: String): Subscription? = subscriptions.find { it.id == id }
 
+    /**
+     * True when [subscriptionId] participates in the config the active slot would run.
+     *
+     * Used by [upsert] to decide whether a mutation can change the active config at all. Updating a
+     * subscription that is neither active nor a mix member must not rewrite — and therefore must
+     * not re-validate or re-commit — the config of the subscription that IS active.
+     */
+    fun affectsActivePool(subscriptionId: String, activeId: String, mixEnabled: Boolean, mixIds: Set<String>): Boolean {
+        if (subscriptionId.isBlank()) return false
+        if (activeId.isNotBlank() && subscriptionId == activeId) return true
+        return mixEnabled && subscriptionId in mixIds
+    }
+
     @Synchronized
     fun upsert(subscription: Subscription) {
         val index = subscriptions.indexOfFirst { it.id == subscription.id }
@@ -121,7 +179,9 @@ object SubscriptionRepository {
         }
         if (activeSubscriptionId.isBlank()) activeSubscriptionId = subscription.id
         save()
-        regenerateActiveConfig()
+        if (affectsActivePool(subscription.id, activeSubscriptionId, Settings.mixEnabled, Settings.mixSubscriptionIds)) {
+            regenerateActiveConfig()
+        }
     }
 
     @Synchronized
@@ -206,13 +266,48 @@ object SubscriptionRepository {
         return error
     }
 
+    /** What one regeneration of the active config produced, and whose config it is. */
+    data class ActiveConfigBuild(
+        val content: String?,
+        /** Subscription the produced config belongs to; null when nothing was produced. */
+        val ownerId: String?,
+        /** Why nothing was produced (or why a raw body was refused), or null. */
+        val error: String?,
+        /** True when [content] is a subscription's raw document rather than a generated node pool. */
+        val raw: Boolean,
+    )
+
     /**
-     * Regenerates filesDir/active.json from the current node pool (the active
-     * subscription, or the mix union when Mix is on).
+     * Regenerates filesDir/active.json from the node pool (the active subscription, or
+     * the mix union when Mix is on).
      * Returns null when there is nothing to run.
      */
     @Synchronized
-    fun regenerateActiveConfig(includeTun: Boolean = true): String? {
+    fun regenerateActiveConfig(includeTun: Boolean = true): String? =
+        buildActiveConfig(
+            activeId = activeSubscriptionId,
+            mixEnabled = Settings.mixEnabled,
+            mixIds = Settings.mixSubscriptionIds,
+            includeTun = includeTun,
+            commit = true,
+        ).content
+
+    /**
+     * Builds (and, when [commit], installs) the config an active slot would run.
+     *
+     * A refused raw body is a terminal answer for THIS subscription only: the previous bytes stay on
+     * disk and are returned when they belong to the same subscription (its own last good), and are
+     * never returned when they belong to another one. That single rule is what keeps the UI, the
+     * file and the running Box naming the same profile after an activation is refused.
+     */
+    @Synchronized
+    fun buildActiveConfig(
+        activeId: String = activeSubscriptionId,
+        mixEnabled: Boolean = Settings.mixEnabled,
+        mixIds: Set<String> = Settings.mixSubscriptionIds,
+        includeTun: Boolean = true,
+        commit: Boolean = true,
+    ): ActiveConfigBuild {
         // Raw-config path — automatic, with no user switch to understand.
         //
         // If the active subscription's body is a complete sing-box config, it is
@@ -220,37 +315,47 @@ object SubscriptionRepository {
         // outbound rebuild, no route.final override. The config decides the
         // behaviour. Anything else (share links, base64 node lists, Clash YAML)
         // is not a config, so it falls through to the minimal generator below.
-        val activeSub = activeSubscription()
+        val activeSub = activeId.takeIf { it.isNotBlank() }?.let { get(it) }
         if (activeSub != null) {
             when (val rawApplied = applyRawConfigIfMatching(activeSub)) {
-                is RawApply.Applied -> return rawApplied.content
+                is RawApply.Applied -> {
+                    lastConfigError = null
+                    if (commit) ConfigStore.writeActiveConfig(rawApplied.content, activeSub.id)
+                    return ActiveConfigBuild(rawApplied.content, activeSub.id, null, raw = true)
+                }
                 // A raw body the core refused is a terminal answer for this regeneration: falling
                 // through to the node generator would overwrite the real reason with "no usable
-                // nodes". The last good active config stays on disk and keeps serving - including
-                // the next start, which must not be poisoned by the refused body.
-                RawApply.Refused -> {
-                    val lastGood = runCatching { ConfigStore.readActiveConfig() }.getOrNull()
-                    if (lastGood != null) return lastGood
-                    return null
+                // nodes". Only this subscription's OWN previous config may keep serving - another
+                // subscription's config must never be presented as this one's.
+                is RawApply.Refused -> {
+                    val lastGood = ConfigStore.readActiveConfig()
+                    val lastGoodOwner = ConfigStore.readActiveConfigOwner()
+                    lastConfigError = rawApplied.error
+                    return if (lastGood != null && lastGoodOwner == activeSub.id) {
+                        ActiveConfigBuild(lastGood, activeSub.id, rawApplied.error, raw = true)
+                    } else {
+                        ActiveConfigBuild(null, null, rawApplied.error, raw = true)
+                    }
                 }
                 RawApply.NotRaw -> Unit
             }
         }
 
-        val mix = Settings.mixEnabled
-        if (!mix && activeSubscription() == null) {
-            lastConfigError = str(com.interstellar.proxy.R.string.repo_no_subscription_selected)
-            return null
+        if (!mixEnabled && activeSub == null) {
+            val error = str(com.interstellar.proxy.R.string.repo_no_subscription_selected)
+            lastConfigError = error
+            return ActiveConfigBuild(null, null, error, raw = false)
         }
 
-        val nodes = activeNodes()
+        val nodes = poolOf(subscriptions, activeId, mixEnabled, mixIds)
         if (nodes.isEmpty()) {
-            lastConfigError = when {
-                mix && mixedSubscriptions().isEmpty() -> str(com.interstellar.proxy.R.string.repo_mix_none_checked)
-                mix -> str(com.interstellar.proxy.R.string.repo_selected_no_nodes)
+            val error = when {
+                mixEnabled && !hasUsableMixMember(mixIds) -> str(com.interstellar.proxy.R.string.repo_mix_none_checked)
+                mixEnabled -> str(com.interstellar.proxy.R.string.repo_selected_no_nodes)
                 else -> str(com.interstellar.proxy.R.string.repo_no_nodes)
             }
-            return null
+            lastConfigError = error
+            return ActiveConfigBuild(null, null, error, raw = false)
         }
 
         val selectedTag = Settings.selectedOutboundTag.takeIf { it.isNotBlank() }
@@ -263,22 +368,27 @@ object SubscriptionRepository {
         val content = MinimalConfigBuilder.build(nodes, opts)
         return try {
             Libbox.checkConfig(content)
-            ConfigStore.writeActiveConfig(content)
             lastConfigError = null
-            content
+            if (commit) ConfigStore.writeActiveConfig(content, activeSub?.id ?: activeId.takeIf { it.isNotBlank() })
+            ActiveConfigBuild(content, activeSub?.id ?: activeId.takeIf { it.isNotBlank() }, null, raw = false)
         } catch (e: Exception) {
-            lastConfigError = str(com.interstellar.proxy.R.string.repo_config_check_failed, e.message ?: "")
+            val error = str(com.interstellar.proxy.R.string.repo_config_check_failed, e.message ?: "")
+            lastConfigError = error
             android.util.Log.e(TAG, "config check failed: ${e.message}\n$content", e)
-            null
+            ActiveConfigBuild(null, null, error, raw = false)
         }
     }
+
+    /** True when at least one checked mix member can contribute nodes (raw configs cannot). */
+    private fun hasUsableMixMember(mixIds: Set<String>): Boolean =
+        subscriptions.any { it.id in mixIds && !isRawConfig(it) }
 
     suspend fun regenerateActiveConfigAsync(): String? = withContext(Dispatchers.IO) {
         regenerateActiveConfig()
     }
 
     /**
-     * Raw path of [regenerateActiveConfig]; null = not applicable, use the rewrite.
+     * Raw path of [buildActiveConfig]; [RawApply.NotRaw] = not applicable, use the rewrite.
      *
      * The subscription body is written out exactly as it was received: no
      * injected outbounds, no rule sets, no DNS rewrite, no route.final override.
@@ -288,7 +398,7 @@ object SubscriptionRepository {
         data class Applied(val content: String) : RawApply
 
         /** The body is a sing-box document and the core refused it; the previous config stands. */
-        object Refused : RawApply
+        data class Refused(val error: String) : RawApply
 
         /** This subscription is not a raw sing-box body, or has none on disk yet. */
         object NotRaw : RawApply
@@ -300,16 +410,13 @@ object SubscriptionRepository {
         // bodies were only ever pass-through for the sidecars this client no
         // longer ships.
         if (format != com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX) return RawApply.NotRaw
-        val raw = runCatching { rawFileOf(sub.id).takeIf { it.isFile }?.readText() }.getOrNull() ?: return RawApply.NotRaw
+        val raw = readRawBody(sub.id)?.takeIf { it.isNotBlank() } ?: return RawApply.NotRaw
         return try {
             Libbox.checkConfig(raw)
-            ConfigStore.writeActiveConfig(raw)
-            lastConfigError = null
             RawApply.Applied(raw)
         } catch (e: Exception) {
-            lastConfigError = str(com.interstellar.proxy.R.string.repo_raw_check_failed, e.message ?: "")
             android.util.Log.e(TAG, "raw config check failed: ${e.message}", e)
-            RawApply.Refused
+            RawApply.Refused(str(com.interstellar.proxy.R.string.repo_raw_check_failed, e.message ?: ""))
         }
     }
 
@@ -322,13 +429,12 @@ object SubscriptionRepository {
         val url = sub.url ?: return@withContext str(com.interstellar.proxy.R.string.vm_local_no_refresh)
         try {
             val result = com.interstellar.proxy.data.net.SubscriptionFetcher.fetch(url)
-            val format = saveRawBody(id, result.body)
-            when (val parsed = com.interstellar.proxy.data.subscription.SubscriptionParser.parse(result.body, id)) {
-                is com.interstellar.proxy.data.subscription.SubscriptionParser.Result.Nodes -> {
+            when (val commit = commitFetchedBody(id, result.body)) {
+                is BodyCommit.Refused -> {
+                    // The body is refused, but the download and its quota headers are real: keep the
+                    // subscription's previous config and update only the accounting.
                     upsert(
                         sub.copy(
-                            nodes = parsed.nodes,
-                            configFormat = format,
                             uploadBytes = result.uploadBytes,
                             downloadBytes = result.downloadBytes,
                             totalBytes = result.totalBytes,
@@ -336,32 +442,52 @@ object SubscriptionRepository {
                             lastUpdated = System.currentTimeMillis(),
                         ),
                     )
-                    str(com.interstellar.proxy.R.string.repo_refreshed, sub.name, parsed.nodes.size)
+                    commit.error
                 }
 
-                com.interstellar.proxy.data.subscription.SubscriptionParser.Result.Empty ->
-                    // e.g. a full sing-box profile: no nodes to extract, but the
-                    // raw body is retained and usable in raw mode. Quota still
-                    // belongs to this subscription, so keep it fresh too.
-                    if (format != null) {
-                        upsert(
-                            sub.copy(
-                                configFormat = format,
-                                uploadBytes = result.uploadBytes,
-                                downloadBytes = result.downloadBytes,
-                                totalBytes = result.totalBytes,
-                                expireSeconds = result.expireSeconds,
-                                lastUpdated = System.currentTimeMillis(),
-                            ),
-                        )
-                        str(
-                            com.interstellar.proxy.R.string.repo_refreshed_raw,
-                            sub.name,
-                            com.interstellar.proxy.data.subscription.RawConfigFormat.from(format)?.label ?: "",
-                        )
-                    } else {
-                        str(com.interstellar.proxy.R.string.repo_refresh_unparsable, sub.name)
+                is BodyCommit.Accepted -> {
+                    val format = commit.format
+                    when (val parsed = com.interstellar.proxy.data.subscription.SubscriptionParser.parse(result.body, id)) {
+                        is com.interstellar.proxy.data.subscription.SubscriptionParser.Result.Nodes -> {
+                            upsert(
+                                sub.copy(
+                                    nodes = parsed.nodes,
+                                    configFormat = format,
+                                    uploadBytes = result.uploadBytes,
+                                    downloadBytes = result.downloadBytes,
+                                    totalBytes = result.totalBytes,
+                                    expireSeconds = result.expireSeconds,
+                                    lastUpdated = System.currentTimeMillis(),
+                                ),
+                            )
+                            str(com.interstellar.proxy.R.string.repo_refreshed, sub.name, parsed.nodes.size)
+                        }
+
+                        com.interstellar.proxy.data.subscription.SubscriptionParser.Result.Empty ->
+                            // e.g. a full sing-box profile: no nodes to extract, but the
+                            // raw body is retained and usable in raw mode. Quota still
+                            // belongs to this subscription, so keep it fresh too.
+                            if (format != null) {
+                                upsert(
+                                    sub.copy(
+                                        configFormat = format,
+                                        uploadBytes = result.uploadBytes,
+                                        downloadBytes = result.downloadBytes,
+                                        totalBytes = result.totalBytes,
+                                        expireSeconds = result.expireSeconds,
+                                        lastUpdated = System.currentTimeMillis(),
+                                    ),
+                                )
+                                str(
+                                    com.interstellar.proxy.R.string.repo_refreshed_raw,
+                                    sub.name,
+                                    com.interstellar.proxy.data.subscription.RawConfigFormat.from(format)?.label ?: "",
+                                )
+                            } else {
+                                str(com.interstellar.proxy.R.string.repo_refresh_unparsable, sub.name)
+                            }
                     }
+                }
             }
         } catch (e: Exception) {
             str(com.interstellar.proxy.R.string.repo_refresh_failed, sub.name, e.message ?: "")

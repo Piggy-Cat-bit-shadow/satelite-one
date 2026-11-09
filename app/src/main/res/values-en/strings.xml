@@ -59,6 +59,13 @@
     <string name="vm_config_saved">Config saved; the core is not running, so it applies on next start</string>
     <string name="vm_config_unchanged">Config unchanged</string>
     <string name="vm_config_apply_failed">Config was written but the hot reload failed</string>
+    <string name="vm_config_apply_unconfirmed">The core did not confirm that this config was applied</string>
+    <string name="vm_config_apply_restored">The core refused the new config; the previous config was restored and the core restarted</string>
+    <string name="vm_config_apply_superseded">The running instance changed while the config was applying; nothing was reloaded</string>
+    <string name="vm_provider_superseded">Provider: the running instance changed; this refresh was not sent</string>
+    <string name="vm_activate_refused">Cannot activate “%1$s”: %2$s. Still using “%3$s”.</string>
+    <string name="vm_activate_refused_restored">Cannot activate “%1$s”: %2$s. “%3$s” was restored and the core restarted.</string>
+    <string name="vm_update_in_progress">“%1$s” is already updating; this tap was ignored</string>
 <string name="vm_update_superseded">The active profile changed while “%1$s” was updating; this result was not applied to the running instance</string>
 <string name="vm_update_all_superseded">The active profile changed during the batch update; this result was not applied to the running instance</string>
     <string name="vm_provider_summary">Provider: %1$d published, %2$d unchanged, %3$d failed, %4$d skipped</string>

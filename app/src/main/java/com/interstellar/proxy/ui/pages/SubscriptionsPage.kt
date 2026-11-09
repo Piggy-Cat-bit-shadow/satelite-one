@@ -596,16 +596,17 @@ private fun SubscriptionsToast(viewModel: AppViewModel, modifier: Modifier = Mod
         val t = toast ?: return@AnimatedVisibility
         val colors = LocalInterstellarColors.current
         val ok = t.kind == com.interstellar.proxy.ui.UiToast.Kind.Success
+        val secondary = t.secondary
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(50))
+                .clip(RoundedCornerShape(if (secondary == null) 50 else 20))
                 .background(colors.panelSolid)
                 .border(
                     1.dp,
                     if (ok) colors.primaryBorder else colors.border,
-                    RoundedCornerShape(50),
+                    RoundedCornerShape(if (secondary == null) 50 else 20),
                 )
                 .padding(horizontal = 16.dp, vertical = 11.dp),
         ) {
@@ -616,13 +617,27 @@ private fun SubscriptionsToast(viewModel: AppViewModel, modifier: Modifier = Mod
                     .background(if (ok) colors.success else colors.danger),
             )
             Spacer(Modifier.width(10.dp))
-            Text(
-                t.text,
-                color = colors.text,
-                fontSize = 13.sp,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
+            // Two results of ONE operation (config + provider) are shown together, never as two
+            // transient pills that replace each other before they can be read.
+            Column(Modifier.weight(1f)) {
+                Text(
+                    t.text,
+                    color = colors.text,
+                    fontSize = 13.sp,
+                    maxLines = if (secondary == null) 2 else 3,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (secondary != null) {
+                    Spacer(Modifier.height(3.dp))
+                    Text(
+                        secondary,
+                        color = colors.text.copy(alpha = 0.72f),
+                        fontSize = 12.sp,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
         }
     }
 }

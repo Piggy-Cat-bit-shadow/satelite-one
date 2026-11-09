@@ -57,6 +57,13 @@
     <string name="vm_config_saved">配置已保存；内核未运行，下次启动生效</string>
     <string name="vm_config_unchanged">配置未变化</string>
     <string name="vm_config_apply_failed">配置已写入，但热重载失败</string>
+    <string name="vm_config_apply_unconfirmed">内核未确认本次配置已生效</string>
+    <string name="vm_config_apply_restored">新配置被内核拒绝；已恢复上一份配置并重启内核</string>
+    <string name="vm_config_apply_superseded">配置应用期间运行实例已更换，本次未重载</string>
+    <string name="vm_provider_superseded">Provider：运行实例已更换，本次未刷新</string>
+    <string name="vm_activate_refused">无法激活「%1$s」：%2$s；仍在使用「%3$s」</string>
+    <string name="vm_activate_refused_restored">无法激活「%1$s」：%2$s；已恢复「%3$s」的配置并重启内核</string>
+    <string name="vm_update_in_progress">「%1$s」正在更新，本次点击已忽略</string>
 <string name="vm_update_superseded">「%1$s」更新期间已切换活动订阅，本次结果未应用到运行实例</string>
 <string name="vm_update_all_superseded">批量更新期间已切换活动订阅，本次结果未应用到运行实例</string>
     <string name="vm_provider_summary">Provider：发布 %1$d，未变 %2$d，失败 %3$d，跳过 %4$d</string>
