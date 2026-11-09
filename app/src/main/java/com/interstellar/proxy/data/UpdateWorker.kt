@@ -19,10 +19,20 @@ class UpdateWorker(context: Context, params: WorkerParameters) : CoroutineWorker
 
     override suspend fun doWork(): Result {
         if (!Settings.autoUpdateEnabled) return Result.success()
+        val activeBefore = ConfigStore.readActiveConfig()
         val messages = SubscriptionRepository.refreshAll()
-        // core hot-reload picks up the regenerated active config
+        // Same contract as a manual update: only a changed active config needs a
+        // hot-reload, while the provider refresh runs even when the body did not
+        // change (a remote document may have).
+        val changed = SubscriptionUpdateCoordinator.configChanged(
+            activeBefore,
+            ConfigStore.readActiveConfig(),
+        )
         if (messages.isNotEmpty() && Settings.tileActive) {
-            runCatching { CommandTarget.standaloneClient().serviceReload() }
+            if (changed) {
+                runCatching { CommandTarget.standaloneClient().serviceReload() }
+            }
+            runCatching { CommandTarget.standaloneClient().refreshRemoteProviders("", 15_000) }
         }
         return Result.success()
     }

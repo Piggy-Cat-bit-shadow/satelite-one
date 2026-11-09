@@ -11,8 +11,12 @@ import androidx.lifecycle.viewModelScope
 import com.interstellar.proxy.constant.Action
 import com.interstellar.proxy.constant.Status
 import com.interstellar.proxy.data.ConfigStore
+import com.interstellar.proxy.data.ProviderRefresh
+import com.interstellar.proxy.data.ProviderRefreshSummary
 import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.data.SubscriptionRepository
+import com.interstellar.proxy.data.SubscriptionUpdateCoordinator
+import com.interstellar.proxy.data.SubscriptionUpdateCoordinator.ActiveConfigAction
 import com.interstellar.proxy.data.config.MinimalConfigBuilder
 import com.interstellar.proxy.data.model.RoutingMode
 import com.interstellar.proxy.data.net.SubscriptionFetcher
@@ -1027,16 +1031,124 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             // a switch during Starting would otherwise be silently dropped: the
             // in-flight start already consumed the previous config and no
             // reload fires — wait for the start to settle, then apply
-            if (_status.value == Status.Starting) {
-                var waited = 0
-                while (_status.value == Status.Starting && waited < 20_000) {
-                    delay(200)
-                    waited += 200
-                }
-            }
+            waitForStartSettle()
             if (_status.value == Status.Started) {
                 runCatching { CommandTarget.standaloneClient().serviceReload() }
             }
+        }
+    }
+
+    /**
+     * Waits out an in-flight start so a reload is not dropped by the start that
+     * already consumed the previous config. Bounded by the same 20s budget as the
+     * original inline loop.
+     */
+    private suspend fun waitForStartSettle() {
+        if (_status.value != Status.Starting) return
+        var waited = 0
+        while (_status.value == Status.Starting && waited < 20_000) {
+            delay(200)
+            waited += 200
+        }
+    }
+
+    /** What happened to the active config after a manual subscription update. */
+    private enum class ActiveConfigOutcome { Unchanged, Reloaded, SavedOnly, Failed }
+
+    /**
+     * Applies the active config a manual update just regenerated.
+     *
+     * [before] is the config bytes captured before the refresh. A change while
+     * the core is running is hot-reloaded; a change while it is stopped is only
+     * persisted (it applies on the next start); no change never reloads. This is
+     * the "配置" half of the two results a manual update reports.
+     */
+    private suspend fun applyActiveConfigIfChanged(before: String?): ActiveConfigOutcome {
+        waitForStartSettle()
+        val after = ConfigStore.readActiveConfig() ?: return ActiveConfigOutcome.Failed
+        return when (
+            SubscriptionUpdateCoordinator.action(
+                changed = SubscriptionUpdateCoordinator.configChanged(before, after),
+                running = _status.value == Status.Started,
+            )
+        ) {
+            ActiveConfigAction.None -> ActiveConfigOutcome.Unchanged
+            ActiveConfigAction.SavedOnly -> ActiveConfigOutcome.SavedOnly
+            ActiveConfigAction.Reload ->
+                runCatching { CommandTarget.standaloneClient().serviceReload() }
+                    .fold({ ActiveConfigOutcome.Reloaded }, { ActiveConfigOutcome.Failed })
+        }
+    }
+
+    /**
+     * Refreshes the current remote providers on the live core. Returns null when
+     * no core is running or the command failed; the caller reports that case as
+     * "unavailable" rather than as an empty success.
+     */
+    private suspend fun refreshProvidersNow(timeoutMilliseconds: Long = 30_000): ProviderRefreshSummary? {
+        if (_status.value != Status.Started) return null
+        return runCatching {
+            ProviderRefresh.parse(
+                CommandTarget.standaloneClient().refreshRemoteProviders("", timeoutMilliseconds).value,
+            )
+        }.getOrNull()
+    }
+
+    private fun reportActiveConfig(outcome: ActiveConfigOutcome) {
+        when (outcome) {
+            ActiveConfigOutcome.Unchanged -> showToast(
+                str(com.interstellar.proxy.R.string.vm_config_unchanged), UiToast.Kind.Success,
+            )
+            ActiveConfigOutcome.Reloaded -> showToast(
+                str(com.interstellar.proxy.R.string.vm_config_reloaded), UiToast.Kind.Success,
+            )
+            ActiveConfigOutcome.SavedOnly -> showToast(
+                str(com.interstellar.proxy.R.string.vm_config_saved), UiToast.Kind.Success,
+            )
+            ActiveConfigOutcome.Failed -> showToast(
+                str(com.interstellar.proxy.R.string.vm_config_apply_failed), UiToast.Kind.Error,
+            )
+        }
+    }
+
+    private fun reportProviders(summary: ProviderRefreshSummary?) {
+        if (summary == null) {
+            showToast(str(com.interstellar.proxy.R.string.vm_provider_unavailable), UiToast.Kind.Error)
+            return
+        }
+        if (summary.boxChanged) {
+            showToast(str(com.interstellar.proxy.R.string.vm_provider_box_changed), UiToast.Kind.Error)
+            return
+        }
+        if (summary.cancelled) {
+            showToast(str(com.interstellar.proxy.R.string.vm_provider_cancelled), UiToast.Kind.Error)
+            return
+        }
+        val counts = ProviderRefresh.counts(summary)
+        showToast(
+            str(
+                com.interstellar.proxy.R.string.vm_provider_summary,
+                counts.published,
+                counts.unchanged,
+                counts.failed,
+                counts.skipped,
+            ),
+            if (counts.failed > 0 || counts.busy > 0) UiToast.Kind.Error else UiToast.Kind.Success,
+        )
+    }
+
+    /**
+     * Reports the two outcomes of a manual update that touched the active pool:
+     * the config application and the provider refresh. Providers are refreshed
+     * even when the config bytes did not change, so an unchanged subscription
+     * still gets a fresh remote document.
+     */
+    private suspend fun reportManualUpdateOutcome(activeBefore: String?) {
+        reportActiveConfig(applyActiveConfigIfChanged(activeBefore))
+        if (_status.value == Status.Started) {
+            reportProviders(refreshProvidersNow())
+        } else {
+            reportProviders(null)
         }
     }
 
@@ -1623,6 +1735,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             if (fromPull) _refreshing.value = true
             _busy.value = true
+            val activeBefore = ConfigStore.readActiveConfig()
+            var updated = false
             try {
                 val result = SubscriptionFetcher.fetch(url)
                 val format = SubscriptionRepository.saveRawBody(id, result.body)
@@ -1639,6 +1753,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                 lastUpdated = System.currentTimeMillis(),
                             ),
                         )
+                        updated = true
                         showToast(str(com.interstellar.proxy.R.string.vm_refreshed, sub.name, parsed.nodes.size), UiToast.Kind.Success)
                     }
 
@@ -1654,6 +1769,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                     lastUpdated = System.currentTimeMillis(),
                                 ),
                             )
+                            updated = true
                             showToast(str(com.interstellar.proxy.R.string.vm_config_kept, sub.name), UiToast.Kind.Success)
                         } else {
                             showToast(str(com.interstellar.proxy.R.string.vm_refresh_unparsable, sub.name), UiToast.Kind.Error)
@@ -1669,6 +1785,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 _subscriptions.value = SubscriptionRepository.subscriptions.toList()
                 _activeSubscriptionId.value = SubscriptionRepository.activeSubscriptionId
             }
+            if (updated &&
+                SubscriptionUpdateCoordinator.affectsActiveConfig(
+                    listOf(id),
+                    SubscriptionRepository.activeSubscriptionId,
+                    Settings.mixEnabled,
+                    Settings.mixSubscriptionIds,
+                )
+            ) {
+                reportManualUpdateOutcome(activeBefore)
+            }
         }
     }
 
@@ -1682,6 +1808,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             _refreshing.value = true
             _busy.value = true
+            val activeBefore = ConfigStore.readActiveConfig()
             val semaphore = kotlinx.coroutines.sync.Semaphore(3)
             var ok = 0
             try {
@@ -1746,6 +1873,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 refreshStaticGroups()
                 _subscriptions.value = SubscriptionRepository.subscriptions.toList()
                 _activeSubscriptionId.value = SubscriptionRepository.activeSubscriptionId
+            }
+            if (ok > 0 &&
+                SubscriptionUpdateCoordinator.affectsActiveConfig(
+                    subs.map { it.id },
+                    SubscriptionRepository.activeSubscriptionId,
+                    Settings.mixEnabled,
+                    Settings.mixSubscriptionIds,
+                )
+            ) {
+                reportManualUpdateOutcome(activeBefore)
             }
         }
     }

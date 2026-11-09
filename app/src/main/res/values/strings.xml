@@ -53,6 +53,14 @@
     <string name="vm_no_sub_to_update">没有可更新的订阅</string>
     <string name="vm_updated_all">已更新全部 %1$d 个订阅</string>
     <string name="vm_updated_partial">更新完成 %1$d/%2$d 个订阅</string>
+    <string name="vm_config_reloaded">新配置已应用到运行内核</string>
+    <string name="vm_config_saved">配置已保存；内核未运行，下次启动生效</string>
+    <string name="vm_config_unchanged">配置未变化</string>
+    <string name="vm_config_apply_failed">配置已写入，但热重载失败</string>
+    <string name="vm_provider_summary">Provider：发布 %1$d，未变 %2$d，失败 %3$d，跳过 %4$d</string>
+    <string name="vm_provider_cancelled">Provider 刷新已取消</string>
+    <string name="vm_provider_box_changed">内核实例已更换，Provider 刷新中止</string>
+    <string name="vm_provider_unavailable">Provider 刷新不可用（内核未运行或命令失败）</string>
     <string name="vm_keep_one_sub">至少保留一个订阅</string>
 
     <!-- subscription repository -->
