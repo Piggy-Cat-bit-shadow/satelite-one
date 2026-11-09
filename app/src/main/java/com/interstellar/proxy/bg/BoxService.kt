@@ -31,6 +31,7 @@ import com.interstellar.proxy.core.ProxyCore
 import com.interstellar.proxy.core.SystemProxyState
 import com.interstellar.proxy.data.ConfigStore
 import com.interstellar.proxy.data.CoreRuntime
+import com.interstellar.proxy.data.ReloadReceipt
 import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.ktx.hasPermission
 import kotlinx.coroutines.DelicateCoroutinesApi
@@ -52,24 +53,55 @@ class BoxService(private val service: Service, private val platformInterface: Pl
          * `CommandServerHandler.serviceReload()` returns void, so the command RPC cannot report a
          * refused reload: the failure is handled inside [serviceReload0], which stops the service.
          * The caller still has to know whether the revision it wrote is the one the Box is serving,
-         * so the verdict is recorded here with the revision it applied (or failed to apply), and
-         * the caller compares that against the revision it wrote. Without this, "the RPC returned"
-         * was being reported as "the config was applied".
+         * so the receipt is recorded here with the revision it read, the request intent that caused
+         * it, and the engine generation of the attempt.
          */
-        data class ReloadVerdict(
-            val success: Boolean,
-            val error: String?,
-            val configRevision: Long,
-            val engineGeneration: Long,
-            val atMillis: Long,
-        )
-
         @Volatile
-        var lastReload: ReloadVerdict? = null
+        var lastReload: ReloadReceipt? = null
             private set
 
-        private fun recordReload(verdict: ReloadVerdict) {
-            lastReload = verdict
+        /** A reload the client is about to ask for, registered before the RPC is sent. */
+        data class ReloadIntent(val id: Long, val revision: Long, val atMillis: Long)
+
+        private val reloadIntents = ArrayDeque<ReloadIntent>()
+        private var reloadIntentSequence = 0L
+
+        /**
+         * Binds the next reload of [revision] to a caller-visible id.
+         *
+         * The RPC carries no payload, so the service cannot be told which client request it is
+         * serving. Registering the intent here — same process, before the call — and consuming it in
+         * [serviceReload0] when the Box reads that revision is what lets a caller recognise its own
+         * receipt instead of reading whichever verdict was written last. Stale intents expire so a
+         * reload that never reached the Box cannot be matched by a later request for the same bytes.
+         */
+        @Synchronized
+        fun registerReloadIntent(revision: Long): ReloadIntent {
+            val now = System.currentTimeMillis()
+            while (reloadIntents.isNotEmpty() && now - reloadIntents.first().atMillis > 60_000) {
+                reloadIntents.removeFirst()
+            }
+            val intent = ReloadIntent(++reloadIntentSequence, revision, now)
+            reloadIntents.addLast(intent)
+            return intent
+        }
+
+        @Synchronized
+        private fun consumeReloadIntent(revision: Long): Long? {
+            val iterator = reloadIntents.iterator()
+            while (iterator.hasNext()) {
+                val intent = iterator.next()
+                if (intent.revision == revision) {
+                    iterator.remove()
+                    return intent.id
+                }
+            }
+            return null
+        }
+
+        @Synchronized
+        private fun recordReload(receipt: ReloadReceipt) {
+            lastReload = receipt
         }
 
         /**
@@ -325,7 +357,12 @@ class BoxService(private val service: Service, private val platformInterface: Pl
                 notification.show(service.getString(R.string.app_name), R.string.status_starting)
             }
 
-            val content = ConfigStore.readActiveConfig()
+            // The bytes this Box will run and the revision that identifies them come from ONE
+            // snapshot. A write that lands during applyConfig must leave the applied revision
+            // describing the old bytes, so a caller checking "is my revision serving?" sees the
+            // mismatch instead of a revision that was never applied.
+            val snapshot = ConfigStore.snapshot()
+            val content = snapshot.content
             if (content == null) {
                 stopAndAlert(Alert.EmptyConfiguration)
                 return
@@ -342,7 +379,7 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             }
             // The Box is running exactly these bytes; the revision is what a later "was my config
             // applied?" check compares against.
-            CoreRuntime.onConfigApplied(ConfigStore.activeConfigRevision())
+            CoreRuntime.onConfigApplied(snapshot.meta.revision)
 
             if (core?.needWifiState() == true) {
                 val wifiPermission =
@@ -413,8 +450,15 @@ class BoxService(private val service: Service, private val platformInterface: Pl
     }
 
     suspend fun serviceReload0() {
-        val content = ConfigStore.readActiveConfig()
-        val revision = ConfigStore.activeConfigRevision()
+        // One snapshot for both facts: the bytes the Box is asked to run and the revision that
+        // identifies them. Reading them separately let a write land in between, so the Box could
+        // apply the old document while recording the new revision (or vice versa).
+        val snapshot = ConfigStore.snapshot()
+        val content = snapshot.content
+        val revision = snapshot.meta.revision
+        // Bind this reload to the client request that asked for this exact revision, when there is
+        // one. A verification-only reload (a settings change) has no intent and records 0.
+        val requestId = consumeReloadIntent(revision)
         // A reload replaces the kernel Box even when the bytes are identical
         // (`daemon.StartedService.StartOrReloadService` closes the old instance before building the
         // next), so this IS a new engine generation: a result started against the previous instance
@@ -422,7 +466,7 @@ class BoxService(private val service: Service, private val platformInterface: Pl
         CoreRuntime.onEngineStarted()
         if (content == null) {
             recordReload(
-                ReloadVerdict(false, "empty configuration", revision, CoreRuntime.engineGeneration, System.currentTimeMillis()),
+                ReloadReceipt(requestId ?: 0L, false, "empty configuration", revision, CoreRuntime.engineGeneration, System.currentTimeMillis()),
             )
             CoreRuntime.onApplyFailed("empty configuration")
             stopAndAlert(Alert.EmptyConfiguration)
@@ -438,7 +482,7 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             // document on disk so the caller can restore it and start again. Both are done here and
             // by the caller; an uninterrupted swap needs the kernel-side atomic replace.
             recordReload(
-                ReloadVerdict(false, e.message, revision, CoreRuntime.engineGeneration, System.currentTimeMillis()),
+                ReloadReceipt(requestId ?: 0L, false, e.message, revision, CoreRuntime.engineGeneration, System.currentTimeMillis()),
             )
             CoreRuntime.onApplyFailed(e.message)
             stopAndAlert(Alert.CreateService, e.message)
@@ -455,7 +499,7 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             if (!service.hasPermission(wifiPermission)) {
                 val reason = "location permission missing"
                 recordReload(
-                    ReloadVerdict(false, reason, revision, CoreRuntime.engineGeneration, System.currentTimeMillis()),
+                    ReloadReceipt(requestId ?: 0L, false, reason, revision, CoreRuntime.engineGeneration, System.currentTimeMillis()),
                 )
                 CoreRuntime.onApplyFailed(reason)
                 stopAndAlert(Alert.RequestLocationPermission)
@@ -463,7 +507,7 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             }
         }
         recordReload(
-            ReloadVerdict(true, null, revision, CoreRuntime.engineGeneration, System.currentTimeMillis()),
+            ReloadReceipt(requestId ?: 0L, true, null, revision, CoreRuntime.engineGeneration, System.currentTimeMillis()),
         )
         CoreRuntime.onConfigApplied(revision)
     }

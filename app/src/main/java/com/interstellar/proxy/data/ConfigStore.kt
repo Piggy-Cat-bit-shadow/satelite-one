@@ -25,11 +25,31 @@ object ConfigStore {
     private const val ACTIVE_CONFIG = "active.json"
     private const val ACTIVE_META = "active.meta.json"
 
+    /**
+     * Test/embedding seam: run the store against [root] instead of the application files dir.
+     *
+     * The real store is process-wide Android state, but the invariants this class owns — "bytes and
+     * revision are one snapshot" and "restore only while the store is still at the failed revision" —
+     * are exactly the ones a late failure used to break. They need a JVM test that can commit two
+     * writes from different threads, which is what this seam enables.
+     */
+    @Volatile
+    private var rootOverride: File? = null
+
+    internal fun useRootForTest(root: File?) {
+        synchronized(this) {
+            rootOverride = root
+            meta = null
+        }
+    }
+
+    private fun root(): File = rootOverride ?: InterstellarApplication.application.filesDir
+
     val activeFile: File
-        get() = File(InterstellarApplication.application.filesDir, ACTIVE_CONFIG)
+        get() = File(root(), ACTIVE_CONFIG)
 
     private val metaFile: File
-        get() = File(InterstellarApplication.application.filesDir, ACTIVE_META)
+        get() = File(root(), ACTIVE_META)
 
     /** Identity of the bytes on disk: which subscription they belong to and which write they are. */
     @Serializable
@@ -37,6 +57,12 @@ object ConfigStore {
         val ownerSubscriptionId: String? = null,
         val revision: Long = 0,
         val sha256: String = "",
+    )
+
+    /** Config bytes and the identity of exactly those bytes. */
+    data class Snapshot(
+        val content: String?,
+        val meta: Meta,
     )
 
     private val json = Json {
@@ -47,18 +73,40 @@ object ConfigStore {
     @Volatile
     private var meta: Meta? = null
 
+    @Synchronized
     fun readActiveConfig(): String? {
         val file = activeFile
         if (!file.exists()) return null
         return runCatching { file.readText() }.getOrNull()?.takeIf { it.isNotBlank() }
     }
 
+    /**
+     * The config bytes and the revision that identifies them, read under one lock.
+     *
+     * Reading them separately is what lets a writer slip between the two reads: the reader then
+     * applies the old bytes while recording the new revision (or serves a revision that does not
+     * describe the bytes it ran). Every consumer that needs both — the Box start/reload path and the
+     * receipt it records — must take this snapshot instead.
+     */
+    @Synchronized
+    fun snapshot(): Snapshot {
+        val content = activeFile.takeIf { it.isFile }?.let { file ->
+            runCatching { file.readText() }.getOrNull()?.takeIf { it.isNotBlank() }
+        }
+        val current = readMeta()
+        // A metadata file without bytes (or a torn write) is not an identity.
+        return Snapshot(content, if (content == null) Meta() else current)
+    }
+
     /** Owner of the active config, or null when nothing usable is on disk. */
+    @Synchronized
     fun readActiveConfigOwner(): String? = readMeta().ownerSubscriptionId
 
     /** Monotonic write generation of the active config. */
+    @Synchronized
     fun activeConfigRevision(): Long = readMeta().revision
 
+    @Synchronized
     fun readActiveConfigMeta(): Meta = readMeta()
 
     /**
@@ -88,8 +136,33 @@ object ConfigStore {
         return next.revision
     }
 
-    /** Drop the active config (all subscriptions removed — nothing to run). */
+    /**
+     * Puts [content] back only while the store is still at [expectedRevision].
+     *
+     * This is the compare-and-swap a failed reload needs. Checking the revision and then calling
+     * [writeActiveConfig] is two operations: a newer commit (C) can land between the check and the
+     * write, and the failure of the older attempt (B) then rolls C back. Here both happen under one
+     * lock, so B has no way to overwrite a write it no longer owns.
+     *
+     * @return the restoring revision, or null when a newer write owns the store (nothing written).
+     */
     @Synchronized
+    fun restoreIfRevision(expectedRevision: Long, content: String, ownerSubscriptionId: String?): Long? {
+        val previous = readMeta()
+        if (previous.revision != expectedRevision) return null
+        if (!activeFile.isFile) return null
+        val next = Meta(
+            ownerSubscriptionId = ownerSubscriptionId,
+            revision = previous.revision + 1,
+            sha256 = sha256(content),
+        )
+        activeFile.writeText(content)
+        meta = next
+        runCatching { metaFile.writeText(json.encodeToString(next)) }
+        return next.revision
+    }
+
+    /** Drop the active config (all subscriptions removed — nothing to run). */    @Synchronized
     fun clear() {
         runCatching { activeFile.delete() }
         runCatching { metaFile.delete() }
@@ -102,6 +175,7 @@ object ConfigStore {
         return digest.joinToString("") { "%02x".format(it) }
     }
 
+    @Synchronized
     private fun readMeta(): Meta {
         meta?.let { return it }
         val loaded = runCatching {

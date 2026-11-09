@@ -10,10 +10,13 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.interstellar.proxy.constant.Action
 import com.interstellar.proxy.constant.Status
+import com.interstellar.proxy.data.ActiveConfigApply
+import com.interstellar.proxy.data.ActiveConfigRecovery
 import com.interstellar.proxy.data.ConfigStore
 import com.interstellar.proxy.data.CoreRuntime
 import com.interstellar.proxy.data.ProviderRefresh
 import com.interstellar.proxy.data.ProviderRefreshSummary
+import com.interstellar.proxy.data.ReloadRequest
 import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.data.SubscriptionRepository
 import com.interstellar.proxy.data.SubscriptionUpdateCoordinator
@@ -1099,24 +1102,39 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             val expectedRevision = ConfigStore.activeConfigRevision()
             if (!SubscriptionUpdateCoordinator.stillOwns(start, instanceSnapshot(), expectedRevision)) return@launch
             if (!SubscriptionUpdateCoordinator.configChanged(before, config)) return@launch
-            when (val outcome = reloadVerdict()) {
+            val committed = ConfigStore.snapshot()
+            val committedRawBody =
+                activeId.takeIf { it.isNotBlank() }?.let { SubscriptionRepository.readRawBody(it) }
+            when (val outcome = reloadVerdict(expectedRevision)) {
                 is ReloadOutcome.Applied -> Unit
                 is ReloadOutcome.Failed -> {
-                    val restored = restoreAfterFailedReload(
-                        previousConfig = before,
-                        previousOwner = ownerBefore,
-                        rawOwnerId = activeId.takeIf { it.isNotBlank() },
-                        previousRaw = rawBefore,
-                        failure = outcome.error,
+                    val recovery = recoverRefusedReload(
+                        ActiveConfigRecovery.FailedCandidate(
+                            committedRevision = expectedRevision,
+                            committedOwner = committed.meta.ownerSubscriptionId,
+                            previousConfig = before,
+                            previousOwner = ownerBefore,
+                            rawOwnerId = activeId.takeIf { it.isNotBlank() },
+                            committedRawBody = committedRawBody,
+                            previousRawBody = rawBefore,
+                        ),
+                        outcome.error,
                     )
                     _message.value = str(
-                        if (restored) {
+                        if (recovery == RecoveryOutcome.Restored) {
                             com.interstellar.proxy.R.string.vm_config_apply_restored
                         } else {
                             com.interstellar.proxy.R.string.vm_config_apply_failed
                         },
                     )
                 }
+
+                is ReloadOutcome.Unconfirmed ->
+                    _message.value = outcome.error
+                        ?: str(com.interstellar.proxy.R.string.vm_config_apply_unconfirmed)
+
+                // A newer write or instance owns the config; this refresh says nothing about it.
+                ReloadOutcome.Superseded -> Unit
             }
         }
     }
@@ -1141,7 +1159,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     /** What the core said about the revision this client asked it to apply. */
     private sealed interface ReloadOutcome {
         data class Applied(val revision: Long) : ReloadOutcome
+
+        /** The receipt is this request's refusal: recovery may undo it while it still owns it. */
         data class Failed(val error: String?, val revision: Long) : ReloadOutcome
+
+        /** A newer write/instance owns the config; this result must not touch it. */
+        data object Superseded : ReloadOutcome
+
+        /** The RPC failed without a matching receipt; what the Box did is unknown. */
+        data class Unconfirmed(val error: String?) : ReloadOutcome
     }
 
     /** Identity of the live instance plus the config generation it was asked to serve. */
@@ -1155,32 +1181,48 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         )
 
     /**
-     * Asks the core to reload and reads back whether THAT revision is what it is serving.
+     * Asks the core to reload [expectedRevision] and reads back whether THAT request applied it.
      *
      * `serviceReload()` is void on the wire, so a returned RPC is not a verdict: the failure path
-     * stops the service inside the handler. The recorded verdict carries the revision the handler
-     * actually applied, which is what makes "Configuration applied" an observation instead of an
-     * assumption.
+     * stops the service inside the handler. Before the call this registers a request intent for the
+     * revision, and [ActiveConfigApply.classify] compares the Box's receipt against that intent, the
+     * current revision and the live engine. A receipt that belongs to another request, a revision
+     * that moved while it was in flight, or a newer Box is [ReloadOutcome.Superseded] - never an
+     * applied config and never a failure the caller may roll back.
      */
-    private fun reloadVerdict(): ReloadOutcome {
-        val revision = ConfigStore.activeConfigRevision()
+    private fun reloadVerdict(expectedRevision: Long): ReloadOutcome {
+        val intent = com.interstellar.proxy.bg.BoxService.registerReloadIntent(expectedRevision)
+        val request = ReloadRequest(
+            requestId = intent.id,
+            revision = expectedRevision,
+            engineGenerationBefore = CoreRuntime.engineGeneration,
+        )
         val rpc = runCatching { CommandTarget.standaloneClient().serviceReload() }
-        if (rpc.isFailure) {
-            return ReloadOutcome.Failed(rpc.exceptionOrNull()?.message, revision)
-        }
-        val verdict = com.interstellar.proxy.bg.BoxService.lastReload
-            ?: return ReloadOutcome.Failed(str(com.interstellar.proxy.R.string.vm_config_apply_unconfirmed), revision)
-        if (verdict.configRevision != revision) {
-            // Another config was written between our write and the reload, so this verdict is about
-            // a different document.
-            return ReloadOutcome.Failed(str(com.interstellar.proxy.R.string.vm_config_apply_unconfirmed), revision)
-        }
-        return if (verdict.success) {
-            ReloadOutcome.Applied(revision)
-        } else {
-            ReloadOutcome.Failed(verdict.error, revision)
+        val receipt = com.interstellar.proxy.bg.BoxService.lastReload
+        return when (
+            ActiveConfigApply.classify(
+                request = request,
+                rpcSucceeded = rpc.isSuccess,
+                receipt = receipt,
+                currentRevision = ConfigStore.activeConfigRevision(),
+                currentGeneration = CoreRuntime.engineGeneration,
+                appliedRevision = CoreRuntime.appliedConfigRevision,
+            )
+        ) {
+            ActiveConfigApply.Verdict.APPLIED -> ReloadOutcome.Applied(expectedRevision)
+            ActiveConfigApply.Verdict.REFUSED ->
+                ReloadOutcome.Failed(receipt?.error, expectedRevision)
+            ActiveConfigApply.Verdict.SUPERSEDED -> ReloadOutcome.Superseded
+            ActiveConfigApply.Verdict.UNCONFIRMED ->
+                ReloadOutcome.Unconfirmed(
+                    rpc.exceptionOrNull()?.message
+                        ?: str(com.interstellar.proxy.R.string.vm_config_apply_unconfirmed),
+                )
         }
     }
+
+    /** What a refused reload's recovery actually did. */
+    private enum class RecoveryOutcome { Restored, Superseded, Failed }
 
     /**
      * Puts the previous document back after the core refused a config, and starts the core from it.
@@ -1189,25 +1231,47 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      * not available to the client: what it CAN do is keep the old bytes and bring a Box back with
      * them. Both the subscription's retained body and the active config are restored, so a later
      * start (and the next subscription read) sees the good document, not the refused one.
+     *
+     * The restore only happens while [candidate]'s committed revision is still the active one:
+     * [ActiveConfigRecovery] does the revision check and the write as one compare-and-swap, so a
+     * failure that lands after another operation committed a newer config (C) leaves C in place and
+     * reports [RecoveryOutcome.Superseded] instead of rolling it back. The same path is used by the
+     * periodic worker.
      */
-    private suspend fun restoreAfterFailedReload(
-        previousConfig: String?,
-        previousOwner: String?,
-        rawOwnerId: String?,
-        previousRaw: String?,
+    private suspend fun recoverRefusedReload(
+        candidate: ActiveConfigRecovery.FailedCandidate,
         failure: String?,
-    ): Boolean {
+    ): RecoveryOutcome {
         android.util.Log.w("InterstellarUI", "core refused the new config: $failure")
-        if (rawOwnerId != null) {
-            SubscriptionRepository.restoreRawBody(rawOwnerId, previousRaw)
+        return when (val result = ActiveConfigRecovery.restore(candidate)) {
+            is ActiveConfigRecovery.Result.Restored -> {
+                com.interstellar.proxy.core.AppLog.log(
+                    "config",
+                    "refused new config" + (failure?.let { " ($it)" } ?: "") +
+                        "; restored previous revision=${result.revision}" +
+                        (if (result.rawRestored) " and its retained body" else ""),
+                )
+                if (startStoredConfig()) RecoveryOutcome.Restored else RecoveryOutcome.Failed
+            }
+
+            ActiveConfigRecovery.Result.Superseded -> {
+                com.interstellar.proxy.core.AppLog.log(
+                    "config",
+                    "refused new config" + (failure?.let { " ($it)" } ?: "") +
+                        "; a newer commit owns the active config, nothing restored",
+                )
+                RecoveryOutcome.Superseded
+            }
+
+            ActiveConfigRecovery.Result.NothingToRestore -> {
+                com.interstellar.proxy.core.AppLog.log(
+                    "config",
+                    "refused new config" + (failure?.let { " ($it)" } ?: "") +
+                        "; no previous document to restore",
+                )
+                RecoveryOutcome.Failed
+            }
         }
-        if (previousConfig == null) return false
-        val revision = ConfigStore.writeActiveConfig(previousConfig, previousOwner)
-        com.interstellar.proxy.core.AppLog.log(
-            "config",
-            "refused new config" + (failure?.let { " ($it)" } ?: "") + "; restored previous revision=$revision",
-        )
-        return startStoredConfig()
     }
 
     /** Starts the core from whatever config is on disk, without regenerating it. */
@@ -1257,7 +1321,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         expectedRevision: Long,
     ): ActiveConfigOutcome {
         waitForStartSettle()
-        val after = ConfigStore.readActiveConfig() ?: return ActiveConfigOutcome.Failed
+        // Bytes and revision from ONE snapshot. `expectedRevision` is the revision this operation
+        // committed; if the store has moved past it, the config is no longer ours to apply.
+        val committed = ConfigStore.snapshot()
+        val after = committed.content ?: return ActiveConfigOutcome.Failed
+        if (committed.meta.revision != expectedRevision) return ActiveConfigOutcome.Superseded
         if (!SubscriptionUpdateCoordinator.stillOwns(start, instanceSnapshot(), expectedRevision)) {
             return ActiveConfigOutcome.Superseded
         }
@@ -1269,23 +1337,43 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         ) {
             ActiveConfigAction.None -> ActiveConfigOutcome.Unchanged
             ActiveConfigAction.SavedOnly -> ActiveConfigOutcome.SavedOnly
-            ActiveConfigAction.Reload -> when (val outcome = reloadVerdict()) {
-                is ReloadOutcome.Failed -> {
-                    val restored = restoreAfterFailedReload(
-                        before, previousOwner, rawOwnerId, previousRaw, outcome.error,
-                    )
-                    if (restored) ActiveConfigOutcome.Restored else ActiveConfigOutcome.Failed
-                }
-
-                // The reload itself replaces the kernel Box, so ownership is judged by what the
-                // live instance is SERVING: this exact revision. A third write or reload between
-                // our request and its completion makes it stale, and it is not reported as applied.
-                is ReloadOutcome.Applied ->
-                    if (!servingCommittedRevision(outcome.revision)) {
-                        ActiveConfigOutcome.Superseded
-                    } else {
-                        ActiveConfigOutcome.Reloaded
+            ActiveConfigAction.Reload -> {
+                // The body this operation stored, captured before the reload can be refused. The
+                // recovery may only put the old body back while this one is still on disk.
+                val committedRawBody = rawOwnerId?.let { SubscriptionRepository.readRawBody(it) }
+                when (val outcome = reloadVerdict(expectedRevision)) {
+                    is ReloadOutcome.Failed -> when (
+                        recoverRefusedReload(
+                            ActiveConfigRecovery.FailedCandidate(
+                                committedRevision = expectedRevision,
+                                committedOwner = committed.meta.ownerSubscriptionId,
+                                previousConfig = before,
+                                previousOwner = previousOwner,
+                                rawOwnerId = rawOwnerId,
+                                committedRawBody = committedRawBody,
+                                previousRawBody = previousRaw,
+                            ),
+                            outcome.error,
+                        )
+                    ) {
+                        RecoveryOutcome.Restored -> ActiveConfigOutcome.Restored
+                        RecoveryOutcome.Superseded -> ActiveConfigOutcome.Superseded
+                        RecoveryOutcome.Failed -> ActiveConfigOutcome.Failed
                     }
+
+                    // The reload itself replaces the kernel Box, so ownership is judged by what the
+                    // live instance is SERVING: this exact revision. A third write or reload between
+                    // our request and its completion makes it stale, and it is not reported as applied.
+                    is ReloadOutcome.Applied ->
+                        if (!servingCommittedRevision(outcome.revision)) {
+                            ActiveConfigOutcome.Superseded
+                        } else {
+                            ActiveConfigOutcome.Reloaded
+                        }
+
+                    ReloadOutcome.Superseded -> ActiveConfigOutcome.Superseded
+                    is ReloadOutcome.Unconfirmed -> ActiveConfigOutcome.Failed
+                }
             }
         }
     }
@@ -2382,7 +2470,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             val previousId = SubscriptionRepository.activeSubscriptionId
             val activeBefore = ConfigStore.readActiveConfig()
             val ownerBefore = ConfigStore.readActiveConfigOwner()
-            val rawBefore = previousId.takeIf { it.isNotBlank() }?.let { SubscriptionRepository.readRawBody(it) }
             val targetName = SubscriptionRepository.get(id)?.name ?: id
             val previousName = SubscriptionRepository.get(previousId)?.name ?: previousId
             try {
@@ -2433,36 +2520,75 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     )
                     return@launch
                 }
-                when (val outcome = reloadVerdict()) {
+                when (val outcome = reloadVerdict(revision)) {
                     is ReloadOutcome.Applied ->
                         showToast(str(com.interstellar.proxy.R.string.vm_config_reloaded), UiToast.Kind.Success)
 
                     is ReloadOutcome.Failed -> {
-                        // The core refused the candidate: put the previous profile back, so the UI,
-                        // the file and the Box agree again, and bring its config back up.
-                        SubscriptionRepository.activeSubscriptionId = previousId
-                        _activeSubscriptionId.value = previousId
-                        val restored = restoreAfterFailedReload(
-                            previousConfig = activeBefore,
-                            previousOwner = ownerBefore,
-                            rawOwnerId = previousId.takeIf { it.isNotBlank() },
-                            previousRaw = rawBefore,
-                            failure = outcome.error,
-                        )
-                        showToast(
-                            str(
-                                if (restored) {
-                                    com.interstellar.proxy.R.string.vm_activate_refused_restored
-                                } else {
-                                    com.interstellar.proxy.R.string.vm_activate_refused
-                                },
-                                targetName,
-                                outcome.error ?: str(com.interstellar.proxy.R.string.vm_config_apply_failed),
-                                previousName,
+                        // The core refused the candidate. Recovery is CAS-guarded: if another
+                        // activation/write committed a newer config while this reload was in flight,
+                        // nothing is restored and the newer state stays exactly as it is.
+                        val recovery = recoverRefusedReload(
+                            ActiveConfigRecovery.FailedCandidate(
+                                committedRevision = revision,
+                                committedOwner = candidate.ownerId ?: id,
+                                previousConfig = activeBefore,
+                                previousOwner = ownerBefore,
+                                rawOwnerId = null,
+                                committedRawBody = null,
+                                previousRawBody = null,
                             ),
+                            outcome.error,
+                        )
+                        if (recovery == RecoveryOutcome.Restored) {
+                            // Only now, and only while the UI still names the candidate, put the
+                            // previous profile back: the config CAS above already proved the store
+                            // was still the candidate this operation wrote.
+                            if (SubscriptionRepository.activeSubscriptionId == id) {
+                                SubscriptionRepository.activeSubscriptionId = previousId
+                                _activeSubscriptionId.value = previousId
+                            }
+                            showToast(
+                                str(
+                                    com.interstellar.proxy.R.string.vm_activate_refused_restored,
+                                    targetName,
+                                    outcome.error ?: str(com.interstellar.proxy.R.string.vm_config_apply_failed),
+                                    previousName,
+                                ),
+                                UiToast.Kind.Error,
+                            )
+                        } else if (recovery == RecoveryOutcome.Superseded) {
+                            showToast(
+                                str(com.interstellar.proxy.R.string.vm_config_apply_superseded),
+                                UiToast.Kind.Error,
+                            )
+                        } else {
+                            showToast(
+                                str(
+                                    com.interstellar.proxy.R.string.vm_activate_refused,
+                                    targetName,
+                                    outcome.error ?: str(com.interstellar.proxy.R.string.vm_config_apply_failed),
+                                    previousName,
+                                ),
+                                UiToast.Kind.Error,
+                            )
+                        }
+                    }
+
+                    // No matching receipt: the Box's state is unknown. Leave the committed id and
+                    // config alone (rolling them back would be an unverified second guess) and say
+                    // the application was not confirmed.
+                    is ReloadOutcome.Unconfirmed ->
+                        showToast(
+                            outcome.error ?: str(com.interstellar.proxy.R.string.vm_config_apply_unconfirmed),
                             UiToast.Kind.Error,
                         )
-                    }
+
+                    ReloadOutcome.Superseded ->
+                        showToast(
+                            str(com.interstellar.proxy.R.string.vm_config_apply_superseded),
+                            UiToast.Kind.Error,
+                        )
                 }
             } finally {
                 _busy.value = false

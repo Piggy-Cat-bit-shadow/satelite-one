@@ -49,6 +49,9 @@ object SubscriptionRepository {
     private val dir: File
         get() = File(InterstellarApplication.application.filesDir, "subscriptions").also { it.mkdirs() }
 
+    /** Serializes raw-body reads/writes so a guarded restore cannot interleave a newer commit. */
+    private val rawBodyLock = Any()
+
     private val indexFile: File
         get() = File(InterstellarApplication.application.filesDir, "subscriptions.json")
 
@@ -56,11 +59,35 @@ object SubscriptionRepository {
     fun rawFileOf(subscriptionId: String): File = File(dir, "$subscriptionId.raw")
 
     /** Reads a subscription's retained raw body, or null when it has none. */
-    fun readRawBody(subscriptionId: String): String? =
+    fun readRawBody(subscriptionId: String): String? = synchronized(rawBodyLock) {
+        readRawBodyLocked(subscriptionId)
+    }
+
+    private fun readRawBodyLocked(subscriptionId: String): String? =
         runCatching { rawFileOf(subscriptionId).takeIf { it.isFile }?.readText() }.getOrNull()
 
     /** Puts a previously retained body back (used to undo a candidate the core refused at runtime). */
     fun restoreRawBody(subscriptionId: String, body: String?) {
+        synchronized(rawBodyLock) { writeRawBodyLocked(subscriptionId, body) }
+    }
+
+    /**
+     * Puts [previousBody] back only while the retained body is still [currentBody].
+     *
+     * A late failure of an older update must not overwrite the body a newer update committed. The
+     * comparison and the write share [rawBodyLock] with [commitFetchedBody], so a commit that lands
+     * between them cannot be rolled back by the older attempt.
+     *
+     * @return true when the older body was restored, false when a newer body owns the file.
+     */
+    fun restoreRawBodyIfCurrent(subscriptionId: String, currentBody: String?, previousBody: String?): Boolean =
+        synchronized(rawBodyLock) {
+            if (readRawBodyLocked(subscriptionId) != currentBody) return@synchronized false
+            writeRawBodyLocked(subscriptionId, previousBody)
+            true
+        }
+
+    private fun writeRawBodyLocked(subscriptionId: String, body: String?) {
         val file = rawFileOf(subscriptionId)
         if (body == null) {
             runCatching { file.delete() }
@@ -87,21 +114,21 @@ object SubscriptionRepository {
      * the core refuses is what left the next start with nothing to fall back to. A body that is not
      * a raw core config (a node list) is accepted as "no raw body" and the stale file is dropped.
      */
-    fun commitFetchedBody(subscriptionId: String, body: String): BodyCommit {
+    fun commitFetchedBody(subscriptionId: String, body: String): BodyCommit = synchronized(rawBodyLock) {
         val detected = com.interstellar.proxy.data.subscription.RawConfigDetector.detect(body)
         if (detected == null) {
             rawFileOf(subscriptionId).delete()
-            return BodyCommit.Accepted(null)
+            return@synchronized BodyCommit.Accepted(null)
         }
         if (detected == com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX) {
             val failure = runCatching { Libbox.checkConfig(body) }.exceptionOrNull()
             if (failure != null) {
                 android.util.Log.e(TAG, "refusing fetched raw body: ${failure.message}")
-                return BodyCommit.Refused(str(com.interstellar.proxy.R.string.repo_raw_check_failed, failure.message ?: ""))
+                return@synchronized BodyCommit.Refused(str(com.interstellar.proxy.R.string.repo_raw_check_failed, failure.message ?: ""))
             }
         }
         runCatching { rawFileOf(subscriptionId).writeText(body) }
-        return BodyCommit.Accepted(detected.wire)
+        BodyCommit.Accepted(detected.wire)
     }
 
     /**

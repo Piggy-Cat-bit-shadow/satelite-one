@@ -821,26 +821,35 @@ class AppViewModelWiringTest {
      * "Applied" must be an observation of the core, not the return of a void RPC.
      *
      * `CommandClient.serviceReload()` returns void; the handler stops the service on failure. The
-     * verdict carries the revision it applied, and the ViewModel only reports Reloaded when that
-     * revision is the one it wrote.
+     * receipt carries the request intent, the revision the Box read and the engine generation of
+     * the attempt, and the ViewModel only reports Reloaded when that receipt is this request's and
+     * the live instance is serving this revision.
      */
     @Test
-    fun `the reload verdict is read back from the core instead of assumed`() {
-        val body = code(bodyOf("private fun reloadVerdict()"))
+    fun `the reload verdict is bound to this request and revision`() {
+        val body = code(bodyOf("private fun reloadVerdict("))
         assertTrue(
-            "`reloadVerdict()` no longer reads the verdict the Box recorded, so a refused reload is " +
-                "reported as an applied configuration.",
-            body.contains("BoxService.lastReload"),
+            "`reloadVerdict()` no longer binds the reload to a request intent, so it can read a " +
+                "verdict recorded for some other request as its own.",
+            body.contains("registerReloadIntent("),
         )
         assertTrue(
-            "`reloadVerdict()` no longer compares the applied revision with the one this client wrote.",
-            body.contains("verdict.configRevision != revision"),
+            "`reloadVerdict()` no longer classifies the receipt against this request, revision and " +
+                "engine.",
+            body.contains("ActiveConfigApply.classify("),
         )
-        assertTrue("`reloadVerdict()` no longer distinguishes success from failure.", body.contains("verdict.success"))
+        assertTrue(
+            "`reloadVerdict()` no longer reads the current revision it must match.",
+            body.contains("currentRevision = ConfigStore.activeConfigRevision()"),
+        )
+        assertTrue(
+            "`reloadVerdict()` no longer distinguishes a superseded result from a refusal.",
+            body.contains("ReloadOutcome.Superseded"),
+        )
         val apply = code(bodyOf("private suspend fun applyActiveConfigIfChanged("))
         assertTrue(
-            "`applyActiveConfigIfChanged()` no longer treats a failed reload as a restore-and-restart case.",
-            apply.contains("restoreAfterFailedReload("),
+            "`applyActiveConfigIfChanged()` no longer treats a refused reload as a recovery case.",
+            apply.contains("ActiveConfigRecovery.FailedCandidate("),
         )
         assertTrue(
             "`applyActiveConfigIfChanged()` no longer refuses to apply a config it does not own.",
@@ -849,21 +858,35 @@ class AppViewModelWiringTest {
     }
 
     @Test
-    fun `a refused config restores the previous document and starts it`() {
-        val body = code(bodyOf("private suspend fun restoreAfterFailedReload("))
+    fun `a refused config restores only while it still owns the revision`() {
+        val body = code(bodyOf("private suspend fun recoverRefusedReload("))
         assertTrue(
-            "`restoreAfterFailedReload()` no longer puts the subscription's previous body back, so the next " +
-                "start (and the next activation) reuses the document the core refused.",
-            body.contains("restoreRawBody("),
+            "`recoverRefusedReload()` no longer runs the CAS-guarded recovery instead of writing " +
+                "the previous document unconditionally.",
+            body.contains("ActiveConfigRecovery.restore("),
         )
         assertTrue(
-            "`restoreAfterFailedReload()` no longer restores the previous active config.",
-            body.contains("writeActiveConfig("),
-        )
-        assertTrue(
-            "`restoreAfterFailedReload()` no longer brings a core up on the restored config, so a refused " +
-                "reload leaves the user disconnected even though the old config is known good.",
+            "`recoverRefusedReload()` no longer brings a core up on the restored config, so a " +
+                "refused reload leaves the user disconnected even though the old config is known good.",
             body.contains("startStoredConfig()"),
+        )
+        assertTrue(
+            "`recoverRefusedReload()` no longer reports the case where a newer commit owns the " +
+                "config, so that case would be reported as a failed restore.",
+            body.contains("RecoveryOutcome.Superseded"),
+        )
+        val recovery = File("src/main/java/com/interstellar/proxy/data/ActiveConfigApply.kt").readText()
+        assertTrue(
+            "the recovery no longer compares the committed revision before restoring.",
+            recovery.contains("before.meta.revision != candidate.committedRevision"),
+        )
+        assertTrue(
+            "the recovery no longer restores the active config with a compare-and-swap.",
+            recovery.contains("restoreIfRevision("),
+        )
+        assertTrue(
+            "the recovery no longer guards the retained body against a newer commit.",
+            recovery.contains("restoreRawBodyIfCurrent("),
         )
     }
 
@@ -920,10 +943,11 @@ class AppViewModelWiringTest {
     }
 
     /**
-     * The periodic worker applies the same ownership rules as a manual update.
+     * The periodic worker applies the same ownership rules and the same recovery path as a manual
+     * update.
      */
     @Test
-    fun `the worker re-checks ownership and the reload verdict`() {
+    fun `the worker re-checks ownership and shares the reload and recovery path`() {
         val worker = File("src/main/java/com/interstellar/proxy/data/UpdateWorker.kt").readText()
         assertTrue(
             "UpdateWorker no longer captures the instance identity before its batch, so a scheduled run that " +
@@ -935,12 +959,30 @@ class AppViewModelWiringTest {
             worker.contains("stillOwns(start, instanceSnapshot(), expectedRevision)"),
         )
         assertTrue(
-            "UpdateWorker reports a reload as applied without reading the core's verdict.",
-            worker.contains("BoxService.lastReload"),
+            "UpdateWorker no longer binds its reload to a receipt, so it cannot tell its own failure " +
+                "from a newer operation's.",
+            worker.contains("registerReloadIntent(expectedRevision)"),
         )
         assertTrue(
-            "UpdateWorker no longer compares the applied revision with the one it committed.",
-            worker.contains("verdict.configRevision == expectedRevision"),
+            "UpdateWorker no longer classifies the receipt against the revision it committed.",
+            worker.contains("ActiveConfigApply.classify("),
+        )
+        assertTrue(
+            "UpdateWorker no longer restores a refused candidate through the shared recovery.",
+            worker.contains("ActiveConfigRecovery.restore("),
+        )
+        assertTrue(
+            "UpdateWorker no longer contains the failed-candidate description the shared recovery needs.",
+            worker.contains("ActiveConfigRecovery.FailedCandidate("),
+        )
+        assertTrue(
+            "UpdateWorker no longer attempts to bring a Box back from the restored config.",
+            worker.contains("restartStoredConfig()"),
+        )
+        val viewModel = File("src/main/java/com/interstellar/proxy/ui/AppViewModel.kt").readText()
+        assertTrue(
+            "the manual path and the worker no longer share the failed-application recovery.",
+            viewModel.contains("ActiveConfigRecovery.restore(") && worker.contains("ActiveConfigRecovery.restore("),
         )
     }
 }
