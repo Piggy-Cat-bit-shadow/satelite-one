@@ -979,6 +979,11 @@ class AppViewModelWiringTest {
             "UpdateWorker no longer attempts to bring a Box back from the restored config.",
             worker.contains("restartStoredConfig()"),
         )
+        assertTrue(
+            "UpdateWorker no longer proves the restored revision is serving before it refreshes the " +
+                "instance's providers.",
+            worker.contains("restored instance serving=") && worker.contains("refreshProviders()"),
+        )
         val viewModel = File("src/main/java/com/interstellar/proxy/ui/AppViewModel.kt").readText()
         assertTrue(
             "the manual path and the worker no longer share the failed-application recovery.",

@@ -117,6 +117,24 @@ class UpdateWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                         if (wasServing) {
                             val restarted = restartStoredConfig()
                             log("restart from restored config requested=$restarted")
+                            if (restarted) {
+                                // The start is asynchronous. Wait for the daemon to report the
+                                // restored revision as applied, then refresh providers on THAT
+                                // instance; otherwise the worker would end without proving that the
+                                // recovered document actually serves.
+                                val deadline = System.currentTimeMillis() + 15_000
+                                while (
+                                    System.currentTimeMillis() < deadline &&
+                                    CoreRuntime.appliedConfigRevision != ConfigStore.activeConfigRevision()
+                                ) {
+                                    kotlinx.coroutines.delay(250)
+                                }
+                                val serving = CoreRuntime.appliedConfigRevision == ConfigStore.activeConfigRevision()
+                                log("restored instance serving=$serving gen=${CoreRuntime.engineGeneration}")
+                                if (serving) {
+                                    refreshProviders()
+                                }
+                            }
                         }
                     }
 
