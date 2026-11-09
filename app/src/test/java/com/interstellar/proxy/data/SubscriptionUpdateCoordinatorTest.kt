@@ -3,6 +3,7 @@ package com.interstellar.proxy.data
 import com.interstellar.proxy.data.SubscriptionUpdateCoordinator.ActiveConfigAction
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -151,5 +152,26 @@ class SubscriptionUpdateCoordinatorTest {
                 activeIdNow = "",
             ),
         )
+    }
+
+    /**
+     * A body that downloaded fine but was refused as a config must be reported as that refusal, not
+     * as a config result - while the running instance's providers are still refreshed, because the
+     * old config is what is serving.
+     */
+    @Test
+    fun `a refused body suppresses the config half but not the provider half`() {
+        val report = SubscriptionUpdateCoordinator.report(
+            affected = true,
+            configUpdated = true,
+            configError = "config check failed",
+        )
+        assertFalse(report.config)
+        assertTrue(report.providers)
+        assertEquals("config check failed", report.configError)
+
+        val clean = SubscriptionUpdateCoordinator.report(affected = true, configUpdated = true)
+        assertTrue(clean.config)
+        assertNull(clean.configError)
     }
 }

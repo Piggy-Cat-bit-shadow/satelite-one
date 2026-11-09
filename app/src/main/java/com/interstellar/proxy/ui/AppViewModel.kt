@@ -1170,7 +1170,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      * failure instead of replacing it.
      */
     private suspend fun reportManualUpdateOutcome(activeBefore: String?, report: UpdateReport) {
-        if (report.config) reportActiveConfig(applyActiveConfigIfChanged(activeBefore))
+        if (report.configError != null) {
+            // The body was downloaded but the repository refused it as a config: the previous
+            // active config is still on disk and still serving. Say that, not "unchanged".
+            showToast(report.configError, UiToast.Kind.Error)
+        } else if (report.config) {
+            reportActiveConfig(applyActiveConfigIfChanged(activeBefore))
+        }
         if (report.providers) reportProviders(refreshProvidersNow())
     }
 
@@ -1758,6 +1764,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             if (fromPull) _refreshing.value = true
             _busy.value = true
             val activeBefore = ConfigStore.readActiveConfig()
+            // The repository records why a fetched body was refused as a config; the verdict is taken
+            // once, after the commit attempt, so this update reports it and no later one inherits it.
             // Both the pool decision and the owner of the live instance are captured before the
             // request: a fetch can outlive the profile it was started for (see ownsInstance).
             val activeIdAtStart = SubscriptionRepository.activeSubscriptionId
@@ -1832,8 +1840,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 return@launch
             }
-            val report = SubscriptionUpdateCoordinator.report(owns, configUpdated = updated)
-            if (report.providers) reportManualUpdateOutcome(activeBefore, report)
+            val report = SubscriptionUpdateCoordinator.report(
+                owns,
+                configUpdated = updated,
+                configError = if (updated) SubscriptionRepository.takeConfigError() else null,
+            )
+            if (report.providers || report.configError != null) reportManualUpdateOutcome(activeBefore, report)
         }
     }
 
@@ -1848,6 +1860,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             _refreshing.value = true
             _busy.value = true
             val activeBefore = ConfigStore.readActiveConfig()
+            // See refreshSubscription: the refusal verdict is taken by the operation that caused it.
             // Same rule as the single-item update: the pool decision and the instance owner are
             // captured before the requests, so a batch in which every download failed still
             // refreshes the running instance's providers, and a batch that outlives the profile it
@@ -1936,8 +1949,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 showToast(str(com.interstellar.proxy.R.string.vm_update_all_superseded), UiToast.Kind.Error)
                 return@launch
             }
-            val report = SubscriptionUpdateCoordinator.report(owns, configUpdated = ok > 0)
-            if (report.providers) reportManualUpdateOutcome(activeBefore, report)
+            val report = SubscriptionUpdateCoordinator.report(
+                owns,
+                configUpdated = ok > 0,
+                configError = if (ok > 0) SubscriptionRepository.takeConfigError() else null,
+            )
+            if (report.providers || report.configError != null) reportManualUpdateOutcome(activeBefore, report)
         }
     }
 

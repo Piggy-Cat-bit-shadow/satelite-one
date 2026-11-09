@@ -196,6 +196,17 @@ object SubscriptionRepository {
         private set
 
     /**
+     * Takes the last config refusal, so it is reported exactly once and by the operation that
+     * caused it: the update paths call this right after the body was committed (or refused) and
+     * carry the verdict into their result. A later unrelated operation must not inherit it.
+     */
+    fun takeConfigError(): String? {
+        val error = lastConfigError
+        lastConfigError = null
+        return error
+    }
+
+    /**
      * Regenerates filesDir/active.json from the current node pool (the active
      * subscription, or the mix union when Mix is on).
      * Returns null when there is nothing to run.
@@ -211,8 +222,19 @@ object SubscriptionRepository {
         // is not a config, so it falls through to the minimal generator below.
         val activeSub = activeSubscription()
         if (activeSub != null) {
-            val rawApplied = applyRawConfigIfMatching(activeSub)
-            if (rawApplied != null) return rawApplied
+            when (val rawApplied = applyRawConfigIfMatching(activeSub)) {
+                is RawApply.Applied -> return rawApplied.content
+                // A raw body the core refused is a terminal answer for this regeneration: falling
+                // through to the node generator would overwrite the real reason with "no usable
+                // nodes". The last good active config stays on disk and keeps serving - including
+                // the next start, which must not be poisoned by the refused body.
+                RawApply.Refused -> {
+                    val lastGood = runCatching { ConfigStore.readActiveConfig() }.getOrNull()
+                    if (lastGood != null) return lastGood
+                    return null
+                }
+                RawApply.NotRaw -> Unit
+            }
         }
 
         val mix = Settings.mixEnabled
@@ -262,22 +284,32 @@ object SubscriptionRepository {
      * injected outbounds, no rule sets, no DNS rewrite, no route.final override.
      * The only thing the app does is ask libbox whether the config is valid.
      */
-    private fun applyRawConfigIfMatching(sub: Subscription): String? {
+    private sealed interface RawApply {
+        data class Applied(val content: String) : RawApply
+
+        /** The body is a sing-box document and the core refused it; the previous config stands. */
+        object Refused : RawApply
+
+        /** This subscription is not a raw sing-box body, or has none on disk yet. */
+        object NotRaw : RawApply
+    }
+
+    private fun applyRawConfigIfMatching(sub: Subscription): RawApply {
         val format = com.interstellar.proxy.data.subscription.RawConfigFormat.from(sub.configFormat)
         // Only a sing-box body can be handed to this core verbatim; Clash/Xray
         // bodies were only ever pass-through for the sidecars this client no
         // longer ships.
-        if (format != com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX) return null
-        val raw = runCatching { rawFileOf(sub.id).takeIf { it.isFile }?.readText() }.getOrNull() ?: return null
+        if (format != com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX) return RawApply.NotRaw
+        val raw = runCatching { rawFileOf(sub.id).takeIf { it.isFile }?.readText() }.getOrNull() ?: return RawApply.NotRaw
         return try {
             Libbox.checkConfig(raw)
             ConfigStore.writeActiveConfig(raw)
             lastConfigError = null
-            raw
+            RawApply.Applied(raw)
         } catch (e: Exception) {
             lastConfigError = str(com.interstellar.proxy.R.string.repo_raw_check_failed, e.message ?: "")
             android.util.Log.e(TAG, "raw config check failed: ${e.message}", e)
-            null
+            RawApply.Refused
         }
     }
 

@@ -37,6 +37,14 @@ object SubscriptionUpdateCoordinator {
         val config: Boolean,
         /** The provider half: refresh the live instance's remote node sources. */
         val providers: Boolean,
+        /**
+         * Why the fetched body was refused before it could become the active config, or null.
+         *
+         * The repository validates the candidate with libbox and keeps the previous active config
+         * when it is refused; this carries that verdict to the initiator so a download that
+         * "succeeded" but produced an unusable body is not reported as a config result.
+         */
+        val configError: String? = null,
     )
 
     /**
@@ -47,11 +55,17 @@ object SubscriptionUpdateCoordinator {
      * config to apply. A download that failed, or a body that could not be parsed, leaves the
      * running instance on its previous config — and that instance's remote providers must still be
      * refreshed, because the node sources and the subscription download are different failures.
-     * An attempt that cannot affect the active pool reports nothing.
+     * An attempt that cannot affect the active pool reports nothing. A body the repository refused
+     * ([configError]) is not a config result either, but it does not suppress the provider half.
      */
-    fun report(affected: Boolean, configUpdated: Boolean): UpdateReport = UpdateReport(
-        config = affected && configUpdated,
+    fun report(
+        affected: Boolean,
+        configUpdated: Boolean,
+        configError: String? = null,
+    ): UpdateReport = UpdateReport(
+        config = affected && configUpdated && configError == null,
         providers = affected,
+        configError = configError,
     )
 
     /**

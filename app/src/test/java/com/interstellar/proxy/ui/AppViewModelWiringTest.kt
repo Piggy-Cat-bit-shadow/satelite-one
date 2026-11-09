@@ -13,30 +13,31 @@ import java.io.File
  *
  * `UiClientLifetimeTest` proves the *rules*. It cannot prove that the ViewModel consults them, and an
  * independent red-team run measured that gap rather than assuming it: **twelve minimal wiring breaks in
- * `AppViewModel.kt` each produced zero red on the 230-test suite**, including this one â€? *
+ * `AppViewModel.kt` each produced zero red on the 230-test suite**, including this one â€”
+ *
  * ```kotlin
  * // onDisconnected, reverted to the pre-fix body:
  * if (!probing) applySocketDrop()
  * ```
  *
- * â€?which restores the exact defect the whole round exists to remove. That defect is not cosmetic:
+ * â€” which restores the exact defect the whole round exists to remove. That defect is not cosmetic:
  * `applySocketDrop()` answers a deliberate disconnect by arming a 400 ms watchdog that calls
  * `markStopped()` **and `BoxService.stop()`**, so the user pressing Home would stop the running tunnel
  * 400 ms later. A guard whose removal is invisible to the suite is not guarded.
  *
  * The ViewModel cannot be constructed in a plain JVM test here: it is an `AndroidViewModel`, there is no
  * Robolectric on this host, and there is no `androidTest` source set. So these tests read the production
- * source and assert the *shape* of the wiring â€?the same technique `ScreenFactOrderingTest` already uses in
+ * source and assert the *shape* of the wiring â€” the same technique `ScreenFactOrderingTest` already uses in
  * this project for `B02`/`E02`, and for the same reason: to bind a call site that no behavioural test can
  * reach.
  *
  * # Stated limits, so nobody reads more into a green run than is there
  *
  * * This proves the calls exist in the right order in the source. It does not prove they have the right
- *   effect at runtime â€?an end-to-end proof needs a device or an injectable client seam.
+ *   effect at runtime â€” an end-to-end proof needs a device or an injectable client seam.
  * * It is sensitive to renames and to moving a call into a helper. If a check here fails after a
  *   deliberate refactor, the correct response is to confirm the guard is still wired somewhere and update
- *   the test â€?not to delete it. Each failure message says what breaks in production, so that judgement
+ *   the test â€” not to delete it. Each failure message says what breaks in production, so that judgement
  *   can be made quickly.
  */
 class AppViewModelWiringTest {
@@ -231,7 +232,7 @@ class AppViewModelWiringTest {
      *
      * `commandClient` is ONE socket. `startProxy()` reaches the same `CommandClient` the guarded
      * `connect()` hands to the UI, so its `commandClient.connect()` is not a separate, startup-only
-     * client that could legitimately sit outside the lifetime â€?it is the UI's client, established
+     * client that could legitimately sit outside the lifetime â€” it is the UI's client, established
      * from a second place.
      *
      * That second place is reachable while suspended, which is what made this a real bypass rather
@@ -253,7 +254,7 @@ class AppViewModelWiringTest {
      * lifetime verdict. Equal counts can only hold when every one of them is gated.
      *
      * The two legitimate shapes are the only ones accepted: `connect()`'s
-     * `if (wantsClient) { â€?}`, and `startProxy()`'s `if (uiLifetime.wantsClient()) { â€?}`. The
+     * `if (wantsClient) { â€¦ }`, and `startProxy()`'s `if (uiLifetime.wantsClient()) { â€¦ }`. The
      * comment-stripped source is used because these functions discuss `commandClient.connect()` in
      * prose while explaining the gate, and a count taken over raw text includes the prose.
      */
@@ -262,7 +263,7 @@ class AppViewModelWiringTest {
         val establishes = Regex("commandClient\\.connect\\(\\)")
 
         // Two functions, two allowed shapes. `connect()` legitimately has TWO establishes - the
-        // immediate one inside `if (wantsClient) { â€?}` and the poll's inside
+        // immediate one inside `if (wantsClient) { â€¦ }` and the poll's inside
         // `if (!uiLifetime.mayReconnect()) continue` - so its poll establish is accounted for
         // separately rather than being counted as an ungated call. `startProxy()` gets one verdict
         // and no poll, so for it the two counts must be exactly equal.
@@ -300,7 +301,7 @@ class AppViewModelWiringTest {
      * The headless probe is the deliberate exception, and it must stay deliberate.
      *
      * `runDisconnectedUrlTest` drives this same client without any lifetime verdict, on purpose:
-     * a url-test run from the æœªè¿žæŽ?state has no UI to serve, signals readiness only through
+     * a url-test run from the æœªè¿žæŽ¥ state has no UI to serve, signals readiness only through
      * `onConnected()`, and is bounded by the kernel's per-node timeout. Its own continuation is
      * `reapplyOwedSuspend()`, which applies a background edge that arrived mid-probe.
      *
@@ -329,8 +330,8 @@ class AppViewModelWiringTest {
      * The P0-A defect: the canonical verdict arrives DURING `connect()` and `connect()` undid it.
      *
      * `subscribeForeground()` replays the canonical foreground value synchronously, so a `false`
-     * replay runs `suspendUiClient()` inside `connect()` â€?marking the lifetime suspended and
-     * disconnecting the client â€?and `connect()` then returned and called `commandClient.connect()`
+     * replay runs `suspendUiClient()` inside `connect()` â€” marking the lifetime suspended and
+     * disconnecting the client â€” and `connect()` then returned and called `commandClient.connect()`
      * unconditionally. The canonical state said "the app is in the background and must not have a UI
      * client" and `connect()` built one anyway, which is precisely the behaviour the whole round
      * exists to remove.
@@ -441,7 +442,7 @@ class AppViewModelWiringTest {
      * This is the `background -> connect()` case. `resumeUiClient()` re-enters `connect()` on every
      * foreground edge, and `connect()` is also re-entered from the composition, so a `connect()` that
      * established the client regardless of the verdict would pull a deliberately suspended client
-     * back up with no foreground edge at all â€?and with it the 1 Hz Status tick and the control plane
+     * back up with no foreground edge at all â€” and with it the 1 Hz Status tick and the control plane
      * the suspension exists to stop.
      */
     @Test
@@ -557,7 +558,7 @@ class AppViewModelWiringTest {
      *
      * The core reports that case as `published` plus `pendingTags`/`restartRequired`, so a client
      * that only counts statuses prints "1 published, 0 failed" for a document whose group kept its
-     * previous members â€?invisible failure, which the original acceptance forbids.
+     * previous members â€” invisible failure, which the original acceptance forbids.
      */
     @Test
     fun `a partly applied provider refresh is reported before the plain summary`() {
@@ -642,6 +643,45 @@ class AppViewModelWiringTest {
     // --- the two results of an update are independent -----------------------------------------------
 
     /**
+     * A body that downloaded fine but was refused as a config must reach the initiator as that
+     * refusal. The repository already keeps the previous active config and records the verdict in
+     * `lastConfigError`; the update path used to ignore it and report the outcome as a config
+     * result, which claims a refresh that never happened.
+     */
+    @Test
+    fun `a refused body is reported instead of a config result`() {
+        val signature = "private suspend fun reportManualUpdateOutcome("
+        val body = code(bodyOf(signature))
+        val refusal = body.indexOf("report.configError")
+        val config = body.indexOf("if (report.config)")
+        assertTrue(
+            "`reportManualUpdateOutcome()` no longer looks at `report.configError`, so a refused body is " +
+                "reported as a config result the running instance never applied.",
+            refusal >= 0,
+        )
+        assertTrue(
+            "`reportManualUpdateOutcome()` checks the config half before the refusal, so the refusal can " +
+                "never be shown and the user sees an applied/unchanged config instead.",
+            refusal < config,
+        )
+        assertInBody(
+            signature,
+            "showToast(report.configError",
+            "the refusal is no longer surfaced to the user.",
+        )
+        assertInBody(
+            "fun refreshSubscription(",
+            "configError = if (updated) SubscriptionRepository.takeConfigError() else null",
+            "`refreshSubscription()` no longer carries the repository's refusal verdict into the report.",
+        )
+        assertInBody(
+            "fun refreshAll()",
+            "configError = if (ok > 0) SubscriptionRepository.takeConfigError() else null",
+            "`refreshAll()` no longer carries the repository's refusal verdict into the report.",
+        )
+    }
+
+    /**
      * A subscription whose download fails must still refresh the running instance's providers.
      *
      * The defect this binds, measured on the emulator before the fix: `refreshSubscription` guarded
@@ -665,7 +705,7 @@ class AppViewModelWiringTest {
         )
         assertInBody(
             "fun refreshSubscription(",
-            "SubscriptionUpdateCoordinator.report(owns, configUpdated = updated)",
+            "configUpdated = updated,",
             "`refreshSubscription()` no longer derives the reported halves from both the pool decision and " +
                 "the download result; tying them back to `updated` alone silences the provider refresh " +
                 "whenever the subscription download fails.",
@@ -686,7 +726,7 @@ class AppViewModelWiringTest {
         )
         assertInBody(
             "fun refreshAll()",
-            "SubscriptionUpdateCoordinator.report(owns, configUpdated = ok > 0)",
+            "configUpdated = ok > 0,",
             "`refreshAll()` no longer separates the pool decision from the batch's success count, so a " +
                 "failed batch skips the provider refresh of the instance that is still running.",
         )
