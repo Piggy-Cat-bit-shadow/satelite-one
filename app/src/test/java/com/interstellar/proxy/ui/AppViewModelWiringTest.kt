@@ -13,31 +13,30 @@ import java.io.File
  *
  * `UiClientLifetimeTest` proves the *rules*. It cannot prove that the ViewModel consults them, and an
  * independent red-team run measured that gap rather than assuming it: **twelve minimal wiring breaks in
- * `AppViewModel.kt` each produced zero red on the 230-test suite**, including this one â€”
- *
+ * `AppViewModel.kt` each produced zero red on the 230-test suite**, including this one â€? *
  * ```kotlin
  * // onDisconnected, reverted to the pre-fix body:
  * if (!probing) applySocketDrop()
  * ```
  *
- * â€” which restores the exact defect the whole round exists to remove. That defect is not cosmetic:
+ * â€?which restores the exact defect the whole round exists to remove. That defect is not cosmetic:
  * `applySocketDrop()` answers a deliberate disconnect by arming a 400 ms watchdog that calls
  * `markStopped()` **and `BoxService.stop()`**, so the user pressing Home would stop the running tunnel
  * 400 ms later. A guard whose removal is invisible to the suite is not guarded.
  *
  * The ViewModel cannot be constructed in a plain JVM test here: it is an `AndroidViewModel`, there is no
  * Robolectric on this host, and there is no `androidTest` source set. So these tests read the production
- * source and assert the *shape* of the wiring â€” the same technique `ScreenFactOrderingTest` already uses in
+ * source and assert the *shape* of the wiring â€?the same technique `ScreenFactOrderingTest` already uses in
  * this project for `B02`/`E02`, and for the same reason: to bind a call site that no behavioural test can
  * reach.
  *
  * # Stated limits, so nobody reads more into a green run than is there
  *
  * * This proves the calls exist in the right order in the source. It does not prove they have the right
- *   effect at runtime â€” an end-to-end proof needs a device or an injectable client seam.
+ *   effect at runtime â€?an end-to-end proof needs a device or an injectable client seam.
  * * It is sensitive to renames and to moving a call into a helper. If a check here fails after a
  *   deliberate refactor, the correct response is to confirm the guard is still wired somewhere and update
- *   the test â€” not to delete it. Each failure message says what breaks in production, so that judgement
+ *   the test â€?not to delete it. Each failure message says what breaks in production, so that judgement
  *   can be made quickly.
  */
 class AppViewModelWiringTest {
@@ -232,7 +231,7 @@ class AppViewModelWiringTest {
      *
      * `commandClient` is ONE socket. `startProxy()` reaches the same `CommandClient` the guarded
      * `connect()` hands to the UI, so its `commandClient.connect()` is not a separate, startup-only
-     * client that could legitimately sit outside the lifetime â€” it is the UI's client, established
+     * client that could legitimately sit outside the lifetime â€?it is the UI's client, established
      * from a second place.
      *
      * That second place is reachable while suspended, which is what made this a real bypass rather
@@ -254,7 +253,7 @@ class AppViewModelWiringTest {
      * lifetime verdict. Equal counts can only hold when every one of them is gated.
      *
      * The two legitimate shapes are the only ones accepted: `connect()`'s
-     * `if (wantsClient) { â€¦ }`, and `startProxy()`'s `if (uiLifetime.wantsClient()) { â€¦ }`. The
+     * `if (wantsClient) { â€?}`, and `startProxy()`'s `if (uiLifetime.wantsClient()) { â€?}`. The
      * comment-stripped source is used because these functions discuss `commandClient.connect()` in
      * prose while explaining the gate, and a count taken over raw text includes the prose.
      */
@@ -263,7 +262,7 @@ class AppViewModelWiringTest {
         val establishes = Regex("commandClient\\.connect\\(\\)")
 
         // Two functions, two allowed shapes. `connect()` legitimately has TWO establishes - the
-        // immediate one inside `if (wantsClient) { â€¦ }` and the poll's inside
+        // immediate one inside `if (wantsClient) { â€?}` and the poll's inside
         // `if (!uiLifetime.mayReconnect()) continue` - so its poll establish is accounted for
         // separately rather than being counted as an ungated call. `startProxy()` gets one verdict
         // and no poll, so for it the two counts must be exactly equal.
@@ -301,7 +300,7 @@ class AppViewModelWiringTest {
      * The headless probe is the deliberate exception, and it must stay deliberate.
      *
      * `runDisconnectedUrlTest` drives this same client without any lifetime verdict, on purpose:
-     * a url-test run from the æœªè¿žæŽ¥ state has no UI to serve, signals readiness only through
+     * a url-test run from the æœªè¿žæŽ?state has no UI to serve, signals readiness only through
      * `onConnected()`, and is bounded by the kernel's per-node timeout. Its own continuation is
      * `reapplyOwedSuspend()`, which applies a background edge that arrived mid-probe.
      *
@@ -330,8 +329,8 @@ class AppViewModelWiringTest {
      * The P0-A defect: the canonical verdict arrives DURING `connect()` and `connect()` undid it.
      *
      * `subscribeForeground()` replays the canonical foreground value synchronously, so a `false`
-     * replay runs `suspendUiClient()` inside `connect()` â€” marking the lifetime suspended and
-     * disconnecting the client â€” and `connect()` then returned and called `commandClient.connect()`
+     * replay runs `suspendUiClient()` inside `connect()` â€?marking the lifetime suspended and
+     * disconnecting the client â€?and `connect()` then returned and called `commandClient.connect()`
      * unconditionally. The canonical state said "the app is in the background and must not have a UI
      * client" and `connect()` built one anyway, which is precisely the behaviour the whole round
      * exists to remove.
@@ -442,7 +441,7 @@ class AppViewModelWiringTest {
      * This is the `background -> connect()` case. `resumeUiClient()` re-enters `connect()` on every
      * foreground edge, and `connect()` is also re-entered from the composition, so a `connect()` that
      * established the client regardless of the verdict would pull a deliberately suspended client
-     * back up with no foreground edge at all â€” and with it the 1 Hz Status tick and the control plane
+     * back up with no foreground edge at all â€?and with it the 1 Hz Status tick and the control plane
      * the suspension exists to stop.
      */
     @Test
@@ -558,7 +557,7 @@ class AppViewModelWiringTest {
      *
      * The core reports that case as `published` plus `pendingTags`/`restartRequired`, so a client
      * that only counts statuses prints "1 published, 0 failed" for a document whose group kept its
-     * previous members â€” invisible failure, which the original acceptance forbids.
+     * previous members â€?invisible failure, which the original acceptance forbids.
      */
     @Test
     fun `a partly applied provider refresh is reported before the plain summary`() {
@@ -579,6 +578,64 @@ class AppViewModelWiringTest {
             "`reportProviders()` no longer reports the partial case as an error; its result would read " +
                 "like any other successful refresh.",
             body.substring(partial).contains("UiToast.Kind.Error"),
+        )
+    }
+
+    /**
+     * A fetch that outlives the profile it was started for must not act on the new profile.
+     *
+     * The defect this binds: the pool decision was the only guard, so an update started on A and
+     * landing after the user activated B reloaded B (the active config "changed") and refreshed
+     * B's providers, attributing B's state to A's operation. The owner of the live instance has to
+     * be captured before the request and re-checked before the result is applied.
+     */
+    @Test
+    fun `a late update result is dropped when another profile became active`() {
+        val body = bodyOf("fun refreshSubscription(")
+        val capture = body.indexOf("val activeIdAtStart = SubscriptionRepository.activeSubscriptionId")
+        val decide = body.indexOf("affectsActiveConfig(")
+        val fetch = body.indexOf("SubscriptionFetcher.fetch(")
+        val owns = body.indexOf("ownsInstance(")
+        assertTrue("`refreshSubscription()` no longer captures the active profile before the fetch", capture >= 0)
+        assertTrue("`refreshSubscription()` no longer decides pool membership", decide >= 0)
+        assertTrue("`refreshSubscription()` no longer fetches the subscription", fetch >= 0)
+        assertTrue(
+            "`refreshSubscription()` captures the active profile after the pool decision or after the fetch, " +
+                "so the owner of the live instance is not known when the request starts",
+            capture < decide && decide < fetch,
+        )
+        assertTrue(
+            "`refreshSubscription()` no longer re-checks instance ownership before applying the result, so a " +
+                "result that lands after another profile became active reloads that profile and refreshes its " +
+                "providers - the late-result misattribution.",
+            owns > fetch,
+        )
+        assertInBody(
+            "fun refreshSubscription(",
+            "vm_update_superseded",
+            "`refreshSubscription()` no longer reports the superseded case, so the user sees the other " +
+                "profile's result as this subscription's, or sees nothing at all.",
+        )
+    }
+
+    @Test
+    fun `a batch that outlives its profile is dropped the same way`() {
+        val body = bodyOf("fun refreshAll()")
+        val capture = body.indexOf("val activeIdAtStart = SubscriptionRepository.activeSubscriptionId")
+        val launch = body.indexOf("coroutineScope {")
+        val owns = body.indexOf("ownsInstance(")
+        assertTrue("`refreshAll()` no longer captures the active profile before the batch", capture >= 0)
+        assertTrue("`refreshAll()` captures the active profile after the batch started", capture < launch)
+        assertTrue(
+            "`refreshAll()` no longer re-checks instance ownership before applying the batch result, so a " +
+                "batch that lands after another profile became active reloads and refreshes that profile.",
+            owns > launch,
+        )
+        assertInBody(
+            "fun refreshAll()",
+            "vm_update_all_superseded",
+            "`refreshAll()` no longer reports the superseded batch, so a profile switch during the batch is " +
+                "invisible and its result is attributed to the wrong instances.",
         )
     }
 
@@ -608,7 +665,7 @@ class AppViewModelWiringTest {
         )
         assertInBody(
             "fun refreshSubscription(",
-            "SubscriptionUpdateCoordinator.report(affectsActive, configUpdated = updated)",
+            "SubscriptionUpdateCoordinator.report(owns, configUpdated = updated)",
             "`refreshSubscription()` no longer derives the reported halves from both the pool decision and " +
                 "the download result; tying them back to `updated` alone silences the provider refresh " +
                 "whenever the subscription download fails.",
@@ -629,7 +686,7 @@ class AppViewModelWiringTest {
         )
         assertInBody(
             "fun refreshAll()",
-            "SubscriptionUpdateCoordinator.report(affectsActive, configUpdated = ok > 0)",
+            "SubscriptionUpdateCoordinator.report(owns, configUpdated = ok > 0)",
             "`refreshAll()` no longer separates the pool decision from the batch's success count, so a " +
                 "failed batch skips the provider refresh of the instance that is still running.",
         )

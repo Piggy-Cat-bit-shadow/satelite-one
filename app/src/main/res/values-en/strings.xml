@@ -59,6 +59,8 @@
     <string name="vm_config_saved">Config saved; the core is not running, so it applies on next start</string>
     <string name="vm_config_unchanged">Config unchanged</string>
     <string name="vm_config_apply_failed">Config was written but the hot reload failed</string>
+<string name="vm_update_superseded">The active profile changed while “%1$s” was updating; this result was not applied to the running instance</string>
+<string name="vm_update_all_superseded">The active profile changed during the batch update; this result was not applied to the running instance</string>
     <string name="vm_provider_summary">Provider: %1$d published, %2$d unchanged, %3$d failed, %4$d skipped</string>
     <string name="vm_provider_none">Provider: no remote providers in the current config</string>
 <string name="vm_provider_partial">Provider: %1$d published, %2$d unchanged, %3$d failed, %4$d skipped; %5$d nodes pending, %6$d providers need a restart</string>

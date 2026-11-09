@@ -54,6 +54,22 @@ object SubscriptionUpdateCoordinator {
         providers = affected,
     )
 
+    /**
+     * Whether an update that started while [activeIdAtStart] was active may still apply and report.
+     *
+     * A fetch can outlive the profile it was started for. When the user activates another profile
+     * in the meantime, the running instance is now built from that profile: reloading it because
+     * "the active config changed" and then refreshing its providers would attribute one
+     * subscription's result to another, and would reload a Box nobody asked to touch. The
+     * subscription's own bytes are still stored by the caller — this only decides whether the
+     * result may act on the live instance.
+     */
+    fun ownsInstance(
+        affectedAtStart: Boolean,
+        activeIdAtStart: String,
+        activeIdNow: String,
+    ): Boolean = affectedAtStart && activeIdAtStart.isNotBlank() && activeIdAtStart == activeIdNow
+
     enum class ActiveConfigAction {
         /** The bytes on disk did not change; nothing to reload. */
         None,

@@ -1758,12 +1758,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             if (fromPull) _refreshing.value = true
             _busy.value = true
             val activeBefore = ConfigStore.readActiveConfig()
-            // Decided before the attempt, not from its result: a failed download leaves this
-            // subscription in the running instance's pool, and that instance's providers still
-            // need a refresh.
+            // Both the pool decision and the owner of the live instance are captured before the
+            // request: a fetch can outlive the profile it was started for (see ownsInstance).
+            val activeIdAtStart = SubscriptionRepository.activeSubscriptionId
             val affectsActive = SubscriptionUpdateCoordinator.affectsActiveConfig(
                 listOf(id),
-                SubscriptionRepository.activeSubscriptionId,
+                activeIdAtStart,
                 Settings.mixEnabled,
                 Settings.mixSubscriptionIds,
             )
@@ -1816,7 +1816,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 _subscriptions.value = SubscriptionRepository.subscriptions.toList()
                 _activeSubscriptionId.value = SubscriptionRepository.activeSubscriptionId
             }
-            val report = SubscriptionUpdateCoordinator.report(affectsActive, configUpdated = updated)
+            // The result may only act on the live instance if this attempt still owns it: another
+            // profile activated while the fetch was in flight means the running Box is that
+            // profile's, so reloading it or refreshing its providers here would misattribute this
+            // result and reload a Box nobody asked to touch.
+            val owns = SubscriptionUpdateCoordinator.ownsInstance(
+                affectsActive,
+                activeIdAtStart,
+                SubscriptionRepository.activeSubscriptionId,
+            )
+            if (affectsActive && !owns) {
+                showToast(
+                    str(com.interstellar.proxy.R.string.vm_update_superseded, sub.name),
+                    UiToast.Kind.Error,
+                )
+                return@launch
+            }
+            val report = SubscriptionUpdateCoordinator.report(owns, configUpdated = updated)
             if (report.providers) reportManualUpdateOutcome(activeBefore, report)
         }
     }
@@ -1832,11 +1848,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             _refreshing.value = true
             _busy.value = true
             val activeBefore = ConfigStore.readActiveConfig()
-            // Same rule as the single-item update: decided before the attempt, so a batch in which
-            // every download failed still refreshes the running instance's providers.
+            // Same rule as the single-item update: the pool decision and the instance owner are
+            // captured before the requests, so a batch in which every download failed still
+            // refreshes the running instance's providers, and a batch that outlives the profile it
+            // started for does not touch the new one.
+            val activeIdAtStart = SubscriptionRepository.activeSubscriptionId
             val affectsActive = SubscriptionUpdateCoordinator.affectsActiveConfig(
                 subs.map { it.id },
-                SubscriptionRepository.activeSubscriptionId,
+                activeIdAtStart,
                 Settings.mixEnabled,
                 Settings.mixSubscriptionIds,
             )
@@ -1905,7 +1924,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 _subscriptions.value = SubscriptionRepository.subscriptions.toList()
                 _activeSubscriptionId.value = SubscriptionRepository.activeSubscriptionId
             }
-            val report = SubscriptionUpdateCoordinator.report(affectsActive, configUpdated = ok > 0)
+            // Same ownership rule as the single-item update: a batch whose result is appended after
+            // another profile became active may keep the downloaded bytes, but must not reload or
+            // refresh the instance that profile owns.
+            val owns = SubscriptionUpdateCoordinator.ownsInstance(
+                affectsActive,
+                activeIdAtStart,
+                SubscriptionRepository.activeSubscriptionId,
+            )
+            if (affectsActive && !owns) {
+                showToast(str(com.interstellar.proxy.R.string.vm_update_all_superseded), UiToast.Kind.Error)
+                return@launch
+            }
+            val report = SubscriptionUpdateCoordinator.report(owns, configUpdated = ok > 0)
             if (report.providers) reportManualUpdateOutcome(activeBefore, report)
         }
     }

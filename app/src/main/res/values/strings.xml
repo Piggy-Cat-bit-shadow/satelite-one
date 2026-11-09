@@ -57,6 +57,8 @@
     <string name="vm_config_saved">配置已保存；内核未运行，下次启动生效</string>
     <string name="vm_config_unchanged">配置未变化</string>
     <string name="vm_config_apply_failed">配置已写入，但热重载失败</string>
+<string name="vm_update_superseded">「%1$s」更新期间已切换活动订阅，本次结果未应用到运行实例</string>
+<string name="vm_update_all_superseded">批量更新期间已切换活动订阅，本次结果未应用到运行实例</string>
     <string name="vm_provider_summary">Provider：发布 %1$d，未变 %2$d，失败 %3$d，跳过 %4$d</string>
     <string name="vm_provider_none">Provider：当前配置没有远程 Provider</string>
 <string name="vm_provider_partial">Provider：发布 %1$d，未变 %2$d，失败 %3$d，跳过 %4$d；%5$d 个节点待生效，%6$d 个 Provider 需重启</string>

@@ -106,4 +106,50 @@ class SubscriptionUpdateCoordinatorTest {
             assertFalse(report.providers)
         }
     }
+
+    /**
+     * The P1 this binds: a fetch that started while A was active and lands after the user switched
+     * to B must not reload B, must not refresh B's providers, and must not report B's state as A's
+     * result. A's own bytes are still stored by the caller; ownership is only about the live Box.
+     */
+    @Test
+    fun `a late result loses ownership when another profile became active`() {
+        assertFalse(
+            SubscriptionUpdateCoordinator.ownsInstance(
+                affectedAtStart = true,
+                activeIdAtStart = "a",
+                activeIdNow = "b",
+            ),
+        )
+    }
+
+    @Test
+    fun `a result keeps ownership while the same profile stays active`() {
+        for (affected in listOf(true, false)) {
+            assertEquals(
+                affected,
+                SubscriptionUpdateCoordinator.ownsInstance(
+                    affectedAtStart = affected,
+                    activeIdAtStart = "a",
+                    activeIdNow = "a",
+                ),
+            )
+        }
+        // An update that never concerned the active pool cannot acquire ownership by any switch.
+        assertFalse(
+            SubscriptionUpdateCoordinator.ownsInstance(
+                affectedAtStart = false,
+                activeIdAtStart = "a",
+                activeIdNow = "a",
+            ),
+        )
+        // A blank active id (no profile) is not an owner.
+        assertFalse(
+            SubscriptionUpdateCoordinator.ownsInstance(
+                affectedAtStart = true,
+                activeIdAtStart = "",
+                activeIdNow = "",
+            ),
+        )
+    }
 }
