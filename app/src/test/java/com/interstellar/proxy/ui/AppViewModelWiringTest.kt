@@ -269,7 +269,7 @@ class AppViewModelWiringTest {
         // and no poll, so for it the two counts must be exactly equal.
         for ((signature, gate, allowPoll) in listOf(
             Triple("fun connect()", "if (wantsClient) {", true),
-            Triple("fun startProxy()", "if (uiLifetime.wantsClient()) {", false),
+            Triple("fun startProxyInternal()", "if (uiLifetime.wantsClient()) {", false),
         )) {
             val body = bodyOf(signature)
             val total = establishes.findAll(code(body)).count()
@@ -995,6 +995,30 @@ class AppViewModelWiringTest {
         assertTrue(
             "the manual path and the worker no longer share the failed-application recovery.",
             viewModel.contains("ActiveConfigRecovery.restore(") && worker.contains("ActiveConfigRecovery.restore("),
+        )
+        assertTrue(
+            "the worker no longer journals the last-good document before an offline refresh, so a bad " +
+                "candidate committed while the tunnel is off cannot be rolled back at the next start.",
+            worker.contains("StartupRecovery.rememberBeforeOfflineRefresh(") &&
+                worker.indexOf("rememberBeforeOfflineRefresh(") < worker.indexOf("refreshAll(regenerate = false)"),
+        )
+        val boxService = File("src/main/java/com/interstellar/proxy/bg/BoxService.kt").readText()
+        assertTrue(
+            "BoxService no longer records the failed start's revision/owner, so the UI cannot tell the " +
+                "offline candidate apart from an unrelated start failure.",
+            boxService.contains("lastStartFailure = StartFailure(") &&
+                boxService.contains("lastStartFailure = null"),
+        )
+        assertTrue(
+            "BoxService no longer confirms a successful start, so the last-good journal would survive a " +
+                "successful start and could be replayed later.",
+            boxService.contains("StartupRecovery.confirmStarted("),
+        )
+        assertTrue(
+            "the ViewModel no longer performs the bounded startup recovery/retry.",
+            viewModel.contains("watchStartupFailure(") &&
+                viewModel.contains("StartupRecovery.restore(") &&
+                viewModel.contains("startupRecoveryAttempted"),
         )
     }
 }

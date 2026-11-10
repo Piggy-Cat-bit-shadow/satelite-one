@@ -36,6 +36,7 @@ import com.interstellar.proxy.data.ReloadIntentQueue
 import com.interstellar.proxy.data.ReloadReceipt
 import com.interstellar.proxy.data.ReloadReceiptBook
 import com.interstellar.proxy.data.Settings
+import com.interstellar.proxy.data.StartupRecovery
 import com.interstellar.proxy.ktx.hasPermission
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
@@ -49,6 +50,25 @@ class BoxService(private val service: Service, private val platformInterface: Pl
     CoreHost {
     companion object {
         private const val TAG = "BoxService"
+
+        /** The failure of the most recent start attempt, for the UI's bounded startup recovery. */
+        data class StartFailure(
+            val attempt: Long,
+            val alert: Alert,
+            val message: String?,
+            val revision: Long,
+            val ownerSubscriptionId: String?,
+        )
+
+        @Volatile
+        private var currentInstance: BoxService? = null
+
+        @Volatile
+        var lastStartFailure: StartFailure? = null
+            private set
+
+        /** The lifecycle attempt id of the current service instance, 0 when none is alive. */
+        fun currentStartAttempt(): Long = currentInstance?.lifecycle?.currentStartAttempt() ?: 0L
 
         /**
          * Verdict of the last config application attempted by this process's Box.
@@ -152,6 +172,10 @@ class BoxService(private val service: Service, private val platformInterface: Pl
     private val lifecycle = CoreLifecycle()
 
     private var receiverRegistered = false
+
+    init {
+        currentInstance = this
+    }
 
     // `pendingRestart` used to live here as a @Volatile Boolean. It is gone on purpose:
     // a flag that a stale stop could clear (`pendingRestart = false` on the way out) had
@@ -338,6 +362,7 @@ class BoxService(private val service: Service, private val platformInterface: Pl
     private suspend fun startService() {
         try {
             if (status.value != Status.Starting) return
+            lastStartFailure = null
             withContext(Dispatchers.Main) {
                 notification.show(service.getString(R.string.app_name), R.string.status_starting)
             }
@@ -358,6 +383,13 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             try {
                 core?.applyConfig(content, buildOverrides())
             } catch (e: Exception) {
+                lastStartFailure = StartFailure(
+                    attempt = lifecycle.currentStartAttempt(),
+                    alert = Alert.CreateService,
+                    message = e.message,
+                    revision = snapshot.meta.revision,
+                    ownerSubscriptionId = snapshot.meta.ownerSubscriptionId,
+                )
                 CoreRuntime.onApplyFailed(e.message)
                 stopAndAlert(Alert.CreateService, e.message)
                 return
@@ -365,6 +397,7 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             // The Box is running exactly these bytes; the revision is what a later "was my config
             // applied?" check compares against.
             CoreRuntime.onConfigApplied(snapshot.meta.revision)
+            StartupRecovery.confirmStarted(snapshot.meta.ownerSubscriptionId)
 
             if (core?.needWifiState() == true) {
                 val wifiPermission =
@@ -724,6 +757,7 @@ class BoxService(private val service: Service, private val platformInterface: Pl
 
     @OptIn(DelicateCoroutinesApi::class)
     internal fun onDestroy() {
+        if (currentInstance === this) currentInstance = null
         binder.close()
         // Terminal, and deliberately UNCONDITIONAL. The old guard below only tidied up
         // when `core`/`factSession`/`fileDescriptor` were already set - but the window

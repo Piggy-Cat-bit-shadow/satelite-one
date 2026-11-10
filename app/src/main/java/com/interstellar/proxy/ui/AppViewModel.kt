@@ -9,6 +9,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.interstellar.proxy.constant.Action
+import com.interstellar.proxy.constant.Alert
 import com.interstellar.proxy.constant.Status
 import com.interstellar.proxy.data.ActiveConfigApply
 import com.interstellar.proxy.data.ActiveConfigRecovery
@@ -18,6 +19,7 @@ import com.interstellar.proxy.data.ProviderRefresh
 import com.interstellar.proxy.data.ProviderRefreshSummary
 import com.interstellar.proxy.data.ReloadRequest
 import com.interstellar.proxy.data.Settings
+import com.interstellar.proxy.data.StartupRecovery
 import com.interstellar.proxy.data.SubscriptionRepository
 import com.interstellar.proxy.data.SubscriptionUpdateCoordinator
 import com.interstellar.proxy.data.SubscriptionUpdateCoordinator.ActiveConfigAction
@@ -550,6 +552,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private var stoppedReceiver: BroadcastReceiver? = null
     private var autoTested = false
     @Volatile private var probing = false
+    private var startupRecoveryGeneration = 0L
+    @Volatile private var startupRecoveryAttempted = false
 
     /**
      * When the UI's command-socket client should be on, and whether its failure may drive UI
@@ -1001,7 +1005,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun startProxy() {
+        startupRecoveryAttempted = false
+        startProxyInternal()
+    }
+
+    private fun startProxyInternal() {
         android.util.Log.d("InterstellarUI", "startProxy invoked")
+        val generation = ++startupRecoveryGeneration
         if (probing) {
             probing = false
             com.interstellar.proxy.bg.BoxService.stop()
@@ -1028,6 +1038,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 android.util.Log.d("InterstellarUI", "config ok length=" + config.length)
                 com.interstellar.proxy.bg.BoxService.start()
+                watchStartupFailure(
+                    generation = generation,
+                    revision = ConfigStore.activeConfigRevision(),
+                    owner = SubscriptionRepository.activeSubscription()?.id,
+                    allowRecovery = !startupRecoveryAttempted,
+                )
                 // Same client, same lifetime as every other establish in this file: `commandClient`
                 // is ONE socket, and the guarded `connect()` above hands it to the UI. So the
                 // startup establish is a UI-client establish too, and it needs the same verdict.
@@ -1061,6 +1077,57 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 markStopped()
             } finally {
                 _busy.value = false
+            }
+        }
+    }
+
+    /**
+     * Waits for this start attempt's outcome, and once restores the last-good config if the core
+     * refused the candidate at startup.
+     *
+     * Only a [BoxService.StartFailure] carrying the exact revision/owner of this attempt is
+     * eligible: a stop, a watchdog expiry, a permission failure or a newer write must not be
+     * mistaken for the offline candidate. [allowRecovery] makes the retry single-shot; the journal
+     * is consumed by [StartupRecovery.restore] before the retry, so a bad candidate cannot loop.
+     */
+    private fun watchStartupFailure(
+        generation: Long,
+        revision: Long,
+        owner: String?,
+        allowRecovery: Boolean,
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val deadline = System.currentTimeMillis() + STARTING_TIMEOUT_MS
+            while (generation == startupRecoveryGeneration && System.currentTimeMillis() < deadline) {
+                if (_status.value == Status.Started) return@launch
+                val failure = com.interstellar.proxy.bg.BoxService.lastStartFailure
+                val stopped = _status.value == Status.Stopped
+                if (stopped && failure != null &&
+                    failure.revision == revision &&
+                    failure.ownerSubscriptionId == owner &&
+                    failure.alert == Alert.CreateService
+                ) {
+                    if (!allowRecovery || startupRecoveryAttempted) {
+                        android.util.Log.w("InterstellarUI", "startup failed; no second recovery attempt")
+                        return@launch
+                    }
+                    when (val result = StartupRecovery.restore(revision, owner)) {
+                        is StartupRecovery.Result.Restored -> {
+                            android.util.Log.w(
+                                "InterstellarUI",
+                                "startup failed at revision=$revision; restored revision=${result.revision}",
+                            )
+                            startupRecoveryAttempted = true
+                            startProxyInternal()
+                        }
+                        StartupRecovery.Result.Nothing ->
+                            android.util.Log.w("InterstellarUI", "startup failed; no last-good candidate to restore")
+                        StartupRecovery.Result.Superseded ->
+                            android.util.Log.w("InterstellarUI", "startup recovery superseded; leaving newer state")
+                    }
+                    return@launch
+                }
+                delay(100)
             }
         }
     }

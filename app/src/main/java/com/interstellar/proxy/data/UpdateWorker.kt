@@ -37,6 +37,17 @@ class UpdateWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         val activeIdBefore = start.activeSubscriptionId
         val rawBefore = activeIdBefore.takeIf { it.isNotBlank() }?.let { SubscriptionRepository.readRawBody(it) }
         val wasServing = CoreRuntime.appliedConfigRevision >= 0
+        val offline = !Settings.tileActive
+        if (offline && activeIdBefore.isNotBlank() && rawBefore != null) {
+            // The offline refresh below replaces the raw body but cannot try it. Remember the
+            // document that is serving now *before* the write, so a failed first start can restore
+            // the same subscription's last good config even if this process dies in between.
+            StartupRecovery.rememberBeforeOfflineRefresh(
+                subscriptionId = activeIdBefore,
+                previousRawBody = rawBefore,
+                snapshot = ConfigStore.snapshot(),
+            )
+        }
         val batch = SubscriptionRepository.refreshAll(regenerate = false)
         val messages = batch.messages
         var owns = SubscriptionUpdateCoordinator.stillOwns(
@@ -49,7 +60,7 @@ class UpdateWorker(context: Context, params: WorkerParameters) : CoroutineWorker
             log("result superseded by a newer instance; nothing committed")
             return Result.success()
         }
-        if (messages.isEmpty() || !Settings.tileActive) return Result.success()
+        if (messages.isEmpty() || offline) return Result.success()
         // Commit the fetched bytes only after the ownership check, then decide whether the config
         // actually changed; only a changed config needs a hot reload.
         SubscriptionRepository.regenerateActiveConfig()
@@ -90,7 +101,11 @@ class UpdateWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                 (receipt?.let { "req=${it.requestId} rev=${it.configRevision} success=${it.success} error=${it.error}" } ?: "none"),
         )
         when (verdict) {
-            ActiveConfigApply.Verdict.APPLIED -> Unit
+            ActiveConfigApply.Verdict.APPLIED -> {
+                // The candidate is confirmed serving; any offline last-good journal for this
+                // subscription is no longer needed.
+                StartupRecovery.confirmStarted(committed.meta.ownerSubscriptionId)
+            }
             ActiveConfigApply.Verdict.REFUSED -> {
                 // The body this run actually committed, captured at commit time. Reading the file
                 // again here would name a newer body if another operation replaced it while the
