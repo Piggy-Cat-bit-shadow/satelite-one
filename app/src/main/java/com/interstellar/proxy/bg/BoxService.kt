@@ -31,7 +31,10 @@ import com.interstellar.proxy.core.ProxyCore
 import com.interstellar.proxy.core.SystemProxyState
 import com.interstellar.proxy.data.ConfigStore
 import com.interstellar.proxy.data.CoreRuntime
+import com.interstellar.proxy.data.ReloadIntent
+import com.interstellar.proxy.data.ReloadIntentQueue
 import com.interstellar.proxy.data.ReloadReceipt
+import com.interstellar.proxy.data.ReloadReceiptBook
 import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.ktx.hasPermission
 import kotlinx.coroutines.DelicateCoroutinesApi
@@ -56,15 +59,17 @@ class BoxService(private val service: Service, private val platformInterface: Pl
          * so the receipt is recorded here with the revision it read, the request intent that caused
          * it, and the engine generation of the attempt.
          */
-        @Volatile
-        var lastReload: ReloadReceipt? = null
-            private set
+        /**
+         * The latest reload receipt, kept for diagnostics (the log page).
+         *
+         * Callers must not use this to decide whether *their* reload was applied: another request
+         * can finish in between. [receiptFor] answers that question by intent id.
+         */
+        val lastReload: ReloadReceipt?
+            get() = reloadReceipts.latest()
 
-        /** A reload the client is about to ask for, registered before the RPC is sent. */
-        data class ReloadIntent(val id: Long, val revision: Long, val atMillis: Long)
-
-        private val reloadIntents = ArrayDeque<ReloadIntent>()
-        private var reloadIntentSequence = 0L
+        private val reloadIntents = ReloadIntentQueue()
+        private val reloadReceipts = ReloadReceiptBook()
 
         /**
          * Binds the next reload of [revision] to a caller-visible id.
@@ -75,34 +80,14 @@ class BoxService(private val service: Service, private val platformInterface: Pl
          * receipt instead of reading whichever verdict was written last. Stale intents expire so a
          * reload that never reached the Box cannot be matched by a later request for the same bytes.
          */
-        @Synchronized
-        fun registerReloadIntent(revision: Long): ReloadIntent {
-            val now = System.currentTimeMillis()
-            while (reloadIntents.isNotEmpty() && now - reloadIntents.first().atMillis > 60_000) {
-                reloadIntents.removeFirst()
-            }
-            val intent = ReloadIntent(++reloadIntentSequence, revision, now)
-            reloadIntents.addLast(intent)
-            return intent
-        }
+        fun registerReloadIntent(revision: Long): ReloadIntent = reloadIntents.register(revision)
 
-        @Synchronized
-        private fun consumeReloadIntent(revision: Long): Long? {
-            val iterator = reloadIntents.iterator()
-            while (iterator.hasNext()) {
-                val intent = iterator.next()
-                if (intent.revision == revision) {
-                    iterator.remove()
-                    return intent.id
-                }
-            }
-            return null
-        }
+        /** The receipt recorded for exactly [requestId], or null when it never reached the Box. */
+        fun receiptFor(requestId: Long): ReloadReceipt? = reloadReceipts.forRequest(requestId)
 
-        @Synchronized
-        private fun recordReload(receipt: ReloadReceipt) {
-            lastReload = receipt
-        }
+        private fun consumeReloadIntent(revision: Long): Long? = reloadIntents.consume(revision)
+
+        private fun recordReload(receipt: ReloadReceipt) = reloadReceipts.record(receipt)
 
         /**
          * A refused publish is retried at most this many times.

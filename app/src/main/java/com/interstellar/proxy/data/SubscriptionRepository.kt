@@ -98,8 +98,16 @@ object SubscriptionRepository {
 
     /** Outcome of deciding what to do with a downloaded subscription body. */
     sealed interface BodyCommit {
-        /** The body was kept (a raw config) or the subscription is a node list again. */
-        data class Accepted(val format: String?) : BodyCommit
+        /**
+         * The body was kept (a raw config) or the subscription is a node list again.
+         *
+         * [rawBody] is the exact bytes this commit wrote as the retained body (null when the
+         * candidate was a node list and the file was removed). A later recovery must roll back
+         * *this* body, not whatever happens to be on disk when the failure arrives: another
+         * operation can commit a newer body for the same subscription before the old reload
+         * fails, and a late read would then name the newer body as its own.
+         */
+        data class Accepted(val format: String?, val rawBody: String? = null) : BodyCommit
 
         /** A sing-box body the core refuses; the subscription's previous body is still on disk. */
         data class Refused(val error: String) : BodyCommit
@@ -118,7 +126,7 @@ object SubscriptionRepository {
         val detected = com.interstellar.proxy.data.subscription.RawConfigDetector.detect(body)
         if (detected == null) {
             rawFileOf(subscriptionId).delete()
-            return@synchronized BodyCommit.Accepted(null)
+            return@synchronized BodyCommit.Accepted(null, null)
         }
         if (detected == com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX) {
             val failure = runCatching { Libbox.checkConfig(body) }.exceptionOrNull()
@@ -128,7 +136,7 @@ object SubscriptionRepository {
             }
         }
         runCatching { rawFileOf(subscriptionId).writeText(body) }
-        BodyCommit.Accepted(detected.wire)
+        BodyCommit.Accepted(detected.wire, body)
     }
 
     /**
@@ -453,9 +461,30 @@ object SubscriptionRepository {
      * Fetches a URL subscription and updates the store.
      * Returns a user-facing message, or null when the sub is not refreshable.
      */
-    suspend fun refresh(id: String, regenerate: Boolean = true): String? = withContext(Dispatchers.IO) {
+    /** One subscription refresh: its user-facing message and the body this run committed. */
+    data class RefreshCommit(
+        val message: String?,
+        val rawBody: String?,
+        /** True only when this run actually replaced the retained body (Accepted). */
+        val committed: Boolean = false,
+    )
+
+    /** The whole batch: messages, plus the exact body each subscription committed, if any. */
+    data class RefreshAllResult(
+        val messages: List<String>,
+        val committedRawBodies: Map<String, String?>,
+    )
+
+    /**
+     * Refreshes one subscription and returns the body it actually committed.
+     *
+     * The body is captured from the commit result inside this call, not read again later: a newer
+     * operation can replace the same subscription's raw file before an older reload fails, and a
+     * late read would then name the newer body as the old operation's own.
+     */
+    suspend fun refresh(id: String, regenerate: Boolean = true): RefreshCommit? = withContext(Dispatchers.IO) {
         val sub = get(id) ?: return@withContext null
-        val url = sub.url ?: return@withContext str(com.interstellar.proxy.R.string.vm_local_no_refresh)
+        val url = sub.url ?: return@withContext RefreshCommit(str(com.interstellar.proxy.R.string.vm_local_no_refresh), null)
         try {
             val result = com.interstellar.proxy.data.net.SubscriptionFetcher.fetch(url)
             when (val commit = commitFetchedBody(id, result.body)) {
@@ -472,12 +501,12 @@ object SubscriptionRepository {
                         ),
                         regenerate = regenerate,
                     )
-                    commit.error
+                    RefreshCommit(commit.error, null)
                 }
 
                 is BodyCommit.Accepted -> {
                     val format = commit.format
-                    when (val parsed = com.interstellar.proxy.data.subscription.SubscriptionParser.parse(result.body, id)) {
+                    val message = when (val parsed = com.interstellar.proxy.data.subscription.SubscriptionParser.parse(result.body, id)) {
                         is com.interstellar.proxy.data.subscription.SubscriptionParser.Result.Nodes -> {
                             upsert(
                                 sub.copy(
@@ -519,16 +548,28 @@ object SubscriptionRepository {
                                 str(com.interstellar.proxy.R.string.repo_refresh_unparsable, sub.name)
                             }
                     }
+                    RefreshCommit(message, commit.rawBody, committed = true)
                 }
             }
         } catch (e: Exception) {
-            str(com.interstellar.proxy.R.string.repo_refresh_failed, sub.name, e.message ?: "")
+            RefreshCommit(str(com.interstellar.proxy.R.string.repo_refresh_failed, sub.name, e.message ?: ""), null)
         }
     }
 
-    /** Refreshes every URL subscription, keeping the selected node when possible. */
-    suspend fun refreshAll(regenerate: Boolean = true): List<String> = withContext(Dispatchers.IO) {
-        subscriptions.filter { it.url != null }.map { refresh(it.id, regenerate) }.filterNotNull()
+    /**
+     * Refreshes every URL subscription, keeping the selected node when possible.
+     *
+     * The committed bodies travel with the messages so a caller that later has to roll one back
+     * uses the bytes it actually wrote, not whatever is on disk at failure time.
+     */
+    suspend fun refreshAll(regenerate: Boolean = true): RefreshAllResult = withContext(Dispatchers.IO) {
+        val commits = subscriptions.filter { it.url != null }.mapNotNull { sub ->
+            refresh(sub.id, regenerate)?.let { sub.id to it }
+        }
+        RefreshAllResult(
+            messages = commits.mapNotNull { it.second.message },
+            committedRawBodies = commits.filter { it.second.committed }.associate { it.first to it.second.rawBody },
+        )
     }
 
     fun selectNode(nodeId: String) {

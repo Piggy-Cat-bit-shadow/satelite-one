@@ -37,7 +37,8 @@ class UpdateWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         val activeIdBefore = start.activeSubscriptionId
         val rawBefore = activeIdBefore.takeIf { it.isNotBlank() }?.let { SubscriptionRepository.readRawBody(it) }
         val wasServing = CoreRuntime.appliedConfigRevision >= 0
-        val messages = SubscriptionRepository.refreshAll(regenerate = false)
+        val batch = SubscriptionRepository.refreshAll(regenerate = false)
+        val messages = batch.messages
         var owns = SubscriptionUpdateCoordinator.stillOwns(
             start,
             instanceSnapshot(),
@@ -75,7 +76,7 @@ class UpdateWorker(context: Context, params: WorkerParameters) : CoroutineWorker
             engineGenerationBefore = CoreRuntime.engineGeneration,
         )
         val rpc = runCatching { CommandTarget.standaloneClient().serviceReload() }
-        val receipt = BoxService.lastReload
+        val receipt = BoxService.receiptFor(intent.id)
         val verdict = ActiveConfigApply.classify(
             request = request,
             rpcSucceeded = rpc.isSuccess,
@@ -91,16 +92,18 @@ class UpdateWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         when (verdict) {
             ActiveConfigApply.Verdict.APPLIED -> Unit
             ActiveConfigApply.Verdict.REFUSED -> {
+                // The body this run actually committed, captured at commit time. Reading the file
+                // again here would name a newer body if another operation replaced it while the
+                // reload was failing.
+                val rawOwnerId = activeIdBefore.takeIf { it.isNotBlank() && batch.committedRawBodies.containsKey(it) }
                 val recovery = ActiveConfigRecovery.restore(
                     ActiveConfigRecovery.FailedCandidate(
                         committedRevision = expectedRevision,
                         committedOwner = committed.meta.ownerSubscriptionId,
                         previousConfig = activeBefore,
                         previousOwner = ownerBefore,
-                        rawOwnerId = activeIdBefore.takeIf { it.isNotBlank() },
-                        committedRawBody = activeIdBefore
-                            .takeIf { it.isNotBlank() }
-                            ?.let { SubscriptionRepository.readRawBody(it) },
+                        rawOwnerId = rawOwnerId,
+                        committedRawBody = rawOwnerId?.let { batch.committedRawBodies[it] },
                         previousRawBody = rawBefore,
                     ),
                 )
@@ -115,22 +118,30 @@ class UpdateWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                         // rejected by the platform, in which case the restored files still make the
                         // next start good and the log records that no restart happened.
                         if (wasServing) {
+                            val restoredRevision = recovery.revision
                             val restarted = restartStoredConfig()
-                            log("restart from restored config requested=$restarted")
+                            log("restart from restored config requested=$restarted expectedRevision=$restoredRevision")
                             if (restarted) {
-                                // The start is asynchronous. Wait for the daemon to report the
-                                // restored revision as applied, then refresh providers on THAT
-                                // instance; otherwise the worker would end without proving that the
-                                // recovered document actually serves.
+                                // The start is asynchronous, and another operation may commit and
+                                // apply a newer revision while this worker waits. Wait for THIS
+                                // recovery's revision, not "whatever revision is on disk now": the
+                                // latter can be C's, and refreshing C from an old worker is exactly
+                                // the misattribution this guards against.
                                 val deadline = System.currentTimeMillis() + 15_000
                                 while (
                                     System.currentTimeMillis() < deadline &&
-                                    CoreRuntime.appliedConfigRevision != ConfigStore.activeConfigRevision()
+                                    CoreRuntime.appliedConfigRevision != restoredRevision
                                 ) {
                                     kotlinx.coroutines.delay(250)
                                 }
-                                val serving = CoreRuntime.appliedConfigRevision == ConfigStore.activeConfigRevision()
-                                log("restored instance serving=$serving gen=${CoreRuntime.engineGeneration}")
+                                val serving = ActiveConfigRecovery.servesRestoredInstance(
+                                    restoredRevision,
+                                    CoreRuntime.appliedConfigRevision,
+                                )
+                                log(
+                                    "restored instance serving=$serving expectedRevision=$restoredRevision " +
+                                        "appliedRevision=${CoreRuntime.appliedConfigRevision} gen=${CoreRuntime.engineGeneration}",
+                                )
                                 if (serving) {
                                     refreshProviders()
                                 }

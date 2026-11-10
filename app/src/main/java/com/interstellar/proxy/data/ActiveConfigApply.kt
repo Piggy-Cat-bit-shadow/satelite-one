@@ -78,9 +78,12 @@ object ActiveConfigApply {
             return if (appliedRevision == request.revision) Verdict.SUPERSEDED else Verdict.REFUSED
         }
         if (!rpcSucceeded) return Verdict.UNCONFIRMED
-        // The RPC returned but the receipt is about another revision/request, or the store moved
-        // past ours while the request was in flight.
-        return Verdict.SUPERSEDED
+        // The RPC returned but no receipt carries this request id. Either the Box consumed a
+        // different caller's intent (the reload RPC has no request payload) or another write/reload
+        // moved past us. When the revision is still current we cannot tell whether it applied; that
+        // is an unconfirmed result, not a clean success and not a refusal to roll back.
+        if (currentRevision != request.revision) return Verdict.SUPERSEDED
+        return Verdict.UNCONFIRMED
     }
 }
 
@@ -127,6 +130,17 @@ object AndroidActiveConfigStorage : ActiveConfigStorage {
  * checking first and writing after is the race that let B's late failure restore A over C.
  */
 object ActiveConfigRecovery {
+
+    /**
+     * True only when the live Box is serving the revision this recovery restored.
+     *
+     * Comparing "applied revision" with "the revision currently on disk" would also be true when
+     * another operation (C) committed and applied while an old worker was waiting; the worker
+     * would then refresh C's instance and log it as its own recovery. The expected revision is the
+     * one [restore] returned, and it is the only instance this worker may act on.
+     */
+    fun servesRestoredInstance(restoredRevision: Long, appliedRevision: Long): Boolean =
+        appliedRevision == restoredRevision
 
     /** What the failed attempt committed, and what was there before it. */
     data class FailedCandidate(

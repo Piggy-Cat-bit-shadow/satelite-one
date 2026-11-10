@@ -193,6 +193,17 @@ class ActiveConfigRecoveryTest {
     }
 
     @Test
+    fun `only the restored revision counts as the recovered instance, not whatever is current`() {
+        // The worker restored revision 5 and waits. If another operation commits and applies
+        // revision 7 meanwhile, "applied == on-disk current" would be true for C's instance; the
+        // restored revision comparison is what keeps the old worker from refreshing C.
+        assertTrue(ActiveConfigRecovery.servesRestoredInstance(restoredRevision = 5, appliedRevision = 5))
+        assertFalse(ActiveConfigRecovery.servesRestoredInstance(restoredRevision = 5, appliedRevision = 7))
+        assertFalse(ActiveConfigRecovery.servesRestoredInstance(restoredRevision = 5, appliedRevision = -1))
+        assertFalse(ActiveConfigRecovery.servesRestoredInstance(restoredRevision = 5, appliedRevision = 0))
+    }
+
+    @Test
     fun `a different owner on the same revision is not this candidate`() {
         val store = FakeStorage(content = "B", owner = "someone-else", revision = 2)
         store.rawBodies["b"] = "B-body"

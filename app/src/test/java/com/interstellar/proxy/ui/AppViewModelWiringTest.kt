@@ -982,7 +982,14 @@ class AppViewModelWiringTest {
         assertTrue(
             "UpdateWorker no longer proves the restored revision is serving before it refreshes the " +
                 "instance's providers.",
-            worker.contains("restored instance serving=") && worker.contains("refreshProviders()"),
+            worker.contains("servesRestoredInstance(") &&
+                worker.contains("restored instance serving="),
+        )
+        assertTrue(
+            "UpdateWorker reads the body from disk after the failure instead of using the identity it " +
+                "committed; a newer raw body can then be rolled back by the old attempt.",
+            worker.contains("batch.committedRawBodies") &&
+                !worker.contains("committedRawBody = activeIdBefore"),
         )
         val viewModel = File("src/main/java/com/interstellar/proxy/ui/AppViewModel.kt").readText()
         assertTrue(

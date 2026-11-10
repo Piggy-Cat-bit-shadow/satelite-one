@@ -68,8 +68,11 @@ class ActiveConfigApplyTest {
 
     @Test
     fun `a receipt for another request is not evidence about this one`() {
+        // A receipt that belongs to another request cannot confirm this one. The revision is still
+        // current, so the honest verdict is unconfirmed (the old code reported superseded, which
+        // looked like a newer operation owned the result).
         assertEquals(
-            Verdict.SUPERSEDED,
+            Verdict.UNCONFIRMED,
             ActiveConfigApply.classify(
                 request = request,
                 rpcSucceeded = true,
@@ -156,15 +159,27 @@ class ActiveConfigApplyTest {
     }
 
     @Test
-    fun `a returned RPC without our receipt is superseded, not applied`() {
+    fun `a returned RPC without our receipt is unconfirmed, not applied`() {
         assertEquals(
-            Verdict.SUPERSEDED,
+            Verdict.UNCONFIRMED,
             ActiveConfigApply.classify(
                 request = request,
                 rpcSucceeded = true,
                 receipt = null,
                 currentRevision = 12,
                 currentGeneration = 40,
+                appliedRevision = -1,
+            ),
+        )
+        // A revision that moved meanwhile is still superseded: the verdict cannot be about us.
+        assertEquals(
+            Verdict.SUPERSEDED,
+            ActiveConfigApply.classify(
+                request = request,
+                rpcSucceeded = true,
+                receipt = null,
+                currentRevision = 13,
+                currentGeneration = 41,
                 appliedRevision = -1,
             ),
         )

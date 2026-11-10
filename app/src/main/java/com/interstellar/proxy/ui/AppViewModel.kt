@@ -1198,7 +1198,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             engineGenerationBefore = CoreRuntime.engineGeneration,
         )
         val rpc = runCatching { CommandTarget.standaloneClient().serviceReload() }
-        val receipt = com.interstellar.proxy.bg.BoxService.lastReload
+        val receipt = com.interstellar.proxy.bg.BoxService.receiptFor(intent.id)
         return when (
             ActiveConfigApply.classify(
                 request = request,
