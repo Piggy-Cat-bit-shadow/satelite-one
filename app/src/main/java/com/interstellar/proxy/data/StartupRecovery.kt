@@ -33,6 +33,8 @@ data class StartupCandidate(
     val previousRevision: Long,
     val previousContent: SubscriptionRepository.SubscriptionContent? = null,
     val candidateContent: SubscriptionRepository.SubscriptionContent? = null,
+    val candidateRawBody: String? = null,
+    val candidateRawPresent: Boolean = false,
 )
 
 interface StartupRecoveryStorage {
@@ -154,12 +156,20 @@ object StartupRecovery {
      */
     fun rememberCandidate(
         subscriptionId: String,
+        candidateRawBody: String?,
+        candidateContent: SubscriptionRepository.SubscriptionContent?,
         storage: StartupRecoveryStorage = AndroidStartupRecoveryStorage,
     ): Boolean {
         val candidate = read(storage.readJournal()) ?: return false
         if (candidate.subscriptionId != subscriptionId) return false
-        val content = storage.readSubscriptionContent(subscriptionId) ?: return false
-        write(candidate.copy(candidateContent = content), storage)
+        write(
+            candidate.copy(
+                candidateRawBody = candidateRawBody,
+                candidateRawPresent = true,
+                candidateContent = candidateContent,
+            ),
+            storage,
+        )
         return true
     }
 
@@ -190,15 +200,27 @@ object StartupRecovery {
             storage.clearJournal()
             return Result.Superseded
         }
+        if (!candidate.candidateRawPresent) {
+            // No record of what this run actually committed (legacy journal or an interrupted
+            // fetch). The current raw is not a substitute for that identity.
+            storage.clearJournal()
+            return Result.Nothing
+        }
         val currentRaw = storage.readRawBody(candidate.subscriptionId)
+        if (currentRaw != candidate.candidateRawBody) {
+            // A newer operation wrote the raw body. Restoring the old one would roll that write
+            // back even though it may not have advanced the active revision yet.
+            storage.clearJournal()
+            return Result.Superseded
+        }
         val currentContent = storage.readSubscriptionContent(candidate.subscriptionId)
-        val rawChanged = currentRaw != candidate.previousRawBody
-        val contentChanged = candidate.previousRawBody == null &&
+        val rawChanged = candidate.candidateRawBody != candidate.previousRawBody
+        val contentChanged = candidate.candidateRawBody == null &&
             candidate.previousContent != null &&
             candidate.candidateContent != null &&
             currentContent == candidate.candidateContent &&
             candidate.previousContent != candidate.candidateContent
-        val contentMovedAway = candidate.previousRawBody == null &&
+        val contentMovedAway = candidate.candidateRawBody == null &&
             candidate.candidateContent != null &&
             currentContent != null &&
             currentContent != candidate.candidateContent
@@ -219,7 +241,7 @@ object StartupRecovery {
         if (rawChanged) {
             val rawRestored = storage.restoreRawBodyIfCurrent(
                 subscriptionId = candidate.subscriptionId,
-                currentBody = currentRaw,
+                currentBody = candidate.candidateRawBody,
                 previousBody = candidate.previousRawBody,
             )
             if (!rawRestored) {
@@ -239,7 +261,7 @@ object StartupRecovery {
                     storage.restoreRawBodyIfCurrent(
                         subscriptionId = candidate.subscriptionId,
                         currentBody = candidate.previousRawBody,
-                        previousBody = currentRaw,
+                        previousBody = candidate.candidateRawBody,
                     )
                 }
                 storage.restoreConfigIfRevision(restoredRevision, currentConfig, candidateOwner)
@@ -271,6 +293,10 @@ object StartupRecovery {
         properties["previousRevision"] = candidate.previousRevision.toString()
         candidate.previousContent?.let { properties["previousContent"] = journalJson.encodeToString(it) }
         candidate.candidateContent?.let { properties["candidateContent"] = journalJson.encodeToString(it) }
+        if (candidate.candidateRawPresent) {
+            properties["candidateRawPresent"] = "true"
+            candidate.candidateRawBody?.let { properties["candidateRawBody"] = toHex(it.toByteArray()) }
+        }
         storage.writeJournal(propertiesText(properties))
     }
 
@@ -306,6 +332,10 @@ object StartupRecovery {
                 candidateContent = properties.getProperty("candidateContent")?.let {
                     journalJson.decodeFromString(it)
                 },
+                candidateRawBody = properties.getProperty("candidateRawBody")?.let {
+                    String(fromHex(it))
+                },
+                candidateRawPresent = properties.getProperty("candidateRawPresent") == "true",
             )
         }.getOrNull()
     }

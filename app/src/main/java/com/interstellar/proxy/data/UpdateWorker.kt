@@ -63,10 +63,14 @@ class UpdateWorker(context: Context, params: WorkerParameters) : CoroutineWorker
             log("result superseded by a newer instance; nothing committed")
             return Result.success()
         }
-        if (offline && activeIdBefore.isNotBlank()) {
-            // The candidate exists only after the fetch. It is recorded separately so a node-list
-            // restore can prove the current nodes are still this candidate before reverting them.
-            StartupRecovery.rememberCandidate(activeIdBefore)
+        if (offline && activeIdBefore.isNotBlank() && batch.committedRawBodies.containsKey(activeIdBefore)) {
+            // The candidate identity comes from the commit itself, not from a later repository
+            // read: another operation may already have replaced raw or nodes.
+            StartupRecovery.rememberCandidate(
+                subscriptionId = activeIdBefore,
+                candidateRawBody = batch.committedRawBodies[activeIdBefore],
+                candidateContent = batch.committedContents[activeIdBefore],
+            )
         }
         if (messages.isEmpty() || offline) return Result.success()
         // Commit the fetched bytes only after the ownership check, then decide whether the config

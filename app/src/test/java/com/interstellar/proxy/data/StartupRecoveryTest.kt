@@ -96,6 +96,7 @@ class StartupRecoveryTest {
                 storage = storage,
             ),
         )
+        StartupRecovery.rememberCandidate("sub-a", "new-raw", SubscriptionRepository.SubscriptionContent(), storage)
         assertEquals("new-raw", storage.raw)
 
         val result = StartupRecovery.restore(candidateRevision = 7, candidateOwner = "sub-a", storage = storage)
@@ -128,6 +129,7 @@ class StartupRecoveryTest {
     fun `a newer revision is superseded without writing`() {
         val storage = FakeStorage(snapshot = snapshot(revision = 8), raw = "new-raw")
         StartupRecovery.rememberBeforeOfflineRefresh("sub-a", "old-raw", snapshot(revision = 7), storage)
+        StartupRecovery.rememberCandidate("sub-a", "new-raw", SubscriptionRepository.SubscriptionContent(), storage)
 
         val result = StartupRecovery.restore(candidateRevision = 7, candidateOwner = "sub-a", storage = storage)
 
@@ -143,6 +145,7 @@ class StartupRecoveryTest {
     fun `an unchanged raw body is not evidence of the candidate`() {
         val storage = FakeStorage(snapshot = snapshot(), raw = "old-raw")
         StartupRecovery.rememberBeforeOfflineRefresh("sub-a", "old-raw", snapshot(), storage)
+        StartupRecovery.rememberCandidate("sub-a", "old-raw", SubscriptionRepository.SubscriptionContent(), storage)
 
         val result = StartupRecovery.restore(candidateRevision = 7, candidateOwner = "sub-a", storage = storage)
 
@@ -155,6 +158,7 @@ class StartupRecoveryTest {
     fun `a raw body that moved during recovery is never overwritten`() {
         val storage = FakeStorage(snapshot = snapshot(), raw = "new-raw", failRawCas = true)
         StartupRecovery.rememberBeforeOfflineRefresh("sub-a", "old-raw", snapshot(), storage)
+        StartupRecovery.rememberCandidate("sub-a", "new-raw", SubscriptionRepository.SubscriptionContent(), storage)
 
         val result = StartupRecovery.restore(candidateRevision = 7, candidateOwner = "sub-a", storage = storage)
 
@@ -164,6 +168,35 @@ class StartupRecoveryTest {
         assertEquals(2, storage.configRestores)
         assertEquals("old-config", storage.lastConfigContent)
         assertEquals("new-raw", storage.raw)
+        assertNull(storage.journal)
+    }
+
+    @Test
+    fun `a raw body written by C after the candidate is never rolled back`() {
+        val storage = FakeStorage(snapshot = snapshot(), raw = "candidate-b")
+        StartupRecovery.rememberBeforeOfflineRefresh("sub-a", "old-raw", snapshot(), storage)
+        StartupRecovery.rememberCandidate("sub-a", "candidate-b", SubscriptionRepository.SubscriptionContent(), storage)
+        storage.raw = "candidate-c"
+
+        val result = StartupRecovery.restore(7, "sub-a", storage)
+
+        assertEquals(StartupRecovery.Result.Superseded, result)
+        assertEquals("candidate-c", storage.raw)
+        assertEquals(0, storage.configRestores)
+        assertEquals(0, storage.rawRestores)
+        assertNull(storage.journal)
+    }
+
+    @Test
+    fun `a raw body without a recorded candidate is not guessed`() {
+        val storage = FakeStorage(snapshot = snapshot(), raw = "candidate-b")
+        StartupRecovery.rememberBeforeOfflineRefresh("sub-a", "old-raw", snapshot(), storage)
+
+        val result = StartupRecovery.restore(7, "sub-a", storage)
+
+        assertEquals(StartupRecovery.Result.Nothing, result)
+        assertEquals("candidate-b", storage.raw)
+        assertEquals(0, storage.configRestores)
         assertNull(storage.journal)
     }
 
@@ -190,7 +223,7 @@ class StartupRecoveryTest {
         val storage = FakeStorage(snapshot = snapshot(), raw = null, content = previous)
         assertTrue(StartupRecovery.rememberBeforeOfflineRefresh("sub-a", null, snapshot(), storage))
         storage.content = candidate
-        assertTrue(StartupRecovery.rememberCandidate("sub-a", storage))
+        assertTrue(StartupRecovery.rememberCandidate("sub-a", null, candidate, storage))
 
         val result = StartupRecovery.restore(7, "sub-a", storage)
 
@@ -209,7 +242,7 @@ class StartupRecoveryTest {
         val storage = FakeStorage(snapshot = snapshot(), raw = null, content = previous)
         StartupRecovery.rememberBeforeOfflineRefresh("sub-a", null, snapshot(), storage)
         storage.content = candidate
-        StartupRecovery.rememberCandidate("sub-a", storage)
+        StartupRecovery.rememberCandidate("sub-a", null, candidate, storage)
         storage.content = SubscriptionRepository.SubscriptionContent(configFormat = "newer")
 
         val result = StartupRecovery.restore(7, "sub-a", storage)
@@ -228,7 +261,7 @@ class StartupRecoveryTest {
         val storage = FakeStorage(snapshot = snapshot(), raw = null, content = previous)
         StartupRecovery.rememberBeforeOfflineRefresh("sub-a", null, snapshot(), storage)
         storage.content = candidate
-        StartupRecovery.rememberCandidate("sub-a", storage)
+        StartupRecovery.rememberCandidate("sub-a", null, candidate, storage)
         storage.failContentCas = true
 
         val result = StartupRecovery.restore(7, "sub-a", storage)

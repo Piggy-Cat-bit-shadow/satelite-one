@@ -245,42 +245,47 @@ object SubscriptionRepository {
 
     @Synchronized
     fun upsert(subscription: Subscription, regenerate: Boolean = true) {
-        val index = subscriptions.indexOfFirst { it.id == subscription.id }
-        if (index >= 0) {
-            subscriptions[index] = subscription
-        } else {
-            subscriptions.add(subscription)
+        val shouldRegenerate = synchronized(contentLock) {
+            val index = subscriptions.indexOfFirst { it.id == subscription.id }
+            if (index >= 0) {
+                subscriptions[index] = subscription
+            } else {
+                subscriptions.add(subscription)
+            }
+            if (activeSubscriptionId.isBlank()) activeSubscriptionId = subscription.id
+            save()
+            regenerate &&
+                affectsActivePool(subscription.id, activeSubscriptionId, Settings.mixEnabled, Settings.mixSubscriptionIds)
         }
-        if (activeSubscriptionId.isBlank()) activeSubscriptionId = subscription.id
-        save()
-        if (regenerate &&
-            affectsActivePool(subscription.id, activeSubscriptionId, Settings.mixEnabled, Settings.mixSubscriptionIds)
-        ) {
+        if (shouldRegenerate) {
             regenerateActiveConfig()
         }
     }
 
     @Synchronized
     fun remove(id: String) {
-        subscriptions.removeAll { it.id == id }
-        rawFileOf(id).delete()
-        if (activeSubscriptionId == id) {
-            activeSubscriptionId = subscriptions.firstOrNull()?.id ?: ""
+        val empty = synchronized(contentLock) {
+            subscriptions.removeAll { it.id == id }
+            rawFileOf(id).delete()
+            if (activeSubscriptionId == id) {
+                activeSubscriptionId = subscriptions.firstOrNull()?.id ?: ""
+            }
+            val remaining = Settings.mixSubscriptionIds - id
+            Settings.mixSubscriptionIds =
+                if (Settings.mixEnabled && remaining.isEmpty() && subscriptions.isNotEmpty()) {
+                    // keep the mix pool non-empty: re-check everything left
+                    subscriptions.map { it.id }.toSet()
+                } else {
+                    remaining
+                }
+            save()
+            subscriptions.isEmpty()
         }
         // 删光订阅时把磁盘上的活动配置一并清掉,否则静态分组解析会把
         // 旧配置"复活"成节点列表
-        if (subscriptions.isEmpty()) {
+        if (empty) {
             ConfigStore.clear()
         }
-        val remaining = Settings.mixSubscriptionIds - id
-        Settings.mixSubscriptionIds =
-            if (Settings.mixEnabled && remaining.isEmpty() && subscriptions.isNotEmpty()) {
-                // keep the mix pool non-empty: re-check everything left
-                subscriptions.map { it.id }.toSet()
-            } else {
-                remaining
-            }
-        save()
         regenerateActiveConfig()
     }
 
@@ -506,12 +511,15 @@ object SubscriptionRepository {
         val rawBody: String?,
         /** True only when this run actually replaced the retained body (Accepted). */
         val committed: Boolean = false,
+        /** The nodes/format this run actually wrote; null when nothing was committed. */
+        val committedContent: SubscriptionContent? = null,
     )
 
-    /** The whole batch: messages, plus the exact body each subscription committed, if any. */
+    /** The whole batch: messages, plus the exact body/content each subscription committed. */
     data class RefreshAllResult(
         val messages: List<String>,
         val committedRawBodies: Map<String, String?>,
+        val committedContents: Map<String, SubscriptionContent>,
     )
 
     /**
@@ -545,8 +553,10 @@ object SubscriptionRepository {
 
                 is BodyCommit.Accepted -> {
                     val format = commit.format
+                    var committedContent = SubscriptionContent(sub.nodes, sub.configFormat)
                     val message = when (val parsed = com.interstellar.proxy.data.subscription.SubscriptionParser.parse(result.body, id)) {
                         is com.interstellar.proxy.data.subscription.SubscriptionParser.Result.Nodes -> {
+                            committedContent = SubscriptionContent(parsed.nodes, format)
                             upsert(
                                 sub.copy(
                                     nodes = parsed.nodes,
@@ -567,6 +577,7 @@ object SubscriptionRepository {
                             // raw body is retained and usable in raw mode. Quota still
                             // belongs to this subscription, so keep it fresh too.
                             if (format != null) {
+                                committedContent = SubscriptionContent(sub.nodes, format)
                                 upsert(
                                     sub.copy(
                                         configFormat = format,
@@ -587,7 +598,7 @@ object SubscriptionRepository {
                                 str(com.interstellar.proxy.R.string.repo_refresh_unparsable, sub.name)
                             }
                     }
-                    RefreshCommit(message, commit.rawBody, committed = true)
+                    RefreshCommit(message, commit.rawBody, committed = true, committedContent = committedContent)
                 }
             }
         } catch (e: Exception) {
@@ -608,6 +619,8 @@ object SubscriptionRepository {
         RefreshAllResult(
             messages = commits.mapNotNull { it.second.message },
             committedRawBodies = commits.filter { it.second.committed }.associate { it.first to it.second.rawBody },
+            committedContents = commits.filter { it.second.committed && it.second.committedContent != null }
+                .associate { it.first to it.second.committedContent!! },
         )
     }
 
