@@ -257,6 +257,11 @@ object StartupRecovery {
         if (candidate.subscriptionId == ownerSubscriptionId) storage.clearJournal()
     }
 
+    /** Drops an attempt that lost ownership before it could record a candidate. */
+    fun discard(storage: StartupRecoveryStorage = AndroidStartupRecoveryStorage) {
+        storage.clearJournal()
+    }
+
     private fun write(candidate: StartupCandidate, storage: StartupRecoveryStorage) {
         val properties = Properties()
         properties["subscriptionId"] = candidate.subscriptionId

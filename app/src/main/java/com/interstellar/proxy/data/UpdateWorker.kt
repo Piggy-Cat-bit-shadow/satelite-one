@@ -49,11 +49,6 @@ class UpdateWorker(context: Context, params: WorkerParameters) : CoroutineWorker
             )
         }
         val batch = SubscriptionRepository.refreshAll(regenerate = false)
-        if (offline && activeIdBefore.isNotBlank()) {
-            // The candidate exists only after the fetch. It is recorded separately so a node-list
-            // restore can prove the current nodes are still this candidate before reverting them.
-            StartupRecovery.rememberCandidate(activeIdBefore)
-        }
         val messages = batch.messages
         var owns = SubscriptionUpdateCoordinator.stillOwns(
             start,
@@ -62,8 +57,16 @@ class UpdateWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         )
         log("gen=${start.engineGeneration} messages=${messages.size} owns=$owns serving=$wasServing")
         if (!owns) {
+            // Another operation owns the store now; this attempt's pre-refresh journal must not be
+            // replayed against that newer state.
+            StartupRecovery.discard()
             log("result superseded by a newer instance; nothing committed")
             return Result.success()
+        }
+        if (offline && activeIdBefore.isNotBlank()) {
+            // The candidate exists only after the fetch. It is recorded separately so a node-list
+            // restore can prove the current nodes are still this candidate before reverting them.
+            StartupRecovery.rememberCandidate(activeIdBefore)
         }
         if (messages.isEmpty() || offline) return Result.success()
         // Commit the fetched bytes only after the ownership check, then decide whether the config
@@ -74,6 +77,7 @@ class UpdateWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         val changed = SubscriptionUpdateCoordinator.configChanged(activeBefore, committed.content)
         owns = SubscriptionUpdateCoordinator.stillOwns(start, instanceSnapshot(), expectedRevision)
         if (!owns) {
+            StartupRecovery.discard()
             log("commit superseded; nothing applied")
             return Result.success()
         }

@@ -254,6 +254,16 @@ class StartupRecoveryTest {
     }
 
     @Test
+    fun `a discarded attempt cannot be replayed later`() {
+        val storage = FakeStorage(snapshot = snapshot(), raw = "new-raw")
+        StartupRecovery.rememberBeforeOfflineRefresh("sub-a", "old-raw", snapshot(), storage)
+        assertTrue(storage.journal != null)
+        StartupRecovery.discard(storage)
+        assertNull(storage.journal)
+        assertEquals(StartupRecovery.Result.Nothing, StartupRecovery.restore(7, "sub-a", storage))
+    }
+
+    @Test
     fun `a corrupt journal is ignored`() {
         val storage = FakeStorage(snapshot = snapshot(), raw = "new-raw")
         storage.journal = "not a properties file"
