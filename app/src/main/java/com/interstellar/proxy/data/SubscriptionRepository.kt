@@ -266,7 +266,9 @@ object SubscriptionRepository {
     fun remove(id: String) {
         val empty = synchronized(contentLock) {
             subscriptions.removeAll { it.id == id }
-            rawFileOf(id).delete()
+            // Delete under the same lock as the raw CAS: otherwise a restore that just checked
+            // the old body could have the file removed between its check and write.
+            synchronized(rawBodyLock) { rawFileOf(id).delete() }
             if (activeSubscriptionId == id) {
                 activeSubscriptionId = subscriptions.firstOrNull()?.id ?: ""
             }
