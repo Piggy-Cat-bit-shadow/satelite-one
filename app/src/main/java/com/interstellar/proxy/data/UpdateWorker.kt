@@ -38,8 +38,8 @@ class UpdateWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         val rawBefore = activeIdBefore.takeIf { it.isNotBlank() }?.let { SubscriptionRepository.readRawBody(it) }
         val wasServing = CoreRuntime.appliedConfigRevision >= 0
         val offline = !Settings.tileActive
-        if (offline && activeIdBefore.isNotBlank() && rawBefore != null) {
-            // The offline refresh below replaces the raw body but cannot try it. Remember the
+        if (offline && activeIdBefore.isNotBlank()) {
+            // The offline refresh below replaces the document but cannot try it. Remember the
             // document that is serving now *before* the write, so a failed first start can restore
             // the same subscription's last good config even if this process dies in between.
             StartupRecovery.rememberBeforeOfflineRefresh(
@@ -49,6 +49,11 @@ class UpdateWorker(context: Context, params: WorkerParameters) : CoroutineWorker
             )
         }
         val batch = SubscriptionRepository.refreshAll(regenerate = false)
+        if (offline && activeIdBefore.isNotBlank()) {
+            // The candidate exists only after the fetch. It is recorded separately so a node-list
+            // restore can prove the current nodes are still this candidate before reverting them.
+            StartupRecovery.rememberCandidate(activeIdBefore)
+        }
         val messages = batch.messages
         var owns = SubscriptionUpdateCoordinator.stillOwns(
             start,

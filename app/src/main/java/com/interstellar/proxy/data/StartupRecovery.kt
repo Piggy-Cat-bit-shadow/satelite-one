@@ -1,22 +1,29 @@
 package com.interstellar.proxy.data
 
+import com.interstellar.proxy.InterstellarApplication
 import java.io.File
 import java.util.Properties
-
-import com.interstellar.proxy.InterstellarApplication
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 
 /**
- * The last configuration that actually served before an offline worker replaced its raw body.
+ * The last configuration that actually served before an offline worker replaced it.
  *
  * The worker updates subscriptions while the tunnel is off. The fetch is committed to the profile,
- * but the new bytes are not tried until the next `Start proxy`; if the core rejects them at startup,
- * the old bytes and the exact config revision that served them are the only safe thing to go back
+ * but the new document is not tried until the next `Start proxy`; if the core rejects it at startup,
+ * the old configuration and the exact revision that served it are the only safe thing to go back
  * to. The journal is written *before* the offline refresh, so it names the previous document even
  * when the process dies during the commit.
  *
  * It is deliberately per active subscription and contains only one previous generation. A second
  * offline update of the same subscription keeps the first previous document: replacing it with the
  * bytes that just failed to start would turn "last good" into "last attempted".
+ *
+ * Both shapes are represented:
+ * - a raw body is restored through the repository's raw CAS;
+ * - a node-list profile is restored through the subscription-content CAS (nodes + format), while
+ *   quota/name/url metadata is left alone.
  */
 data class StartupCandidate(
     val subscriptionId: String,
@@ -24,6 +31,8 @@ data class StartupCandidate(
     val previousConfig: String,
     val previousOwner: String?,
     val previousRevision: Long,
+    val previousContent: SubscriptionRepository.SubscriptionContent? = null,
+    val candidateContent: SubscriptionRepository.SubscriptionContent? = null,
 )
 
 interface StartupRecoveryStorage {
@@ -34,6 +43,12 @@ interface StartupRecoveryStorage {
     fun readRawBody(subscriptionId: String): String?
     fun restoreRawBodyIfCurrent(subscriptionId: String, currentBody: String?, previousBody: String?): Boolean
     fun restoreConfigIfRevision(expectedRevision: Long, content: String, ownerSubscriptionId: String?): Long?
+    fun readSubscriptionContent(subscriptionId: String): SubscriptionRepository.SubscriptionContent?
+    fun restoreSubscriptionContentIfCurrent(
+        subscriptionId: String,
+        expected: SubscriptionRepository.SubscriptionContent,
+        previous: SubscriptionRepository.SubscriptionContent,
+    ): Boolean
 }
 
 object AndroidStartupRecoveryStorage : StartupRecoveryStorage {
@@ -68,26 +83,44 @@ object AndroidStartupRecoveryStorage : StartupRecoveryStorage {
         content: String,
         ownerSubscriptionId: String?,
     ): Long? = ConfigStore.restoreIfRevision(expectedRevision, content, ownerSubscriptionId)
+
+    override fun readSubscriptionContent(
+        subscriptionId: String,
+    ): SubscriptionRepository.SubscriptionContent? =
+        SubscriptionRepository.readSubscriptionContent(subscriptionId)
+
+    override fun restoreSubscriptionContentIfCurrent(
+        subscriptionId: String,
+        expected: SubscriptionRepository.SubscriptionContent,
+        previous: SubscriptionRepository.SubscriptionContent,
+    ): Boolean = SubscriptionRepository.restoreSubscriptionContentIfCurrent(
+        subscriptionId,
+        expected,
+        previous,
+    )
 }
 
 object StartupRecovery {
+    private val journalJson = Json { ignoreUnknownKeys = true }
+
     sealed interface Result {
-        /** The previous config and raw body are back; start again from [revision]. */
+        /** The previous config and content are back; start again from [revision]. */
         data class Restored(val revision: Long) : Result
 
-        /** There was no journal, or the candidate never changed the raw body. */
+        /** There was no journal, or the candidate never changed the retained document. */
         data object Nothing : Result
 
-        /** A newer revision/owner or raw body owns the state; nothing was written. */
+        /** A newer revision/owner/content owns the state; nothing was written. */
         data object Superseded : Result
     }
 
     /**
      * Records the document that is serving now, before an offline refresh replaces it.
      *
-     * Returns false when there is no previous raw body or the active config does not belong to
-     * [subscriptionId]: in that case there is no same-subscription last-good to restore, and a
-     * startup failure must be reported rather than silently falling back to another profile.
+     * Returns false when the active config does not belong to [subscriptionId]: there is no
+     * same-subscription last-good to restore, and a startup failure must be reported rather than
+     * silently falling back to another profile. A null [previousRawBody] is legitimate for a
+     * node-list subscription; its nodes/format are journaled separately.
      */
     fun rememberBeforeOfflineRefresh(
         subscriptionId: String,
@@ -95,28 +128,48 @@ object StartupRecovery {
         snapshot: ConfigStore.Snapshot,
         storage: StartupRecoveryStorage = AndroidStartupRecoveryStorage,
     ): Boolean {
-        if (previousRawBody == null || snapshot.content == null) return false
+        if (snapshot.content == null) return false
         if (snapshot.meta.ownerSubscriptionId != subscriptionId) return false
         // Keep the oldest known good generation while an unconfirmed candidate is still pending.
         if (storage.readJournal() != null) return true
+        val previousContent = storage.readSubscriptionContent(subscriptionId)
+            ?: SubscriptionRepository.SubscriptionContent()
         val properties = Properties()
         properties["subscriptionId"] = subscriptionId
-        properties["previousRawBody"] = toHex(previousRawBody.toByteArray())
+        previousRawBody?.let { properties["previousRawBody"] = toHex(it.toByteArray()) }
         properties["previousConfig"] = toHex(snapshot.content.toByteArray())
         properties["previousOwner"] = snapshot.meta.ownerSubscriptionId ?: ""
         properties["previousRevision"] = snapshot.meta.revision.toString()
-        val text = java.io.StringWriter().also { properties.store(it, "startup last good") }.toString()
-        storage.writeJournal(text)
+        properties["previousContent"] = journalJson.encodeToString(previousContent)
+        storage.writeJournal(propertiesText(properties))
+        return true
+    }
+
+    /**
+     * Records the candidate content after the offline fetch, without touching what serves.
+     *
+     * The previous generation is already in the journal. The candidate is what the next start may
+     * reject; restore only applies it back to the previous nodes/format after checking that the
+     * current content is still exactly this candidate.
+     */
+    fun rememberCandidate(
+        subscriptionId: String,
+        storage: StartupRecoveryStorage = AndroidStartupRecoveryStorage,
+    ): Boolean {
+        val candidate = read(storage.readJournal()) ?: return false
+        if (candidate.subscriptionId != subscriptionId) return false
+        val content = storage.readSubscriptionContent(subscriptionId) ?: return false
+        write(candidate.copy(candidateContent = content), storage)
         return true
     }
 
     /**
      * Restores the journaled document if [candidateRevision] is still the failed candidate.
      *
-     * The config CAS runs before the raw CAS, exactly like the reload recovery. If the raw body was
-     * replaced by a newer operation in between, the config restore is undone and the result is
-     * [Result.Superseded]; the newer raw is never overwritten. The journal is consumed on every
-     * attempt so a bad candidate cannot restart the service more than once.
+     * Config CAS runs first. A raw body and a node-list content are then restored through their own
+     * CAS; if either loses, the already-written pieces are undone so the newer winner is never
+     * overwritten. The journal is consumed on every attempt so a bad candidate cannot restart the
+     * service more than once.
      */
     fun restore(
         candidateRevision: Long,
@@ -129,7 +182,7 @@ object StartupRecovery {
             storage.clearJournal()
             return Result.Superseded
         }
-        val currentContent = before.content ?: run {
+        val currentConfig = before.content ?: run {
             storage.clearJournal()
             return Result.Nothing
         }
@@ -138,11 +191,22 @@ object StartupRecovery {
             return Result.Superseded
         }
         val currentRaw = storage.readRawBody(candidate.subscriptionId)
-        if (currentRaw == candidate.previousRawBody) {
-            // The offline refresh did not change the body (or another operation already restored
-            // it); this failure is not the candidate's and must be reported as-is.
+        val currentContent = storage.readSubscriptionContent(candidate.subscriptionId)
+        val rawChanged = currentRaw != candidate.previousRawBody
+        val contentChanged = candidate.previousRawBody == null &&
+            candidate.previousContent != null &&
+            candidate.candidateContent != null &&
+            currentContent == candidate.candidateContent &&
+            candidate.previousContent != candidate.candidateContent
+        val contentMovedAway = candidate.previousRawBody == null &&
+            candidate.candidateContent != null &&
+            currentContent != null &&
+            currentContent != candidate.candidateContent
+        if (!rawChanged && !contentChanged) {
+            // The offline refresh did not change the retained document (or another operation
+            // already restored it); this failure is not the candidate's.
             storage.clearJournal()
-            return Result.Nothing
+            return if (contentMovedAway) Result.Superseded else Result.Nothing
         }
         val restoredRevision = storage.restoreConfigIfRevision(
             expectedRevision = candidateRevision,
@@ -152,18 +216,36 @@ object StartupRecovery {
             storage.clearJournal()
             return Result.Superseded
         }
-        val rawRestored = storage.restoreRawBodyIfCurrent(
-            subscriptionId = candidate.subscriptionId,
-            currentBody = currentRaw,
-            previousBody = candidate.previousRawBody,
-        )
-        if (!rawRestored) {
-            // A newer body won the CAS after the config was restored. Put the candidate config
-            // back so the raw and config still describe the same generation; if that also lost,
-            // report superseded and leave the newer owner untouched.
-            storage.restoreConfigIfRevision(restoredRevision, currentContent, candidateOwner)
-            storage.clearJournal()
-            return Result.Superseded
+        if (rawChanged) {
+            val rawRestored = storage.restoreRawBodyIfCurrent(
+                subscriptionId = candidate.subscriptionId,
+                currentBody = currentRaw,
+                previousBody = candidate.previousRawBody,
+            )
+            if (!rawRestored) {
+                storage.restoreConfigIfRevision(restoredRevision, currentConfig, candidateOwner)
+                storage.clearJournal()
+                return Result.Superseded
+            }
+        }
+        if (contentChanged) {
+            val contentRestored = storage.restoreSubscriptionContentIfCurrent(
+                subscriptionId = candidate.subscriptionId,
+                expected = candidate.candidateContent,
+                previous = candidate.previousContent,
+            )
+            if (!contentRestored) {
+                if (rawChanged) {
+                    storage.restoreRawBodyIfCurrent(
+                        subscriptionId = candidate.subscriptionId,
+                        currentBody = candidate.previousRawBody,
+                        previousBody = currentRaw,
+                    )
+                }
+                storage.restoreConfigIfRevision(restoredRevision, currentConfig, candidateOwner)
+                storage.clearJournal()
+                return Result.Superseded
+            }
         }
         storage.clearJournal()
         return Result.Restored(restoredRevision)
@@ -174,6 +256,21 @@ object StartupRecovery {
         val candidate = read(storage.readJournal()) ?: return
         if (candidate.subscriptionId == ownerSubscriptionId) storage.clearJournal()
     }
+
+    private fun write(candidate: StartupCandidate, storage: StartupRecoveryStorage) {
+        val properties = Properties()
+        properties["subscriptionId"] = candidate.subscriptionId
+        candidate.previousRawBody?.let { properties["previousRawBody"] = toHex(it.toByteArray()) }
+        properties["previousConfig"] = toHex(candidate.previousConfig.toByteArray())
+        properties["previousOwner"] = candidate.previousOwner ?: ""
+        properties["previousRevision"] = candidate.previousRevision.toString()
+        candidate.previousContent?.let { properties["previousContent"] = journalJson.encodeToString(it) }
+        candidate.candidateContent?.let { properties["candidateContent"] = journalJson.encodeToString(it) }
+        storage.writeJournal(propertiesText(properties))
+    }
+
+    private fun propertiesText(properties: Properties): String =
+        java.io.StringWriter().also { properties.store(it, "startup last good") }.toString()
 
     private fun toHex(bytes: ByteArray): String =
         bytes.joinToString("") { "%02x".format(it.toInt() and 0xff) }
@@ -198,6 +295,12 @@ object StartupRecovery {
                 previousConfig = String(fromHex(properties.getProperty("previousConfig"))),
                 previousOwner = properties.getProperty("previousOwner")?.takeIf { it.isNotEmpty() },
                 previousRevision = properties.getProperty("previousRevision")?.toLong() ?: 0L,
+                previousContent = properties.getProperty("previousContent")?.let {
+                    journalJson.decodeFromString(it)
+                },
+                candidateContent = properties.getProperty("candidateContent")?.let {
+                    journalJson.decodeFromString(it)
+                },
             )
         }.getOrNull()
     }

@@ -12,10 +12,14 @@ class StartupRecoveryTest {
         var snapshot: ConfigStore.Snapshot,
         var raw: String?,
         var failRawCas: Boolean = false,
+        var content: SubscriptionRepository.SubscriptionContent? =
+            SubscriptionRepository.SubscriptionContent(),
     ) : StartupRecoveryStorage {
         var journal: String? = null
         var configRestores = 0
         var rawRestores = 0
+        var contentRestores = 0
+        var failContentCas = false
         var lastConfigContent: String? = null
 
         override fun readJournal(): String? = journal
@@ -41,6 +45,21 @@ class StartupRecoveryTest {
             if (raw != currentBody) return false
             raw = previousBody
             rawRestores++
+            return true
+        }
+
+        override fun readSubscriptionContent(
+            subscriptionId: String,
+        ): SubscriptionRepository.SubscriptionContent? = content
+
+        override fun restoreSubscriptionContentIfCurrent(
+            subscriptionId: String,
+            expected: SubscriptionRepository.SubscriptionContent,
+            previous: SubscriptionRepository.SubscriptionContent,
+        ): Boolean {
+            if (failContentCas || content != expected) return false
+            content = previous
+            contentRestores++
             return true
         }
 
@@ -162,6 +181,76 @@ class StartupRecoveryTest {
         )
 
         assertEquals(first, storage.journal)
+    }
+
+    @Test
+    fun `a failed start restores a node-list candidate's previous nodes and format`() {
+        val previous = SubscriptionRepository.SubscriptionContent(configFormat = "old")
+        val candidate = SubscriptionRepository.SubscriptionContent(configFormat = "new")
+        val storage = FakeStorage(snapshot = snapshot(), raw = null, content = previous)
+        assertTrue(StartupRecovery.rememberBeforeOfflineRefresh("sub-a", null, snapshot(), storage))
+        storage.content = candidate
+        assertTrue(StartupRecovery.rememberCandidate("sub-a", storage))
+
+        val result = StartupRecovery.restore(7, "sub-a", storage)
+
+        assertEquals(StartupRecovery.Result.Restored(8), result)
+        assertEquals(previous, storage.content)
+        assertEquals(1, storage.configRestores)
+        assertEquals(1, storage.contentRestores)
+        assertEquals(0, storage.rawRestores)
+        assertNull(storage.journal)
+    }
+
+    @Test
+    fun `a newer node-list content is superseded without writing`() {
+        val previous = SubscriptionRepository.SubscriptionContent(configFormat = "old")
+        val candidate = SubscriptionRepository.SubscriptionContent(configFormat = "new")
+        val storage = FakeStorage(snapshot = snapshot(), raw = null, content = previous)
+        StartupRecovery.rememberBeforeOfflineRefresh("sub-a", null, snapshot(), storage)
+        storage.content = candidate
+        StartupRecovery.rememberCandidate("sub-a", storage)
+        storage.content = SubscriptionRepository.SubscriptionContent(configFormat = "newer")
+
+        val result = StartupRecovery.restore(7, "sub-a", storage)
+
+        assertEquals(StartupRecovery.Result.Superseded, result)
+        assertEquals(SubscriptionRepository.SubscriptionContent(configFormat = "newer"), storage.content)
+        assertEquals(0, storage.configRestores)
+        assertEquals(0, storage.contentRestores)
+        assertNull(storage.journal)
+    }
+
+    @Test
+    fun `a node-list content that moves during recovery is never overwritten`() {
+        val previous = SubscriptionRepository.SubscriptionContent(configFormat = "old")
+        val candidate = SubscriptionRepository.SubscriptionContent(configFormat = "new")
+        val storage = FakeStorage(snapshot = snapshot(), raw = null, content = previous)
+        StartupRecovery.rememberBeforeOfflineRefresh("sub-a", null, snapshot(), storage)
+        storage.content = candidate
+        StartupRecovery.rememberCandidate("sub-a", storage)
+        storage.failContentCas = true
+
+        val result = StartupRecovery.restore(7, "sub-a", storage)
+
+        assertEquals(StartupRecovery.Result.Superseded, result)
+        assertEquals(candidate, storage.content)
+        assertEquals(2, storage.configRestores)
+        assertEquals("old-config", storage.lastConfigContent)
+        assertNull(storage.journal)
+    }
+
+    @Test
+    fun `a node-list candidate that was never recorded is not guessed`() {
+        val storage = FakeStorage(snapshot = snapshot(), raw = null)
+        StartupRecovery.rememberBeforeOfflineRefresh("sub-a", null, snapshot(), storage)
+
+        val result = StartupRecovery.restore(7, "sub-a", storage)
+
+        assertEquals(StartupRecovery.Result.Nothing, result)
+        assertEquals(0, storage.configRestores)
+        assertEquals(0, storage.contentRestores)
+        assertNull(storage.journal)
     }
 
     @Test

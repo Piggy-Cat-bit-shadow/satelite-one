@@ -46,6 +46,45 @@ object SubscriptionRepository {
         val configFormat: String? = null,
     )
 
+    /** The configuration-bearing part of a subscription, without quota/name/url metadata. */
+    @Serializable
+    data class SubscriptionContent(
+        val nodes: List<ProxyNode> = emptyList(),
+        val configFormat: String? = null,
+    )
+
+    private val contentLock = Any()
+
+    fun readSubscriptionContent(subscriptionId: String): SubscriptionContent? = synchronized(contentLock) {
+        get(subscriptionId)?.let { SubscriptionContent(it.nodes, it.configFormat) }
+    }
+
+    /**
+     * Puts [previous] back only while the subscription's configuration content is still [expected].
+     *
+     * Quota, name and URL are deliberately not touched: an offline refresh updates those
+     * independently, and reverting them would discard a newer accounting update. A concurrent
+     * content commit makes the comparison fail, so the older operation never overwrites it.
+     */
+    fun restoreSubscriptionContentIfCurrent(
+        subscriptionId: String,
+        expected: SubscriptionContent,
+        previous: SubscriptionContent,
+    ): Boolean = synchronized(contentLock) {
+        val index = subscriptions.indexOfFirst { it.id == subscriptionId }
+        if (index < 0) return@synchronized false
+        val current = subscriptions[index]
+        if (current.nodes != expected.nodes || current.configFormat != expected.configFormat) {
+            return@synchronized false
+        }
+        subscriptions[index] = current.copy(
+            nodes = previous.nodes,
+            configFormat = previous.configFormat,
+        )
+        save()
+        true
+    }
+
     private val dir: File
         get() = File(InterstellarApplication.application.filesDir, "subscriptions").also { it.mkdirs() }
 

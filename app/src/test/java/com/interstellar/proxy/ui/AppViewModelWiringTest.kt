@@ -1002,6 +1002,12 @@ class AppViewModelWiringTest {
             worker.contains("StartupRecovery.rememberBeforeOfflineRefresh(") &&
                 worker.indexOf("rememberBeforeOfflineRefresh(") < worker.indexOf("refreshAll(regenerate = false)"),
         )
+        assertTrue(
+            "the worker no longer records the post-fetch node-list candidate, so a node-list restore " +
+                "cannot prove the current content is still the failed candidate.",
+            worker.contains("StartupRecovery.rememberCandidate(") &&
+                worker.indexOf("rememberCandidate(") > worker.indexOf("refreshAll(regenerate = false)"),
+        )
         val boxService = File("src/main/java/com/interstellar/proxy/bg/BoxService.kt").readText()
         assertTrue(
             "BoxService no longer records the failed start's revision/owner, so the UI cannot tell the " +
