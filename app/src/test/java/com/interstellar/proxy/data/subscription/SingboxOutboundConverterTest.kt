@@ -41,7 +41,7 @@ class SingboxOutboundConverterTest {
             obj(
                 """
                 {"type":"ssh","tag":"shell","server":"ssh.example.com","server_port":22,
-                 "user":"root","private_key":"-----BEGIN OPENSSH PRIVATE KEY-----"}
+                 "user":"root","private_key":"test-private-key-material"}
                 """.trimIndent(),
             ),
             null,
@@ -49,7 +49,7 @@ class SingboxOutboundConverterTest {
         check(node != null) { "ssh node must convert" }
         check(node!!.type == NodeType.SSH)
         check(node.sshUser == "root")
-        check(node.sshKey == "-----BEGIN OPENSSH PRIVATE KEY-----")
+        check(node.sshKey == "test-private-key-material")
     }
 
     @Test
