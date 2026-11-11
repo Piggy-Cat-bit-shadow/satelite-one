@@ -117,6 +117,17 @@ object SingboxOutboundConverter {
                 tls = true,
             )
 
+            // SSH is a first-class node type in this client (ProxyNode.sshUser /
+            // sshKey, generated back by MinimalConfigBuilder). Without this branch
+            // the type was mapped above and then fell into `else -> null`, so
+            // `mapNotNull` dropped every SSH node while the refresh still reported
+            // success.
+            NodeType.SSH -> node.copy(
+                sshUser = outbound.str("user"),
+                sshKey = outbound.str("private_key"),
+                password = outbound.str("password"),
+            )
+
             else -> null
         }
     }
@@ -128,9 +139,7 @@ object SingboxOutboundConverter {
             sni = tls?.str("server_name"),
             alpn = tls?.strList("alpn"),
             insecure = tls?.bool("insecure"),
-            fingerprint = tls?.str("utls")?.let { utls ->
-                (utls as? JsonObject)?.str("fingerprint") ?: (utls as? JsonPrimitive)?.content
-            },
+            fingerprint = tls?.obj("utls")?.str("fingerprint")?.takeIf { it.isNotBlank() },
             reality = tls?.obj("reality")?.let { reality ->
                 ProxyNode.RealityParams(
                     publicKey = reality.str("public_key") ?: "",

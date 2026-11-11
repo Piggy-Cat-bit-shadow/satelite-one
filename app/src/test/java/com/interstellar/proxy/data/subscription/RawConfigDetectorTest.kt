@@ -5,6 +5,11 @@ import org.junit.Test
 /**
  * Raw-config format sniffing: the retained body decides whether a
  * subscription can be fed to a core verbatim.
+ *
+ * A body with `outbounds` alone is a node list, not a runnable profile. The
+ * detector must only report SINGBOX when the document also brings its own TUN
+ * inbound, because the app hands a raw body to the core unchanged (no generated
+ * TUN is added). This is the exact confusion the old test encoded.
  */
 class RawConfigDetectorTest {
 
@@ -30,20 +35,57 @@ class RawConfigDetectorTest {
     }
 
     @Test
-    fun `singbox json is detected by type field`() {
+    fun `selector and proxy outbounds without an inbound are a node list`() {
         val json = """
             {
               "outbounds": [
                 {"type": "selector", "tag": "proxy", "outbounds": ["auto"]},
-                {"type": "vmess", "tag": "hk", "server": "hk.example.com"}
+                {"type": "vmess", "tag": "hk", "server": "hk.example.com", "server_port": 443, "uuid": "u"}
               ]
+            }
+        """.trimIndent()
+        check(RawConfigDetector.detect(json) == null) { "node JSON must not be a raw config" }
+    }
+
+    @Test
+    fun `complete singbox config with tun inbound is detected`() {
+        val json = """
+            {
+              "inbounds": [{"type": "tun", "tag": "tun-in", "address": ["172.19.0.1/30"]}],
+              "outbounds": [{"type": "direct", "tag": "direct"}]
             }
         """.trimIndent()
         check(RawConfigDetector.detect(json) == RawConfigFormat.SINGBOX)
     }
 
     @Test
-    fun `xray json is detected by protocol field`() {
+    fun `config with inbounds but no tun is not a runnable profile for this app`() {
+        val json = """
+            {
+              "inbounds": [{"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080}],
+              "outbounds": [{"type": "direct", "tag": "direct"}]
+            }
+        """.trimIndent()
+        check(RawConfigDetector.detect(json) == null)
+    }
+
+    @Test
+    fun `xray json with inbounds is detected so the import can refuse it explicitly`() {
+        val json = """
+            {
+              "inbounds": [{"tag": "socks-in", "protocol": "socks", "port": 1080}],
+              "outbounds": [
+                {"tag": "proxy", "protocol": "vless", "settings": {}},
+                {"tag": "direct", "protocol": "freedom"}
+              ],
+              "routing": {"rules": []}
+            }
+        """.trimIndent()
+        check(RawConfigDetector.detect(json) == RawConfigFormat.XRAY)
+    }
+
+    @Test
+    fun `xray outbounds without inbounds are not a complete config`() {
         val json = """
             {
               "outbounds": [
@@ -53,7 +95,7 @@ class RawConfigDetectorTest {
               "routing": {"rules": []}
             }
         """.trimIndent()
-        check(RawConfigDetector.detect(json) == RawConfigFormat.XRAY)
+        check(RawConfigDetector.detect(json) == null)
     }
 
     @Test

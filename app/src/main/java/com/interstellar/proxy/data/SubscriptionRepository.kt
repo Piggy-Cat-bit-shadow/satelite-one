@@ -123,16 +123,16 @@ object SubscriptionRepository {
         synchronized(rawBodyLock) {
             if (readRawBodyLocked(subscriptionId) != currentBody) return@synchronized false
             writeRawBodyLocked(subscriptionId, previousBody)
-            true
         }
 
-    private fun writeRawBodyLocked(subscriptionId: String, body: String?) {
+    /** @return true only when the file now holds [body] (or is gone for null). */
+    private fun writeRawBodyLocked(subscriptionId: String, body: String?): Boolean {
         val file = rawFileOf(subscriptionId)
         if (body == null) {
-            runCatching { file.delete() }
-        } else {
-            runCatching { file.writeText(body) }
+            if (!file.exists()) return true
+            return runCatching { file.delete() }.getOrDefault(false) || !file.exists()
         }
+        return AtomicFileWrite.writeText(file, body)
     }
 
     /** Outcome of deciding what to do with a downloaded subscription body. */
@@ -167,15 +167,38 @@ object SubscriptionRepository {
             rawFileOf(subscriptionId).delete()
             return@synchronized BodyCommit.Accepted(null, null)
         }
-        if (detected == com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX) {
-            val failure = runCatching { Libbox.checkConfig(body) }.exceptionOrNull()
-            if (failure != null) {
-                android.util.Log.e(TAG, "refusing fetched raw body: ${failure.message}")
-                return@synchronized BodyCommit.Refused(str(com.interstellar.proxy.R.string.repo_raw_check_failed, failure.message ?: ""))
+        when (detected) {
+            // This core cannot execute an Xray body, and there is no Xray-to-node
+            // conversion in this app. Accepting it used to write a file the apply
+            // path never reads, so a refresh could report success while the
+            // subscription could not run. Refuse before anything touches the disk.
+            com.interstellar.proxy.data.subscription.RawConfigFormat.XRAY -> {
+                android.util.Log.e(TAG, "refusing Xray raw body: unsupported format")
+                return@synchronized BodyCommit.Refused(str(com.interstellar.proxy.R.string.repo_raw_xray_unsupported))
+            }
+
+            // A Clash config is a node source, not a raw core config for this
+            // client: dropping the stale raw file keeps the subscription on the
+            // generated minimal config built from its parsed nodes.
+            com.interstellar.proxy.data.subscription.RawConfigFormat.CLASH -> {
+                if (!writeRawBodyLocked(subscriptionId, null)) {
+                    return@synchronized BodyCommit.Refused(str(com.interstellar.proxy.R.string.repo_raw_write_failed))
+                }
+                return@synchronized BodyCommit.Accepted(null, null)
+            }
+
+            com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX -> {
+                val failure = runCatching { Libbox.checkConfig(body) }.exceptionOrNull()
+                if (failure != null) {
+                    android.util.Log.e(TAG, "refusing fetched raw body: ${failure.message}")
+                    return@synchronized BodyCommit.Refused(str(com.interstellar.proxy.R.string.repo_raw_check_failed, failure.message ?: ""))
+                }
+                if (!writeRawBodyLocked(subscriptionId, body)) {
+                    return@synchronized BodyCommit.Refused(str(com.interstellar.proxy.R.string.repo_raw_write_failed))
+                }
+                BodyCommit.Accepted(detected.wire, body)
             }
         }
-        runCatching { rawFileOf(subscriptionId).writeText(body) }
-        BodyCommit.Accepted(detected.wire, body)
     }
 
     /**
@@ -599,6 +622,27 @@ object SubscriptionRepository {
                             } else {
                                 str(com.interstellar.proxy.R.string.repo_refresh_unparsable, sub.name)
                             }
+
+                        is com.interstellar.proxy.data.subscription.SubscriptionParser.Result.TooManyNodes ->
+                            // A truncated node list would look like a successful refresh
+                            // while silently dropping most of the subscription. Keep the
+                            // previous nodes and report the hard limit instead.
+                            str(com.interstellar.proxy.R.string.repo_too_many_nodes, parsed.limit)
+
+                        is com.interstellar.proxy.data.subscription.SubscriptionParser.Result.Unsupported -> {
+                            // A JSON core config this app cannot run (Xray, no TUN
+                            // inbound, or an unsupported protocol). Say so instead of
+                            // converting it into a node list.
+                            val reason = parsed.reason
+                            when {
+                                reason == "xray" -> str(com.interstellar.proxy.R.string.repo_unsupported_xray)
+                                reason.startsWith("unsupported_protocol:") -> str(
+                                    com.interstellar.proxy.R.string.repo_unsupported_protocol,
+                                    reason.substringAfter(':'),
+                                )
+                                else -> str(com.interstellar.proxy.R.string.repo_unsupported_no_tun)
+                            }
+                        }
                     }
                     RefreshCommit(message, commit.rawBody, committed = true, committedContent = committedContent)
                 }

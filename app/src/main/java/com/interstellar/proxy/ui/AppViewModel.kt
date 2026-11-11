@@ -2085,6 +2085,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun unsupportedConfigMessage(reason: String): String = when {
+        reason == "xray" -> str(com.interstellar.proxy.R.string.repo_unsupported_xray)
+        reason.startsWith("unsupported_protocol:") -> str(
+            com.interstellar.proxy.R.string.repo_unsupported_protocol,
+            reason.substringAfter(':'),
+        )
+        else -> str(com.interstellar.proxy.R.string.repo_unsupported_no_tun)
+    }
+
     private fun importContent(
         name: String,
         url: String?,
@@ -2150,6 +2159,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     _message.value = str(com.interstellar.proxy.R.string.vm_unrecognized_content)
                     _addSubError.value = str(com.interstellar.proxy.R.string.vm_unrecognized_content)
                 }
+            }
+
+            is SubscriptionParser.Result.TooManyNodes -> {
+                // Never import a truncated node list as if it were the whole
+                // subscription; the limit is a hard failure.
+                SubscriptionRepository.rawFileOf(subId).delete()
+                val message = str(com.interstellar.proxy.R.string.repo_too_many_nodes, parsed.limit)
+                _message.value = message
+                _addSubError.value = message
+            }
+
+            is SubscriptionParser.Result.Unsupported -> {
+                SubscriptionRepository.rawFileOf(subId).delete()
+                val message = unsupportedConfigMessage(parsed.reason)
+                _message.value = message
+                _addSubError.value = message
             }
         }
         _subscriptions.value = SubscriptionRepository.subscriptions.toList()
@@ -2256,6 +2281,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                         UiToast.Kind.Error,
                                     )
                                 }
+
+                            is SubscriptionParser.Result.TooManyNodes ->
+                                showToast(
+                                    str(com.interstellar.proxy.R.string.repo_too_many_nodes, parsed.limit),
+                                    UiToast.Kind.Error,
+                                )
+
+                            is SubscriptionParser.Result.Unsupported ->
+                                showToast(unsupportedConfigMessage(parsed.reason), UiToast.Kind.Error)
                         }
                     }
                 }
@@ -2422,6 +2456,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                                         false
                                                     }
                                                 }
+
+                                                is SubscriptionParser.Result.TooManyNodes -> false
+                                                is SubscriptionParser.Result.Unsupported -> false
                                             }
                                         }
                                     }

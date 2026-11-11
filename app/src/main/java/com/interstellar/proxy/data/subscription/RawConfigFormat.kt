@@ -4,6 +4,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 /**
  * Detects whether a subscription body is a full proxy-core config (clash /
@@ -52,13 +53,25 @@ object RawConfigDetector {
         val json = Json.parseToJsonElement(text).jsonObject
         val outbounds = json["outbounds"]?.jsonArray ?: return@runCatching null
         if (outbounds.isEmpty()) return@runCatching null
+        // A full config is not "a JSON object with outbounds": a node list also
+        // has outbounds, and a selector/urltest wrapper (which is exactly what a
+        // node subscription contains) used to be misread as a runnable profile.
+        // A body only counts as a full config when it brings its own inbound;
+        // for this app that inbound must include a TUN, because a raw body is
+        // handed to the core verbatim and replaces the generated TUN config.
+        val inbounds = json["inbounds"]?.jsonArray ?: return@runCatching null
+        if (inbounds.isEmpty()) return@runCatching null
+        val inboundObjects = inbounds.filterIsInstance<JsonObject>()
+        val hasTun = inboundObjects.any {
+            it["type"]?.jsonPrimitive?.content?.equals("tun", ignoreCase = true) == true
+        }
         val objs = outbounds.filterIsInstance<JsonObject>()
         // sing-box outbounds carry "type"; xray outbounds carry "protocol"
         val withType = objs.count { "type" in it }
         val withProtocol = objs.count { "protocol" in it }
         when {
             withProtocol > 0 && withProtocol >= withType -> RawConfigFormat.XRAY
-            withType > 0 -> RawConfigFormat.SINGBOX
+            withType > 0 && hasTun -> RawConfigFormat.SINGBOX
             else -> null
         }
     }.getOrNull()

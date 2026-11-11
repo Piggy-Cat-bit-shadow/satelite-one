@@ -19,6 +19,14 @@ import java.util.concurrent.TimeUnit
 object SubscriptionFetcher {
     private const val MIXED_PORT = 2080
 
+    /**
+     * Hard ceiling for one subscription body, applied to the DECOMPRESSED bytes.
+     * 10k nodes at roughly 300 bytes each is ~3 MB; 8 MiB leaves headroom for a
+     * full sing-box JSON while keeping a hostile panel from exhausting the
+     * Android heap. `string()` alone would read whatever the server sends.
+     */
+    private const val MAX_BODY_BYTES = 8L * 1024 * 1024
+
     private fun directClient(): OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(5, TimeUnit.SECONDS)
@@ -84,7 +92,7 @@ object SubscriptionFetcher {
                 val parsed = runCatching {
                     response.use {
                         if (!it.isSuccessful) error("HTTP ${it.code}")
-                        val body = it.body!!.string()
+                        val body = readBody(it.body!!)
                         val info = it.header("subscription-userinfo")
                             ?.let { h -> parseSubscriptionUserinfo(h) }
                         val name = parseDispositionName(it.header("Content-Disposition"))
@@ -102,6 +110,29 @@ object SubscriptionFetcher {
                 if (cont.isActive) cont.resumeWith(parsed)
             }
         })
+    }
+
+    /**
+     * Reads at most [MAX_BODY_BYTES] of the decompressed stream. `Content-Length`
+     * is only a fast reject: it can be absent, wrong, or describe the compressed
+     * size, so the stream itself is bounded while reading.
+     */
+    private fun readBody(body: okhttp3.ResponseBody): String {
+        val declared = body.contentLength()
+        if (declared > MAX_BODY_BYTES) error("response body too large: $declared bytes")
+        val output = java.io.ByteArrayOutputStream()
+        body.byteStream().use { stream ->
+            val buffer = ByteArray(16 * 1024)
+            var total = 0L
+            while (true) {
+                val read = stream.read(buffer)
+                if (read < 0) break
+                total += read
+                if (total > MAX_BODY_BYTES) error("response body exceeds $MAX_BODY_BYTES bytes")
+                output.write(buffer, 0, read)
+            }
+        }
+        return output.toString("UTF-8")
     }
 
     /**

@@ -81,6 +81,12 @@
     <string name="repo_no_nodes">订阅中没有可用节点</string>
     <string name="repo_config_check_failed">配置校验失败: %1$s</string>
     <string name="repo_raw_check_failed">原始配置校验失败:%1$s</string>
+    <string name="repo_raw_xray_unsupported">该订阅是 Xray 配置;本客户端只支持 sing-box 原始配置或节点列表</string>
+    <string name="repo_unsupported_xray">该订阅是 Xray 配置,本客户端无法运行</string>
+    <string name="repo_unsupported_no_tun">该 sing-box 配置没有 TUN 入站,无法作为本客户端的运行配置</string>
+    <string name="repo_unsupported_protocol">该订阅包含本客户端不支持的协议:%1$s</string>
+    <string name="repo_raw_write_failed">配置写入失败,已保留上一次的有效配置</string>
+    <string name="repo_too_many_nodes">节点数超过上限(%1$d),请缩小订阅</string>
     <string name="repo_refreshed">已刷新 %1$s:%2$d 个节点</string>
     <string name="repo_refreshed_raw">已刷新 %1$s:%2$s 配置已保留</string>
     <string name="repo_refresh_unparsable">刷新后内容无法解析:%1$s</string>

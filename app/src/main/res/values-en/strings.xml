@@ -83,6 +83,12 @@
     <string name="repo_no_nodes">No usable nodes in the subscription</string>
     <string name="repo_config_check_failed">Config validation failed: %1$s</string>
     <string name="repo_raw_check_failed">Raw config validation failed: %1$s</string>
+    <string name="repo_raw_xray_unsupported">This subscription is an Xray config; only sing-box raw configs or node lists are supported</string>
+    <string name="repo_unsupported_xray">This subscription is an Xray config, which this client cannot run</string>
+    <string name="repo_unsupported_no_tun">This sing-box config has no TUN inbound, so it cannot be the running config of this client</string>
+    <string name="repo_unsupported_protocol">This subscription contains a protocol this client does not support: %1$s</string>
+    <string name="repo_raw_write_failed">Could not persist the config; the previous working config was kept</string>
+    <string name="repo_too_many_nodes">Node count exceeds the %1$d limit; please shrink the subscription</string>
     <string name="repo_refreshed">Refreshed %1$s: %2$d nodes</string>
     <string name="repo_refreshed_raw">Refreshed %1$s: %2$s config kept</string>
     <string name="repo_refresh_unparsable">Content unparsable after refresh: %1$s</string>
