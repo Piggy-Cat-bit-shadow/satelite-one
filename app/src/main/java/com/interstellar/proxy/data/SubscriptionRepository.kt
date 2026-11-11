@@ -167,12 +167,12 @@ object SubscriptionRepository {
             rawFileOf(subscriptionId).delete()
             return@synchronized BodyCommit.Accepted(null, null)
         }
-        when (detected) {
+        when (com.interstellar.proxy.data.subscription.RawConfigCommitPolicy.decide(detected)) {
             // This core cannot execute an Xray body, and there is no Xray-to-node
             // conversion in this app. Accepting it used to write a file the apply
             // path never reads, so a refresh could report success while the
             // subscription could not run. Refuse before anything touches the disk.
-            com.interstellar.proxy.data.subscription.RawConfigFormat.XRAY -> {
+            com.interstellar.proxy.data.subscription.RawConfigCommitPolicy.Decision.REJECT_XRAY -> {
                 android.util.Log.e(TAG, "refusing Xray raw body: unsupported format")
                 return@synchronized BodyCommit.Refused(str(com.interstellar.proxy.R.string.repo_raw_xray_unsupported))
             }
@@ -180,14 +180,14 @@ object SubscriptionRepository {
             // A Clash config is a node source, not a raw core config for this
             // client: dropping the stale raw file keeps the subscription on the
             // generated minimal config built from its parsed nodes.
-            com.interstellar.proxy.data.subscription.RawConfigFormat.CLASH -> {
+            com.interstellar.proxy.data.subscription.RawConfigCommitPolicy.Decision.NODE_LIST -> {
                 if (!writeRawBodyLocked(subscriptionId, null)) {
                     return@synchronized BodyCommit.Refused(str(com.interstellar.proxy.R.string.repo_raw_write_failed))
                 }
                 return@synchronized BodyCommit.Accepted(null, null)
             }
 
-            com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX -> {
+            com.interstellar.proxy.data.subscription.RawConfigCommitPolicy.Decision.SINGBOX -> {
                 val failure = runCatching { Libbox.checkConfig(body) }.exceptionOrNull()
                 if (failure != null) {
                     android.util.Log.e(TAG, "refusing fetched raw body: ${failure.message}")
