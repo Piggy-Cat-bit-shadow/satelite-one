@@ -250,24 +250,28 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
      * process. Holding the lock across check-and-register (and across
      * check-and-unregister, with the generation closed first) makes either order safe.
      */
-    private fun registerReceiver() = synchronized(receiverLock) {
-        // A closed generation must never install a receiver: nothing would ever
-        // unregister it, so it would keep waking this object for the process lifetime.
-        if (!gate.isOpen(generation) || receiverRegistered) return
-        service.registerReceiver(
-            this,
-            IntentFilter().apply {
-                addAction(Intent.ACTION_SCREEN_ON)
-                addAction(Intent.ACTION_SCREEN_OFF)
-            },
-        )
-        receiverRegistered = true
+    private fun registerReceiver() {
+        synchronized(receiverLock) {
+            // A closed generation must never install a receiver: nothing would ever
+            // unregister it, so it would keep waking this object for the process lifetime.
+            if (!gate.isOpen(generation) || receiverRegistered) return
+            service.registerReceiver(
+                this,
+                IntentFilter().apply {
+                    addAction(Intent.ACTION_SCREEN_ON)
+                    addAction(Intent.ACTION_SCREEN_OFF)
+                },
+            )
+            receiverRegistered = true
+        }
     }
 
-    private fun unregisterReceiverIfNeeded() = synchronized(receiverLock) {
-        if (!receiverRegistered) return
-        service.unregisterReceiver(this)
-        receiverRegistered = false
+    private fun unregisterReceiverIfNeeded() {
+        synchronized(receiverLock) {
+            if (!receiverRegistered) return
+            service.unregisterReceiver(this)
+            receiverRegistered = false
+        }
     }
 
     /**
