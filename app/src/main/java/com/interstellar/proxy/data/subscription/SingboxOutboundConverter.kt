@@ -134,17 +134,35 @@ object SingboxOutboundConverter {
 
     private fun ProxyNode.withTlsAndTransport(outbound: JsonObject, defaultTls: Boolean = false): ProxyNode {
         val tls = outbound.obj("tls")
+        // `tls.enabled=false` is an explicit disable even when the object carries
+        // server_name/alpn; the old `tls != null` test flipped that to enabled.
+        // defaultTls only applies when there is no TLS object at all (Trojan).
+        val tlsEnabled = when {
+            tls == null -> defaultTls
+            tls.bool("enabled") == false -> false
+            else -> true
+        }
         var node = copy(
-            tls = tls != null || defaultTls,
+            tls = tlsEnabled,
             sni = tls?.str("server_name"),
             alpn = tls?.strList("alpn"),
             insecure = tls?.bool("insecure"),
-            fingerprint = tls?.obj("utls")?.str("fingerprint")?.takeIf { it.isNotBlank() },
-            reality = tls?.obj("reality")?.let { reality ->
-                ProxyNode.RealityParams(
-                    publicKey = reality.str("public_key") ?: "",
-                    shortId = reality.str("short_id"),
-                )
+            fingerprint = if (tlsEnabled) {
+                tls?.obj("utls")?.str("fingerprint")?.takeIf { it.isNotBlank() }
+            } else {
+                null
+            },
+            // Reality cannot exist without TLS; carrying it while disabled would
+            // make the generator emit `tls.enabled: true` again.
+            reality = if (tlsEnabled) {
+                tls?.obj("reality")?.let { reality ->
+                    ProxyNode.RealityParams(
+                        publicKey = reality.str("public_key") ?: "",
+                        shortId = reality.str("short_id"),
+                    )
+                }
+            } else {
+                null
             },
         )
         val transport = outbound.obj("transport")

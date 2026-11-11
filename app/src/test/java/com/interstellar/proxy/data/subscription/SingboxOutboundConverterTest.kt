@@ -60,4 +60,31 @@ class SingboxOutboundConverterTest {
         )
         check(node == null) { "hysteria 1 has no node model and must not be converted" }
     }
+
+    @Test
+    fun `tls enabled false stays disabled in the node and the generated config`() {
+        val node = SingboxOutboundConverter.toNode(
+            obj(
+                """
+                {"type":"vmess","tag":"plain","server":"a.example.com","server_port":80,
+                 "uuid":"u","tls":{"enabled":false,"server_name":"a.example.com"}}
+                """.trimIndent(),
+            ),
+            null,
+        )
+        check(node != null) { "vmess node must convert" }
+        check(!node!!.tls) { "tls.enabled=false must not become enabled" }
+        val outbound = MinimalConfigBuilder.nodeToOutbound(node, "plain")
+        check("tls" !in outbound) { "a disabled TLS node must not generate a tls block: $outbound" }
+    }
+
+    @Test
+    fun `trojan still defaults to tls when no tls object exists`() {
+        val node = SingboxOutboundConverter.toNode(
+            obj("""{"type":"trojan","tag":"t","server":"t.example.com","server_port":443,"password":"p"}"""),
+            null,
+        )
+        check(node != null)
+        check(node!!.tls) { "trojan requires TLS even when the block is omitted" }
+    }
 }
