@@ -20,6 +20,13 @@ object AtomicFileWrite {
         val backup = File(directory, target.name + ".bak")
         return try {
             temporary.writeText(text)
+            // POSIX rename replaces the target atomically: no window where the
+            // old body is missing. Windows refuses to replace an existing file,
+            // so that path falls back to the backup swap below.
+            if (temporary.renameTo(target)) {
+                backup.delete()
+                return true
+            }
             if (target.exists()) {
                 backup.delete()
                 if (!target.renameTo(backup)) {
