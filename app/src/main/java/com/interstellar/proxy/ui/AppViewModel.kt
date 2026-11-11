@@ -2152,10 +2152,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 if (!SubscriptionRepository.upsert(sub)) {
                     // The raw file was written during commit; undo it through the
                     // same CAS the refresh path uses (there is no previous body for
-                    // a brand-new subscription id).
-                    SubscriptionRepository.restoreRawBodyIfCurrent(subId, committedRaw, null)
-                    _message.value = str(com.interstellar.proxy.R.string.repo_raw_write_failed)
-                    _addSubError.value = str(com.interstellar.proxy.R.string.repo_raw_write_failed)
+                    // a brand-new subscription id). If even removal fails, the raw
+                    // is blocked from being applied and the message says so.
+                    val recovery = SubscriptionRepository.recoverRawBodyIfCurrent(subId, committedRaw, null)
+                    val failure = SubscriptionRepository.rawRecoveryMessage(recovery)
+                    _message.value = failure
+                    _addSubError.value = failure
                     return
                 }
                 if (Settings.selectedOutboundTag.isBlank()) {
@@ -2180,9 +2182,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         ),
                     )
                     if (!saved) {
-                        SubscriptionRepository.restoreRawBodyIfCurrent(subId, committedRaw, null)
-                        _message.value = str(com.interstellar.proxy.R.string.repo_raw_write_failed)
-                        _addSubError.value = str(com.interstellar.proxy.R.string.repo_raw_write_failed)
+                        val recovery = SubscriptionRepository.recoverRawBodyIfCurrent(subId, committedRaw, null)
+                        val failure = SubscriptionRepository.rawRecoveryMessage(recovery)
+                        _message.value = failure
+                        _addSubError.value = failure
                         return
                     }
                     _message.value = str(

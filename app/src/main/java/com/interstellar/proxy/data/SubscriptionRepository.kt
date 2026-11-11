@@ -10,7 +10,9 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
+import java.util.Collections
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * File-backed store for subscriptions, their nodes and the current selection.
@@ -94,14 +96,24 @@ object SubscriptionRepository {
     /** Serializes raw-body reads/writes so a guarded restore cannot interleave a newer commit. */
     private val rawBodyLock = Any()
 
+    /**
+     * Raw bodies whose restore AND removal both failed. They must not be applied:
+     * the metadata still describes the old body, while the file may hold the new
+     * unverified one. This is in-process only; a restart after such a filesystem
+     * failure needs the explicit check in the recovery report.
+     */
+    private val unverifiedRawIds: MutableSet<String> =
+        Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+
     private val indexFile: File
         get() = File(InterstellarApplication.application.filesDir, "subscriptions.json")
 
     /** Retained raw subscription body on disk (kept when it is a full core config). */
     fun rawFileOf(subscriptionId: String): File = File(dir, "$subscriptionId.raw")
 
-    /** Reads a subscription's retained raw body, or null when it has none. */
+    /** Reads a subscription's retained raw body, or null when it has none / is unverified. */
     fun readRawBody(subscriptionId: String): String? = synchronized(rawBodyLock) {
+        if (unverifiedRawIds.contains(subscriptionId)) return@synchronized null
         readRawBodyLocked(subscriptionId)
     }
 
@@ -120,22 +132,68 @@ object SubscriptionRepository {
      * comparison and the write share [rawBodyLock] with [commitFetchedBody], so a commit that lands
      * between them cannot be rolled back by the older attempt.
      *
-     * @return true when the older body was restored, false when a newer body owns the file.
+     * When the restore write itself fails (disk full), the unverified new body is removed or
+     * quarantined under the same lock, so it cannot be applied later under the old metadata.
+     * [recoverRawBodyIfCurrent] exposes which of those happened.
      */
     fun restoreRawBodyIfCurrent(subscriptionId: String, currentBody: String?, previousBody: String?): Boolean =
-        synchronized(rawBodyLock) {
-            if (readRawBodyLocked(subscriptionId) != currentBody) return@synchronized false
-            writeRawBodyLocked(subscriptionId, previousBody)
+        recoverRawBodyIfCurrent(subscriptionId, currentBody, previousBody) == RawRestoreResult.RESTORED
+
+    fun recoverRawBodyIfCurrent(
+        subscriptionId: String,
+        currentBody: String?,
+        previousBody: String?,
+    ): RawRestoreResult = synchronized(rawBodyLock) {
+        if (readRawBodyLocked(subscriptionId) != currentBody) {
+            return@synchronized RawRestoreResult.SUPERSEDED
         }
+        if (writeRawBodyLocked(subscriptionId, previousBody)) {
+            return@synchronized RawRestoreResult.RESTORED
+        }
+        val removed = removeRawBodyLocked(subscriptionId)
+        val result = RawRecoveryPolicy.decide(
+            currentMatches = true,
+            restored = false,
+            removed = removed,
+        )
+        if (result == RawRestoreResult.BODY_STUCK) unverifiedRawIds.add(subscriptionId)
+        result
+    }
 
     /** @return true only when the file now holds [body] (or is gone for null). */
     private fun writeRawBodyLocked(subscriptionId: String, body: String?): Boolean {
+        if (body == null) return removeRawBodyLocked(subscriptionId)
+        val persisted = AtomicFileWrite.writeText(rawFileOf(subscriptionId), body)
+        if (persisted) unverifiedRawIds.remove(subscriptionId)
+        return persisted
+    }
+
+    /**
+     * Deletes the active raw body; if deletion is refused (read-only file), rename it out of the
+     * active path instead. Rename needs no free space, which matters when the restore failed
+     * because the disk is full.
+     */
+    private fun removeRawBodyLocked(subscriptionId: String): Boolean {
         val file = rawFileOf(subscriptionId)
-        if (body == null) {
-            if (!file.exists()) return true
-            return runCatching { file.delete() }.getOrDefault(false) || !file.exists()
+        if (!file.exists()) {
+            unverifiedRawIds.remove(subscriptionId)
+            return true
         }
-        return AtomicFileWrite.writeText(file, body)
+        if (runCatching { file.delete() }.getOrDefault(false) || !file.exists()) {
+            unverifiedRawIds.remove(subscriptionId)
+            return true
+        }
+        val quarantine = File(file.parentFile, file.name + ".orphan")
+        val moved = runCatching {
+            if (quarantine.exists()) quarantine.delete()
+            file.renameTo(quarantine)
+        }.getOrDefault(false)
+        if (moved || !file.exists()) {
+            unverifiedRawIds.remove(subscriptionId)
+            return true
+        }
+        unverifiedRawIds.add(subscriptionId)
+        return false
     }
 
     /** Outcome of deciding what to do with a downloaded subscription body. */
@@ -362,7 +420,8 @@ object SubscriptionRepository {
      * therefore only ever contains plain node subscriptions.
      */
     fun isRawConfig(sub: Subscription): Boolean =
-        com.interstellar.proxy.data.subscription.RawConfigFormat.from(sub.configFormat) ==
+        !unverifiedRawIds.contains(sub.id) &&
+            com.interstellar.proxy.data.subscription.RawConfigFormat.from(sub.configFormat) ==
             com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX &&
             rawFileOf(sub.id).isFile
 
@@ -675,8 +734,8 @@ object SubscriptionRepository {
                                     regenerate = regenerate,
                                 )
                             ) {
-                                restoreRawBodyIfCurrent(id, commit.rawBody, previousRaw)
-                                return@withContext RefreshCommit(str(com.interstellar.proxy.R.string.repo_raw_write_failed), null)
+                                val recovery = recoverRawBodyIfCurrent(id, commit.rawBody, previousRaw)
+                                return@withContext RefreshCommit(rawRecoveryMessage(recovery), null)
                             }
                             str(com.interstellar.proxy.R.string.repo_refreshed, sub.name, parsed.nodes.size)
                         }
@@ -698,8 +757,8 @@ object SubscriptionRepository {
                                     regenerate = regenerate,
                                 )
                             ) {
-                                restoreRawBodyIfCurrent(id, commit.rawBody, previousRaw)
-                                return@withContext RefreshCommit(str(com.interstellar.proxy.R.string.repo_raw_write_failed), null)
+                                val recovery = recoverRawBodyIfCurrent(id, commit.rawBody, previousRaw)
+                                return@withContext RefreshCommit(rawRecoveryMessage(recovery), null)
                             }
                             str(
                                 com.interstellar.proxy.R.string.repo_refreshed_raw,
@@ -716,6 +775,13 @@ object SubscriptionRepository {
         } catch (e: Exception) {
             RefreshCommit(str(com.interstellar.proxy.R.string.repo_refresh_failed, sub.name, e.message ?: ""), null)
         }
+    }
+
+    fun rawRecoveryMessage(result: RawRestoreResult): String = when (result) {
+        RawRestoreResult.RESTORED, RawRestoreResult.SUPERSEDED ->
+            str(com.interstellar.proxy.R.string.repo_raw_write_failed)
+        RawRestoreResult.BODY_REMOVED -> str(com.interstellar.proxy.R.string.repo_raw_restore_failed)
+        RawRestoreResult.BODY_STUCK -> str(com.interstellar.proxy.R.string.repo_raw_restore_stuck)
     }
 
     private fun unsupportedConfigMessage(reason: String): String = when {

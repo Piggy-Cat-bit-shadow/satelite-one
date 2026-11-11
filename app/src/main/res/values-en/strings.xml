@@ -88,6 +88,8 @@
     <string name="repo_unsupported_no_tun">This sing-box config has no TUN inbound, so it cannot be the running config of this client</string>
     <string name="repo_unsupported_protocol">This subscription contains a protocol this client does not support: %1$s</string>
     <string name="repo_raw_write_failed">Could not persist the config; the previous working config was kept</string>
+    <string name="repo_raw_restore_failed">Could not persist the config and could not restore the old raw body; the unverified new raw body was removed</string>
+    <string name="repo_raw_restore_stuck">Could not persist the config and could not restore or remove the raw body; that raw body is blocked, check storage space</string>
     <string name="repo_too_many_nodes">Node count exceeds the %1$d limit; please shrink the subscription</string>
     <string name="repo_refreshed">Refreshed %1$s: %2$d nodes</string>
     <string name="repo_refreshed_raw">Refreshed %1$s: %2$s config kept</string>
