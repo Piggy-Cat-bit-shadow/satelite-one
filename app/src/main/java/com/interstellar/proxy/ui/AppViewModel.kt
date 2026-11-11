@@ -2132,7 +2132,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             SubscriptionRepository.rawFileOf(subId).delete()
             return
         }
-        val format = (commit as SubscriptionRepository.BodyCommit.Accepted).format
+        val accepted = commit as SubscriptionRepository.BodyCommit.Accepted
+        val format = accepted.format
+        val committedRaw = accepted.rawBody
         when (parsed) {
             is SubscriptionParser.Result.Nodes -> {
                 val sub = SubscriptionRepository.Subscription(
@@ -2148,7 +2150,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     configFormat = format,
                 )
                 if (!SubscriptionRepository.upsert(sub)) {
-                    SubscriptionRepository.rawFileOf(subId).delete()
+                    // The raw file was written during commit; undo it through the
+                    // same CAS the refresh path uses (there is no previous body for
+                    // a brand-new subscription id).
+                    SubscriptionRepository.restoreRawBodyIfCurrent(subId, committedRaw, null)
                     _message.value = str(com.interstellar.proxy.R.string.repo_raw_write_failed)
                     _addSubError.value = str(com.interstellar.proxy.R.string.repo_raw_write_failed)
                     return
@@ -2175,7 +2180,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         ),
                     )
                     if (!saved) {
-                        SubscriptionRepository.rawFileOf(subId).delete()
+                        SubscriptionRepository.restoreRawBodyIfCurrent(subId, committedRaw, null)
                         _message.value = str(com.interstellar.proxy.R.string.repo_raw_write_failed)
                         _addSubError.value = str(com.interstellar.proxy.R.string.repo_raw_write_failed)
                         return
@@ -2210,7 +2215,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun refreshSubscription(id: String, fromPull: Boolean = false) {
         val sub = SubscriptionRepository.get(id) ?: return
-        val url = sub.url ?: run {
+        if (sub.url == null) {
             showToast(str(com.interstellar.proxy.R.string.vm_local_no_refresh), UiToast.Kind.Error)
             return
         }
@@ -2240,76 +2245,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             var updated = false
             var commitError: String? = null
             try {
-                val result = SubscriptionFetcher.fetch(url)
-                when (val commit = SubscriptionRepository.commitFetchedBody(id, result.body)) {
-                    is SubscriptionRepository.BodyCommit.Refused -> {
-                        // The candidate is refused; the subscription keeps its previous body. This
-                        // is a config failure, not a download failure - the provider half still runs
-                        // because the instance that is serving is untouched by it.
-                        commitError = commit.error
-                        SubscriptionRepository.upsert(
-                            sub.copy(
-                                uploadBytes = result.uploadBytes,
-                                downloadBytes = result.downloadBytes,
-                                totalBytes = result.totalBytes,
-                                expireSeconds = result.expireSeconds,
-                                lastUpdated = System.currentTimeMillis(),
-                            ),
-                            regenerate = false,
-                        )
-                    }
-
-                    is SubscriptionRepository.BodyCommit.Accepted -> {
-                        val format = commit.format
-                        when (val parsed = SubscriptionParser.parse(result.body, id)) {
-                            is SubscriptionParser.Result.Nodes -> {
-                                SubscriptionRepository.upsert(
-                                    sub.copy(
-                                        nodes = parsed.nodes,
-                                        configFormat = format,
-                                        uploadBytes = result.uploadBytes,
-                                        downloadBytes = result.downloadBytes,
-                                        totalBytes = result.totalBytes,
-                                        expireSeconds = result.expireSeconds,
-                                        lastUpdated = System.currentTimeMillis(),
-                                    ),
-                                    regenerate = false,
-                                )
-                                updated = true
-                            }
-
-                            SubscriptionParser.Result.Empty ->
-                                if (format != null) {
-                                    SubscriptionRepository.upsert(
-                                        sub.copy(
-                                            configFormat = format,
-                                            uploadBytes = result.uploadBytes,
-                                            downloadBytes = result.downloadBytes,
-                                            totalBytes = result.totalBytes,
-                                            expireSeconds = result.expireSeconds,
-                                            lastUpdated = System.currentTimeMillis(),
-                                        ),
-                                        regenerate = false,
-                                    )
-                                    updated = true
-                                } else {
-                                    showToast(
-                                        str(com.interstellar.proxy.R.string.vm_refresh_unparsable, sub.name),
-                                        UiToast.Kind.Error,
-                                    )
-                                }
-
-                            is SubscriptionParser.Result.TooManyNodes ->
-                                showToast(
-                                    str(com.interstellar.proxy.R.string.repo_too_many_nodes, parsed.limit),
-                                    UiToast.Kind.Error,
-                                )
-
-                            is SubscriptionParser.Result.Unsupported ->
-                                showToast(unsupportedConfigMessage(parsed.reason), UiToast.Kind.Error)
-                        }
-                    }
-                }
+                // Reuse the repository's parse -> validate -> commit path (including
+                // the CAS restore of the raw body if metadata persistence fails).
+                // This screen only owns instance identity, the in-flight slot and
+                // the decision about when the active config is regenerated.
+                val refresh = SubscriptionRepository.refresh(id, regenerate = false)
+                val outcome = com.interstellar.proxy.data.subscription.RefreshOutcome.single(refresh)
+                updated = outcome.updated
+                if (!outcome.updated) commitError = outcome.error
             } catch (e: Exception) {
                 showToast(str(com.interstellar.proxy.R.string.vm_refresh_failed, sub.name, e.message ?: ""), UiToast.Kind.Error)
             } finally {
@@ -2409,77 +2352,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 start.mixSubscriptionIds,
             )
             val semaphore = kotlinx.coroutines.sync.Semaphore(3)
-            var ok = 0
-            val refusals = java.util.Collections.synchronizedList(mutableListOf<String>())
+            val commits =
+                java.util.Collections.synchronizedList(
+                    mutableListOf<SubscriptionRepository.RefreshCommit?>(),
+                )
             try {
                 kotlinx.coroutines.coroutineScope {
                     targets.forEach { sub ->
                         launch {
                             semaphore.withPermit {
-                                runCatching {
-                                    val result = SubscriptionFetcher.fetch(sub.url!!)
-                                    when (val commit = SubscriptionRepository.commitFetchedBody(sub.id, result.body)) {
-                                        is SubscriptionRepository.BodyCommit.Refused -> {
-                                            // Keep the subscription's previous body and update only
-                                            // its accounting; the refusal is reported, not hidden.
-                                            SubscriptionRepository.upsert(
-                                                sub.copy(
-                                                    uploadBytes = result.uploadBytes,
-                                                    downloadBytes = result.downloadBytes,
-                                                    totalBytes = result.totalBytes,
-                                                    expireSeconds = result.expireSeconds,
-                                                    lastUpdated = System.currentTimeMillis(),
-                                                ),
-                                                regenerate = false,
-                                            )
-                                            refusals.add(commit.error)
-                                            false
-                                        }
-
-                                        is SubscriptionRepository.BodyCommit.Accepted -> {
-                                            val fmt = commit.format
-                                            when (val parsed = SubscriptionParser.parse(result.body, sub.id)) {
-                                                is SubscriptionParser.Result.Nodes -> {
-                                                    SubscriptionRepository.upsert(
-                                                        sub.copy(
-                                                            nodes = parsed.nodes,
-                                                            configFormat = fmt,
-                                                            uploadBytes = result.uploadBytes,
-                                                            downloadBytes = result.downloadBytes,
-                                                            totalBytes = result.totalBytes,
-                                                            expireSeconds = result.expireSeconds,
-                                                            lastUpdated = System.currentTimeMillis(),
-                                                        ),
-                                                        regenerate = false,
-                                                    )
-                                                    true
-                                                }
-
-                                                SubscriptionParser.Result.Empty -> {
-                                                    if (fmt != null) {
-                                                        SubscriptionRepository.upsert(
-                                                            sub.copy(
-                                                                configFormat = fmt,
-                                                                uploadBytes = result.uploadBytes,
-                                                                downloadBytes = result.downloadBytes,
-                                                                totalBytes = result.totalBytes,
-                                                                expireSeconds = result.expireSeconds,
-                                                                lastUpdated = System.currentTimeMillis(),
-                                                            ),
-                                                            regenerate = false,
-                                                        )
-                                                        true
-                                                    } else {
-                                                        false
-                                                    }
-                                                }
-
-                                                is SubscriptionParser.Result.TooManyNodes -> false
-                                                is SubscriptionParser.Result.Unsupported -> false
-                                            }
-                                        }
-                                    }
-                                }.getOrDefault(false).let { if (it) ok++ }
+                                // Same repository path as the single refresh, so a
+                                // persistence failure returns committed=false and is
+                                // never counted by the batch.
+                                commits.add(
+                                    runCatching {
+                                        SubscriptionRepository.refresh(sub.id, regenerate = false)
+                                    }.getOrNull(),
+                                )
                             }
                         }
                     }
@@ -2496,6 +2385,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             // Same ownership rule as the single-item update: a batch whose result is appended after
             // another profile became active may keep the downloaded bytes, but must not rewrite the
             // active config, reload, or refresh the instance that profile owns.
+            val outcome = com.interstellar.proxy.data.subscription.RefreshOutcome.batch(commits.toList())
+            val ok = outcome.succeeded
             var owns = SubscriptionUpdateCoordinator.ownsInstance(
                 affectsActive,
                 start,
@@ -2506,7 +2397,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 showToast(str(com.interstellar.proxy.R.string.vm_update_all_superseded), UiToast.Kind.Error)
                 return@launch
             }
-            var configError = refusals.firstOrNull()
+            var configError = outcome.errors.firstOrNull()
             if (owns && affectsActive && ok > 0) {
                 SubscriptionRepository.regenerateActiveConfig()
                 configError = configError ?: SubscriptionRepository.takeConfigError()
@@ -2549,12 +2440,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun updateSubscription(id: String, name: String, url: String?) {
         viewModelScope.launch(Dispatchers.IO) {
             val sub = SubscriptionRepository.get(id) ?: return@launch
-            SubscriptionRepository.upsert(
+            val saved = SubscriptionRepository.upsert(
                 sub.copy(
                     name = name.trim().ifBlank { sub.name },
                     url = url?.trim()?.takeIf { it.isNotBlank() } ?: sub.url,
                 ),
             )
+            if (!saved) {
+                showToast(str(com.interstellar.proxy.R.string.repo_raw_write_failed), UiToast.Kind.Error)
+                return@launch
+            }
             _subscriptions.value = SubscriptionRepository.subscriptions.toList()
             _activeSubscriptionId.value = SubscriptionRepository.activeSubscriptionId
         }

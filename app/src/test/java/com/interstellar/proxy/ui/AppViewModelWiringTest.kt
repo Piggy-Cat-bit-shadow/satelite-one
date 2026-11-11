@@ -595,25 +595,58 @@ class AppViewModelWiringTest {
      * + config revision.
      */
     @Test
+    fun `manual refresh paths delegate parse validate and commit to the repository`() {
+        val single = bodyOf("fun refreshSubscription(")
+        assertTrue(
+            "`refreshSubscription()` no longer calls the repository's refresh path, so its parse/validate/" +
+                "commit behaviour can drift from the tested one.",
+            single.contains("SubscriptionRepository.refresh("),
+        )
+        assertTrue(
+            "`refreshSubscription()` still commits the raw body itself instead of reusing the repository path.",
+            !single.contains("commitFetchedBody"),
+        )
+        assertTrue(
+            "`refreshSubscription()` no longer maps the committed flag, so an unpersisted body can be " +
+                "counted as an update.",
+            single.contains("RefreshOutcome.single(") && single.contains("updated = outcome.updated"),
+        )
+
+        val batch = bodyOf("fun refreshAll()")
+        assertTrue(
+            "`refreshAll()` no longer calls the repository's refresh path.",
+            batch.contains("SubscriptionRepository.refresh("),
+        )
+        assertTrue(
+            "`refreshAll()` still commits the raw body itself instead of reusing the repository path.",
+            !batch.contains("commitFetchedBody"),
+        )
+        assertTrue(
+            "`refreshAll()` no longer derives its success count from committed results.",
+            batch.contains("RefreshOutcome.batch(") && batch.contains("val ok = outcome.succeeded"),
+        )
+    }
+
+    @Test
     fun `a late update result is dropped when another profile became active`() {
         val body = bodyOf("fun refreshSubscription(")
         val capture = body.indexOf("val start = instanceSnapshot()")
         val decide = body.indexOf("affectsActiveConfig(")
-        val fetch = body.indexOf("SubscriptionFetcher.fetch(")
+        val refresh = body.indexOf("SubscriptionRepository.refresh(")
         val owns = body.indexOf("ownsInstance(")
         assertTrue("`refreshSubscription()` no longer captures the instance identity before the fetch", capture >= 0)
         assertTrue("`refreshSubscription()` no longer decides pool membership", decide >= 0)
-        assertTrue("`refreshSubscription()` no longer fetches the subscription", fetch >= 0)
+        assertTrue("`refreshSubscription()` no longer delegates the fetch to the repository", refresh >= 0)
         assertTrue(
             "`refreshSubscription()` captures the instance identity after the pool decision or after the " +
                 "fetch, so the owner of the live instance is not known when the request starts",
-            capture < decide && decide < fetch,
+            capture < decide && decide < refresh,
         )
         assertTrue(
             "`refreshSubscription()` no longer re-checks instance ownership before applying the result, so a " +
                 "result that lands after another profile became active reloads that profile and refreshes its " +
                 "providers - the late-result misattribution.",
-            owns > fetch,
+            owns > refresh,
         )
         assertInBody(
             "fun refreshSubscription(",
@@ -665,14 +698,20 @@ class AppViewModelWiringTest {
         )
         assertInBody(
             "fun refreshSubscription(",
-            "when (val commit = SubscriptionRepository.commitFetchedBody(",
-            "`refreshSubscription()` no longer validates the downloaded body before it is stored, so a body " +
-                "the core refuses can overwrite the subscription's last good one.",
+            "SubscriptionRepository.refresh(",
+            "`refreshSubscription()` no longer delegates parsing, validation and the raw commit to the " +
+                "repository, so a body the core refuses can overwrite the subscription's last good one.",
         )
         assertInBody(
             "fun refreshSubscription(",
-            "is SubscriptionRepository.BodyCommit.Refused -> {",
-            "`refreshSubscription()` no longer handles the refused candidate as its own result.",
+            "RefreshOutcome.single(",
+            "`refreshSubscription()` no longer maps the committed flag, so a refused or unpersisted body " +
+                "could be reported as an update.",
+        )
+        assertInBody(
+            "fun refreshSubscription(",
+            "commitError = outcome.error",
+            "`refreshSubscription()` no longer carries the refusal into the report.",
         )
         assertInBody(
             "fun refreshSubscription(",
@@ -681,7 +720,7 @@ class AppViewModelWiringTest {
         )
         assertInBody(
             "fun refreshAll()",
-            "is SubscriptionRepository.BodyCommit.Refused -> {",
+            "SubscriptionRepository.refresh(",
             "`refreshAll()` no longer keeps a refused candidate out of the subscription's stored body.",
         )
         assertInBody(
@@ -723,14 +762,14 @@ class AppViewModelWiringTest {
     fun `a failed download still reaches the provider half of a manual update`() {
         val body = bodyOf("fun refreshSubscription(")
         val decide = body.indexOf("affectsActiveConfig(")
-        val fetch = body.indexOf("SubscriptionFetcher.fetch(")
+        val refresh = body.indexOf("SubscriptionRepository.refresh(")
         assertTrue("`refreshSubscription()` no longer decides whether the update affects the active pool", decide >= 0)
-        assertTrue("`refreshSubscription()` no longer fetches the subscription", fetch >= 0)
+        assertTrue("`refreshSubscription()` no longer delegates the fetch to the repository", refresh >= 0)
         assertTrue(
             "`refreshSubscription()` decides whether the update affects the active pool AFTER the fetch, " +
                 "so the decision can only be taken from a successful download - the failed-download " +
                 "branch returns without refreshing the instance that is still running.",
-            decide < fetch,
+            decide < refresh,
         )
         assertInBody(
             "fun refreshSubscription(",

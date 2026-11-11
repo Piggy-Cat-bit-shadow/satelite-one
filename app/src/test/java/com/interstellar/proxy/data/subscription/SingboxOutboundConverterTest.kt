@@ -29,7 +29,7 @@ class SingboxOutboundConverterTest {
             null,
         )
         check(node != null) { "vmess node must convert" }
-        check(node!!.fingerprint == "chrome") { "fingerprint was dropped: ${node.fingerprint}" }
+        check(node.fingerprint == "chrome") { "fingerprint was dropped: ${node.fingerprint}" }
         val outbound = MinimalConfigBuilder.nodeToOutbound(node, "hk")
         val fingerprint = outbound["tls"]!!.jsonObject["utls"]!!.jsonObject["fingerprint"]!!.jsonPrimitive.content
         check(fingerprint == "chrome") { "fingerprint did not round-trip: $fingerprint" }
@@ -47,7 +47,7 @@ class SingboxOutboundConverterTest {
             null,
         )
         check(node != null) { "ssh node must convert" }
-        check(node!!.type == NodeType.SSH)
+        check(node.type == NodeType.SSH)
         check(node.sshUser == "root")
         check(node.sshKey == "test-private-key-material")
     }
@@ -73,7 +73,7 @@ class SingboxOutboundConverterTest {
             null,
         )
         check(node != null) { "vmess node must convert" }
-        check(!node!!.tls) { "tls.enabled=false must not become enabled" }
+        check(!node.tls) { "tls.enabled=false must not become enabled" }
         val outbound = MinimalConfigBuilder.nodeToOutbound(node, "plain")
         check("tls" !in outbound) { "a disabled TLS node must not generate a tls block: $outbound" }
     }
@@ -85,6 +85,6 @@ class SingboxOutboundConverterTest {
             null,
         )
         check(node != null)
-        check(node!!.tls) { "trojan requires TLS even when the block is omitted" }
+        check(node.tls) { "trojan requires TLS even when the block is omitted" }
     }
 }
