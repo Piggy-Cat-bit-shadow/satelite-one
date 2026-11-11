@@ -227,8 +227,26 @@ object MinimalConfigBuilder {
                     put("detour", GROUP_TAG)
                 },
             )
+            // Direct mode needs its own DoH transport: a DNS server's `detour` is
+            // what actually chooses the dialer, and `dns-remote` detours to the
+            // selector. A DNS rule's `outbound` field is a MATCH condition
+            // (`route/rule/rule_dns.go` builds an OutboundRule from it, the same
+            // item the route rules use), not an action - setting it to `direct`
+            // never changed where the query was dialled from. The action is
+            // `server`; therefore Direct mode selects a server whose own detour is
+            // `direct`.
+            add(
+                buildJsonObject {
+                    put("tag", "dns-remote-direct")
+                    put("type", "https")
+                    put("server", "1.1.1.1")
+                    put("detour", DIRECT_TAG)
+                },
+            )
         }
         putJsonArray("rules") {
+            // Bootstrap first: a DoH server whose address is a domain must resolve
+            // through the system resolver, not through itself.
             add(
                 buildJsonObject {
                     put("outbound", "any")
@@ -244,22 +262,14 @@ object MinimalConfigBuilder {
             // itself enough to keep a proxy connection alive, so "直连" traffic
             // could still be observed from the node.
             //
-            // DNS rules support `clash_mode` in this kernel
-            // (`option/rule_dns.go` `ClashMode`, matched by the same
-            // `rule.ClashModeItem` the route rules use), so the fix is a routing
-            // rule rather than a detour that would have to be rewritten - which
-            // would mean reloading the config on every mode change.
-            //
-            // The detour is overridden per-query instead of per-server: the same
-            // `dns-remote` transport is reused, so nothing about the Rule and
-            // Global DNS policy changes. Placed AFTER the bootstrap rule so that a
-            // DoH server whose own address is a domain still resolves locally
-            // rather than through itself.
+            // The action is `server` (the DNS transport), not `outbound` (a match
+            // condition), so Direct mode switches to the transport whose detour is
+            // `direct`. Rule and Global keep `dns-remote` / `dns.final`, so their
+            // DNS policy is unchanged.
             add(
                 buildJsonObject {
                     put("clash_mode", CLASH_MODE_DIRECT)
-                    put("server", "dns-remote")
-                    putJsonArray("outbound") { add(DIRECT_TAG) }
+                    put("server", "dns-remote-direct")
                 },
             )
         }
@@ -495,6 +505,7 @@ object MinimalConfigBuilder {
                 put("server_port", node.port)
                 node.sshUser?.let { put("user", it) }
                 node.sshKey?.let { put("private_key", it) }
+                node.password?.let { put("password", it) }
             }
 
             NodeType.UNKNOWN -> put("type", "direct")

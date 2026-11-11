@@ -145,12 +145,10 @@ class MinimalConfigBuilderTest {
     /**
      * Direct mode must not resolve through the proxy.
      *
-     * `dns-remote` detours to the selector and `dns.final` is `dns-remote`, so without this
-     * rule every lookup would still leave through the proxy node after the user chose 直连 -
-     * and dialling the DoH server through the selector is by itself enough to keep a node
-     * connection alive. DNS rules support `clash_mode` in this kernel, so the detour is
-     * overridden per query instead of rewriting the server (which would need a config reload
-     * on every mode change).
+     * `dns-remote` detours to the selector and `dns.final` is `dns-remote`. A DNS
+     * rule's `outbound` is a match condition, not an action: the transport is
+     * chosen by `server`, and the transport's own `detour` picks the dialer. The
+     * Direct rule therefore selects `dns-remote-direct`, whose detour is `direct`.
      */
     @Test
     fun `direct mode sends dns out directly instead of through the selector`() {
@@ -161,15 +159,19 @@ class MinimalConfigBuilderTest {
         check(rules[0]["outbound"]!!.jsonPrimitive.content == "any")
         check(rules[0]["server"]!!.jsonPrimitive.content == "dns-local")
         check(rules[1]["clash_mode"]!!.jsonPrimitive.content == "Direct")
-        check(rules[1]["server"]!!.jsonPrimitive.content == "dns-remote")
-        val overrideOutbound = rules[1]["outbound"]!!.jsonArray.map { it.jsonPrimitive.content }
-        check(overrideOutbound == listOf(MinimalConfigBuilder.DIRECT_TAG)) {
-            "the direct override must use the direct outbound, not the selector: $overrideOutbound"
+        check(rules[1]["server"]!!.jsonPrimitive.content == "dns-remote-direct")
+        check("outbound" !in rules[1]) {
+            "`outbound` only matches queries; the action is `server`: $rules"
         }
-        // The transport is reused, so Rule/Global DNS policy is untouched.
+        // The selector transport is untouched, so Rule/Global DNS policy is unchanged.
         val servers = dns["servers"]!!.jsonArray.map { it.jsonObject }
-        check(servers[1]["detour"]!!.jsonPrimitive.content == MinimalConfigBuilder.GROUP_TAG) {
-            "dns-remote itself still detours to the selector"
+        val remote = servers.first { it["tag"]!!.jsonPrimitive.content == "dns-remote" }
+        check(remote["detour"]!!.jsonPrimitive.content == MinimalConfigBuilder.GROUP_TAG) {
+            "dns-remote still detours to the selector"
+        }
+        val direct = servers.first { it["tag"]!!.jsonPrimitive.content == "dns-remote-direct" }
+        check(direct["detour"]!!.jsonPrimitive.content == MinimalConfigBuilder.DIRECT_TAG) {
+            "the direct-mode transport must dial through direct"
         }
         check(dns["final"]!!.jsonPrimitive.content == "dns-remote")
     }
@@ -191,16 +193,20 @@ class MinimalConfigBuilderTest {
     }
 
     @Test
-    fun `dns is the system resolver for outbound dials plus one remote DoH`() {
+    fun `dns is the system resolver for outbound dials plus the two remote DoH transports`() {
         val dns = config()["dns"]!!.jsonObject
         val servers = dns["servers"]!!.jsonArray.map { it.jsonObject }
-        check(servers.size == 2) { "no CN/hosts/extra servers: $servers" }
+        check(servers.size == 3) { "local + proxy DoH + direct DoH: $servers" }
         check(servers[0]["tag"]!!.jsonPrimitive.content == "dns-local")
         check(servers[0]["type"]!!.jsonPrimitive.content == "local")
         val remote = servers[1]
         check(remote["tag"]!!.jsonPrimitive.content == "dns-remote")
         check(remote["type"]!!.jsonPrimitive.content == "https")
         check(remote["detour"]!!.jsonPrimitive.content == MinimalConfigBuilder.GROUP_TAG) { "app DNS rides the selector" }
+        val direct = servers[2]
+        check(direct["tag"]!!.jsonPrimitive.content == "dns-remote-direct")
+        check(direct["type"]!!.jsonPrimitive.content == "https")
+        check(direct["detour"]!!.jsonPrimitive.content == MinimalConfigBuilder.DIRECT_TAG) { "direct DNS must not ride the selector" }
 
         val rules = dns["rules"]!!.jsonArray.map { it.jsonObject }
         check(rules.size == 2) { "the outbound-dial bootstrap rule plus the Direct-mode override: $rules" }
@@ -331,5 +337,40 @@ class MinimalConfigBuilderTest {
         val members = selector["outbounds"]!!.jsonArray.map { it.jsonPrimitive.content }
         check(members.count { it == MinimalConfigBuilder.AUTO_TAG } == 1) { "one real auto only" }
         check(members.count { it == MinimalConfigBuilder.DIRECT_TAG } == 0) { "no node claims direct" }
+    }
+
+    @Test
+    fun `direct mode dns selects a direct-detour transport, not the proxy one`() {
+        // A DNS rule's `outbound` is a MATCH condition in this kernel; the action
+        // is `server`, and the server's own `detour` is the dialer. The old config
+        // had `server: dns-remote` (+ detour=selector) and only added
+        // `outbound: [direct]` to the rule, so Direct mode still resolved through
+        // the proxy. Pin the real relationship: the Direct rule must select a
+        // transport whose detour is `direct`.
+        val dns = config()["dns"]!!.jsonObject
+        val servers = dns["servers"]!!.jsonArray.map { it.jsonObject }
+        val remote = servers.first { it["tag"]!!.jsonPrimitive.content == "dns-remote" }
+        val remoteDirect = servers.first { it["tag"]!!.jsonPrimitive.content == "dns-remote-direct" }
+        check(remote["detour"]!!.jsonPrimitive.content == MinimalConfigBuilder.GROUP_TAG) {
+            "Rule/Global DNS must ride the selector"
+        }
+        check(remoteDirect["detour"]!!.jsonPrimitive.content == MinimalConfigBuilder.DIRECT_TAG) {
+            "Direct DNS must dial through direct"
+        }
+
+        val rules = dns["rules"]!!.jsonArray.map { it.jsonObject }
+        check(rules.first()["server"]!!.jsonPrimitive.content == "dns-local") {
+            "the bootstrap rule must stay first, otherwise DoH self-resolves"
+        }
+        val directRule = rules.first { it["clash_mode"]?.jsonPrimitive?.content == "Direct" }
+        check(directRule["server"]!!.jsonPrimitive.content == "dns-remote-direct") {
+            "Direct mode must select the direct-DoH transport: $directRule"
+        }
+        check("outbound" !in directRule) {
+            "`outbound` is a match condition, not a DNS action: $directRule"
+        }
+        check(dns["final"]!!.jsonPrimitive.content == "dns-remote") {
+            "Rule mode keeps the selector-routed DoH server as final"
+        }
     }
 }
