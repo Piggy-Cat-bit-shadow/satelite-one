@@ -2102,6 +2102,27 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         // stamp the subscription id on nodes up front so mix source labels work
         val subId = SubscriptionRepository.newSubscriptionId()
+        val detected = com.interstellar.proxy.data.subscription.RawConfigDetector.detect(body)
+        val parsed = SubscriptionParser.parse(body, subId)
+        val parsedError = when (com.interstellar.proxy.data.subscription.RefreshGuard.decide(detected, parsed)) {
+            com.interstellar.proxy.data.subscription.RefreshGuard.Decision.ACCEPT -> null
+            com.interstellar.proxy.data.subscription.RefreshGuard.Decision.UNSUPPORTED ->
+                unsupportedConfigMessage((parsed as SubscriptionParser.Result.Unsupported).reason)
+            com.interstellar.proxy.data.subscription.RefreshGuard.Decision.TOO_MANY_NODES ->
+                str(
+                    com.interstellar.proxy.R.string.repo_too_many_nodes,
+                    (parsed as SubscriptionParser.Result.TooManyNodes).limit,
+                )
+            com.interstellar.proxy.data.subscription.RefreshGuard.Decision.EMPTY_UNPARSABLE ->
+                str(com.interstellar.proxy.R.string.vm_unrecognized_content)
+        }
+        if (parsedError != null) {
+            // Parse/classify before commitFetchedBody touches the disk: an unusable
+            // body must not create or replace any file.
+            _message.value = parsedError
+            _addSubError.value = parsedError
+            return
+        }
         val commit = SubscriptionRepository.commitFetchedBody(subId, body)
         if (commit is SubscriptionRepository.BodyCommit.Refused) {
             // An import is a promise that the subscription can be used; a body the core refuses
@@ -2112,7 +2133,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         val format = (commit as SubscriptionRepository.BodyCommit.Accepted).format
-        when (val parsed = SubscriptionParser.parse(body, subId)) {
+        when (parsed) {
             is SubscriptionParser.Result.Nodes -> {
                 val sub = SubscriptionRepository.Subscription(
                     id = subId,
@@ -2126,7 +2147,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     lastUpdated = System.currentTimeMillis(),
                     configFormat = format,
                 )
-                SubscriptionRepository.upsert(sub)
+                if (!SubscriptionRepository.upsert(sub)) {
+                    SubscriptionRepository.rawFileOf(subId).delete()
+                    _message.value = str(com.interstellar.proxy.R.string.repo_raw_write_failed)
+                    _addSubError.value = str(com.interstellar.proxy.R.string.repo_raw_write_failed)
+                    return
+                }
                 if (Settings.selectedOutboundTag.isBlank()) {
                     Settings.selectedOutboundTag = com.interstellar.proxy.data.config.MinimalConfigBuilder.AUTO_TAG
                 }
@@ -2137,10 +2163,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             SubscriptionParser.Result.Empty -> {
-                // a raw config may carry no extractable nodes but still be a
-                // valid body — import it as a raw-only subscription
+                // Reached only for a raw sing-box profile with no extractable nodes.
                 if (format != null) {
-                    SubscriptionRepository.upsert(
+                    val saved = SubscriptionRepository.upsert(
                         SubscriptionRepository.Subscription(
                             id = subId,
                             name = name,
@@ -2149,6 +2174,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             configFormat = format,
                         ),
                     )
+                    if (!saved) {
+                        SubscriptionRepository.rawFileOf(subId).delete()
+                        _message.value = str(com.interstellar.proxy.R.string.repo_raw_write_failed)
+                        _addSubError.value = str(com.interstellar.proxy.R.string.repo_raw_write_failed)
+                        return
+                    }
                     _message.value = str(
                         com.interstellar.proxy.R.string.vm_imported_raw,
                         name,
@@ -2161,21 +2192,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
-            is SubscriptionParser.Result.TooManyNodes -> {
-                // Never import a truncated node list as if it were the whole
-                // subscription; the limit is a hard failure.
-                SubscriptionRepository.rawFileOf(subId).delete()
-                val message = str(com.interstellar.proxy.R.string.repo_too_many_nodes, parsed.limit)
-                _message.value = message
-                _addSubError.value = message
-            }
-
-            is SubscriptionParser.Result.Unsupported -> {
-                SubscriptionRepository.rawFileOf(subId).delete()
-                val message = unsupportedConfigMessage(parsed.reason)
-                _message.value = message
-                _addSubError.value = message
-            }
+            else -> error("parsed error result reached the import commit branch")
         }
         _subscriptions.value = SubscriptionRepository.subscriptions.toList()
         _activeSubscriptionId.value = SubscriptionRepository.activeSubscriptionId

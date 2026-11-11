@@ -81,7 +81,10 @@ object SubscriptionRepository {
             nodes = previous.nodes,
             configFormat = previous.configFormat,
         )
-        save()
+        if (!save()) {
+            subscriptions[index] = current
+            return@synchronized false
+        }
         true
     }
 
@@ -164,7 +167,9 @@ object SubscriptionRepository {
     fun commitFetchedBody(subscriptionId: String, body: String): BodyCommit = synchronized(rawBodyLock) {
         val detected = com.interstellar.proxy.data.subscription.RawConfigDetector.detect(body)
         if (detected == null) {
-            rawFileOf(subscriptionId).delete()
+            if (!writeRawBodyLocked(subscriptionId, null)) {
+                return@synchronized BodyCommit.Refused(str(com.interstellar.proxy.R.string.repo_raw_write_failed))
+            }
             return@synchronized BodyCommit.Accepted(null, null)
         }
         when (com.interstellar.proxy.data.subscription.RawConfigCommitPolicy.decide(detected)) {
@@ -245,10 +250,15 @@ object SubscriptionRepository {
     }
 
     @Synchronized
-    fun save() {
-        runCatching {
-            indexFile.writeText(json.encodeToString(subscriptions.toList()))
+    fun save(): Boolean {
+        val text = runCatching { json.encodeToString(subscriptions.toList()) }.getOrNull()
+        if (text == null) {
+            android.util.Log.e(TAG, "failed to encode subscriptions.json")
+            return false
         }
+        val persisted = AtomicFileWrite.writeText(indexFile, text)
+        if (!persisted) android.util.Log.e(TAG, "failed to persist subscriptions.json")
+        return persisted
     }
 
     fun get(id: String): Subscription? = subscriptions.find { it.id == id }
@@ -267,8 +277,11 @@ object SubscriptionRepository {
     }
 
     @Synchronized
-    fun upsert(subscription: Subscription, regenerate: Boolean = true) {
+    fun upsert(subscription: Subscription, regenerate: Boolean = true): Boolean {
+        var saved = false
         val shouldRegenerate = synchronized(contentLock) {
+            val previous = subscriptions.toList()
+            val previousActive = activeSubscriptionId
             val index = subscriptions.indexOfFirst { it.id == subscription.id }
             if (index >= 0) {
                 subscriptions[index] = subscription
@@ -276,22 +289,31 @@ object SubscriptionRepository {
                 subscriptions.add(subscription)
             }
             if (activeSubscriptionId.isBlank()) activeSubscriptionId = subscription.id
-            save()
+            if (!save()) {
+                // Keep memory and disk on the same (old) version rather than
+                // regenerating a config from metadata that did not persist.
+                subscriptions.clear()
+                subscriptions.addAll(previous)
+                activeSubscriptionId = previousActive
+                return@synchronized false
+            }
+            saved = true
             regenerate &&
                 affectsActivePool(subscription.id, activeSubscriptionId, Settings.mixEnabled, Settings.mixSubscriptionIds)
         }
         if (shouldRegenerate) {
             regenerateActiveConfig()
         }
+        return saved
     }
 
     @Synchronized
     fun remove(id: String) {
         val empty = synchronized(contentLock) {
+            val previous = subscriptions.toList()
+            val previousActive = activeSubscriptionId
+            val previousMix = Settings.mixSubscriptionIds
             subscriptions.removeAll { it.id == id }
-            // Delete under the same lock as the raw CAS: otherwise a restore that just checked
-            // the old body could have the file removed between its check and write.
-            synchronized(rawBodyLock) { rawFileOf(id).delete() }
             if (activeSubscriptionId == id) {
                 activeSubscriptionId = subscriptions.firstOrNull()?.id ?: ""
             }
@@ -303,9 +325,19 @@ object SubscriptionRepository {
                 } else {
                     remaining
                 }
-            save()
+            if (!save()) {
+                subscriptions.clear()
+                subscriptions.addAll(previous)
+                activeSubscriptionId = previousActive
+                Settings.mixSubscriptionIds = previousMix
+                return@synchronized null
+            }
+            // Delete under the same lock as the raw CAS: otherwise a restore that just checked
+            // the old body could have the file removed between its check and write. The index is
+            // already persisted, so a failed delete cannot resurrect the subscription.
+            synchronized(rawBodyLock) { rawFileOf(id).delete() }
             subscriptions.isEmpty()
-        }
+        } ?: return
         // 删光订阅时把磁盘上的活动配置一并清掉,否则静态分组解析会把
         // 旧配置"复活"成节点列表
         if (empty) {
@@ -559,11 +591,33 @@ object SubscriptionRepository {
         val url = sub.url ?: return@withContext RefreshCommit(str(com.interstellar.proxy.R.string.vm_local_no_refresh), null)
         try {
             val result = com.interstellar.proxy.data.net.SubscriptionFetcher.fetch(url)
-            when (val commit = commitFetchedBody(id, result.body)) {
-                is BodyCommit.Refused -> {
-                    // The body is refused, but the download and its quota headers are real: keep the
-                    // subscription's previous config and update only the accounting.
-                    upsert(
+            // Parse and classify BEFORE commitFetchedBody: that call is destructive
+            // (it replaces or deletes the retained raw body). A body this app cannot
+            // use must leave the old nodes, the old configFormat and the last-good
+            // raw body exactly as they were.
+            val detected = com.interstellar.proxy.data.subscription.RawConfigDetector.detect(result.body)
+            val parsed = com.interstellar.proxy.data.subscription.SubscriptionParser.parse(result.body, id)
+            val parsedError = when (
+                com.interstellar.proxy.data.subscription.RefreshGuard.decide(detected, parsed)
+            ) {
+                com.interstellar.proxy.data.subscription.RefreshGuard.Decision.ACCEPT -> null
+                com.interstellar.proxy.data.subscription.RefreshGuard.Decision.UNSUPPORTED ->
+                    unsupportedConfigMessage(
+                        (parsed as com.interstellar.proxy.data.subscription.SubscriptionParser.Result.Unsupported).reason,
+                    )
+                com.interstellar.proxy.data.subscription.RefreshGuard.Decision.TOO_MANY_NODES ->
+                    str(
+                        com.interstellar.proxy.R.string.repo_too_many_nodes,
+                        (parsed as com.interstellar.proxy.data.subscription.SubscriptionParser.Result.TooManyNodes).limit,
+                    )
+                com.interstellar.proxy.data.subscription.RefreshGuard.Decision.EMPTY_UNPARSABLE ->
+                    str(com.interstellar.proxy.R.string.repo_refresh_unparsable, sub.name)
+            }
+            if (parsedError != null) {
+                // Accounting is real (the download happened), but nodes, format and
+                // the retained raw body stay on the previous good version.
+                if (
+                    !upsert(
                         sub.copy(
                             uploadBytes = result.uploadBytes,
                             downloadBytes = result.downloadBytes,
@@ -573,37 +627,66 @@ object SubscriptionRepository {
                         ),
                         regenerate = regenerate,
                     )
+                ) {
+                    return@withContext RefreshCommit(str(com.interstellar.proxy.R.string.repo_raw_write_failed), null)
+                }
+                return@withContext RefreshCommit(parsedError, null)
+            }
+
+            val previousRaw = readRawBody(id)
+            when (val commit = commitFetchedBody(id, result.body)) {
+                is BodyCommit.Refused -> {
+                    // The body is refused, but the download and its quota headers are real: keep the
+                    // subscription's previous config and update only the accounting.
+                    if (
+                        !upsert(
+                            sub.copy(
+                                uploadBytes = result.uploadBytes,
+                                downloadBytes = result.downloadBytes,
+                                totalBytes = result.totalBytes,
+                                expireSeconds = result.expireSeconds,
+                                lastUpdated = System.currentTimeMillis(),
+                            ),
+                            regenerate = regenerate,
+                        )
+                    ) {
+                        return@withContext RefreshCommit(str(com.interstellar.proxy.R.string.repo_raw_write_failed), null)
+                    }
                     RefreshCommit(commit.error, null)
                 }
 
                 is BodyCommit.Accepted -> {
                     val format = commit.format
                     var committedContent = SubscriptionContent(sub.nodes, sub.configFormat)
-                    val message = when (val parsed = com.interstellar.proxy.data.subscription.SubscriptionParser.parse(result.body, id)) {
+                    val message = when (parsed) {
                         is com.interstellar.proxy.data.subscription.SubscriptionParser.Result.Nodes -> {
                             committedContent = SubscriptionContent(parsed.nodes, format)
-                            upsert(
-                                sub.copy(
-                                    nodes = parsed.nodes,
-                                    configFormat = format,
-                                    uploadBytes = result.uploadBytes,
-                                    downloadBytes = result.downloadBytes,
-                                    totalBytes = result.totalBytes,
-                                    expireSeconds = result.expireSeconds,
-                                    lastUpdated = System.currentTimeMillis(),
-                                ),
-                                regenerate = regenerate,
-                            )
+                            if (
+                                !upsert(
+                                    sub.copy(
+                                        nodes = parsed.nodes,
+                                        configFormat = format,
+                                        uploadBytes = result.uploadBytes,
+                                        downloadBytes = result.downloadBytes,
+                                        totalBytes = result.totalBytes,
+                                        expireSeconds = result.expireSeconds,
+                                        lastUpdated = System.currentTimeMillis(),
+                                    ),
+                                    regenerate = regenerate,
+                                )
+                            ) {
+                                restoreRawBodyIfCurrent(id, commit.rawBody, previousRaw)
+                                return@withContext RefreshCommit(str(com.interstellar.proxy.R.string.repo_raw_write_failed), null)
+                            }
                             str(com.interstellar.proxy.R.string.repo_refreshed, sub.name, parsed.nodes.size)
                         }
 
-                        com.interstellar.proxy.data.subscription.SubscriptionParser.Result.Empty ->
-                            // e.g. a full sing-box profile: no nodes to extract, but the
-                            // raw body is retained and usable in raw mode. Quota still
-                            // belongs to this subscription, so keep it fresh too.
-                            if (format != null) {
-                                committedContent = SubscriptionContent(sub.nodes, format)
-                                upsert(
+                        com.interstellar.proxy.data.subscription.SubscriptionParser.Result.Empty -> {
+                            // Reached only for a raw sing-box profile: no nodes to extract,
+                            // but the retained body is what the core will run.
+                            committedContent = SubscriptionContent(sub.nodes, format)
+                            if (
+                                !upsert(
                                     sub.copy(
                                         configFormat = format,
                                         uploadBytes = result.uploadBytes,
@@ -614,35 +697,18 @@ object SubscriptionRepository {
                                     ),
                                     regenerate = regenerate,
                                 )
-                                str(
-                                    com.interstellar.proxy.R.string.repo_refreshed_raw,
-                                    sub.name,
-                                    com.interstellar.proxy.data.subscription.RawConfigFormat.from(format)?.label ?: "",
-                                )
-                            } else {
-                                str(com.interstellar.proxy.R.string.repo_refresh_unparsable, sub.name)
+                            ) {
+                                restoreRawBodyIfCurrent(id, commit.rawBody, previousRaw)
+                                return@withContext RefreshCommit(str(com.interstellar.proxy.R.string.repo_raw_write_failed), null)
                             }
-
-                        is com.interstellar.proxy.data.subscription.SubscriptionParser.Result.TooManyNodes ->
-                            // A truncated node list would look like a successful refresh
-                            // while silently dropping most of the subscription. Keep the
-                            // previous nodes and report the hard limit instead.
-                            str(com.interstellar.proxy.R.string.repo_too_many_nodes, parsed.limit)
-
-                        is com.interstellar.proxy.data.subscription.SubscriptionParser.Result.Unsupported -> {
-                            // A JSON core config this app cannot run (Xray, no TUN
-                            // inbound, or an unsupported protocol). Say so instead of
-                            // converting it into a node list.
-                            val reason = parsed.reason
-                            when {
-                                reason == "xray" -> str(com.interstellar.proxy.R.string.repo_unsupported_xray)
-                                reason.startsWith("unsupported_protocol:") -> str(
-                                    com.interstellar.proxy.R.string.repo_unsupported_protocol,
-                                    reason.substringAfter(':'),
-                                )
-                                else -> str(com.interstellar.proxy.R.string.repo_unsupported_no_tun)
-                            }
+                            str(
+                                com.interstellar.proxy.R.string.repo_refreshed_raw,
+                                sub.name,
+                                com.interstellar.proxy.data.subscription.RawConfigFormat.from(format)?.label ?: "",
+                            )
                         }
+
+                        else -> error("parsed error result reached the commit branch")
                     }
                     RefreshCommit(message, commit.rawBody, committed = true, committedContent = committedContent)
                 }
@@ -650,6 +716,15 @@ object SubscriptionRepository {
         } catch (e: Exception) {
             RefreshCommit(str(com.interstellar.proxy.R.string.repo_refresh_failed, sub.name, e.message ?: ""), null)
         }
+    }
+
+    private fun unsupportedConfigMessage(reason: String): String = when {
+        reason == "xray" -> str(com.interstellar.proxy.R.string.repo_unsupported_xray)
+        reason.startsWith("unsupported_protocol:") -> str(
+            com.interstellar.proxy.R.string.repo_unsupported_protocol,
+            reason.substringAfter(':'),
+        )
+        else -> str(com.interstellar.proxy.R.string.repo_unsupported_no_tun)
     }
 
     /**
