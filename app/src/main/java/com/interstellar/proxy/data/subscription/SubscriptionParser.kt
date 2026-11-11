@@ -1,6 +1,5 @@
 package com.interstellar.proxy.data.subscription
 
-import android.util.Base64
 import com.interstellar.proxy.data.model.ProxyNode
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -58,6 +57,10 @@ object SubscriptionParser {
         val decoded = decodeBase64(trimmed)
         if (decoded != null) {
             if (decoded.trimStart().startsWith("{")) {
+                // Base64 must not be a way around the JSON shape checks: an Xray or
+                // incomplete config wrapped in base64 has to fail exactly like the
+                // same bytes pasted directly.
+                jsonUnsupportedReason(decoded)?.let { return Result.Unsupported(it) }
                 extractNodesFromSingbox(decoded, subscriptionId)?.let {
                     if (it.isNotEmpty()) return resultOf(it)
                 }
@@ -141,29 +144,11 @@ object SubscriptionParser {
         ClashParser.isClashConfig(text) || text.contains("proxies:")
     }.getOrDefault(false)
 
-    private fun decodeBase64(text: String): String? {
-        val cleaned = text.lineSequence()
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .joinToString("")
-        if (cleaned.isEmpty()) return null
-        val normalized = cleaned.replace("-", "+").replace("_", "/")
-        val padded = when (normalized.length % 4) {
-            2 -> "$normalized=="
-            3 -> "$normalized="
-            else -> normalized
-        }
-        return runCatching {
-            val bytes = Base64.decode(padded, Base64.NO_WRAP)
-            val decoded = String(bytes, Charsets.UTF_8)
-            // sanity: decoded content should be printable
-            if (decoded.count { it.code in 32..126 || it == '\n' || it == '\r' } < decoded.length * 9 / 10) {
-                null
-            } else {
-                decoded
-            }
-        }.getOrNull()
-    }
+    private fun decodeBase64(text: String): String? =
+        // One decoder shared with RawConfigDetector: android.util.Base64 is a
+        // stub in local JVM tests (returnDefaultValues), which made every
+        // base64-wrapped JSON look unparsable under test while working on device.
+        SubscriptionParserDecoded.base64Decode(text)
 
     /**
      * Outbound types this client can turn into a node. Hysteria 1 and a bare

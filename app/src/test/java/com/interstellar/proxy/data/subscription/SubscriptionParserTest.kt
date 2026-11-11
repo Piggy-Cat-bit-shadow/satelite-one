@@ -70,4 +70,39 @@ class SubscriptionParserTest {
         check(result is SubscriptionParser.Result.Unsupported) { "expected Unsupported, got $result" }
         check((result as SubscriptionParser.Result.Unsupported).reason == "xray")
     }
+
+    @Test
+    fun `base64-wrapped xray is rejected exactly like plain xray`() {
+        val json = """
+            {"inbounds":[{"protocol":"socks","port":1080}],
+             "outbounds":[{"tag":"proxy","protocol":"vless","settings":{}}]}
+        """.trimIndent()
+        val b64 = java.util.Base64.getEncoder().encodeToString(json.toByteArray())
+        val result = SubscriptionParser.parse(b64, "sub")
+        check(result is SubscriptionParser.Result.Unsupported) { "expected Unsupported, got $result" }
+        check((result as SubscriptionParser.Result.Unsupported).reason == "xray")
+    }
+
+    @Test
+    fun `base64-wrapped config without tun is rejected exactly like plain json`() {
+        val json = """
+            {"inbounds":[{"type":"mixed","tag":"mixed-in","listen_port":2080}],
+             "outbounds":[{"type":"vmess","tag":"hk","server":"s.example.com","server_port":443,"uuid":"u"}]}
+        """.trimIndent()
+        val b64 = java.util.Base64.getEncoder().encodeToString(json.toByteArray())
+        val result = SubscriptionParser.parse(b64, "sub")
+        check(result is SubscriptionParser.Result.Unsupported) { "expected Unsupported, got $result" }
+        check((result as SubscriptionParser.Result.Unsupported).reason == "no_tun")
+    }
+
+    @Test
+    fun `base64-wrapped unsupported protocol is rejected exactly like plain json`() {
+        val json = """
+            {"outbounds":[{"type":"hysteria","tag":"hy1","server":"h.example.com","server_port":443}]}
+        """.trimIndent()
+        val b64 = java.util.Base64.getEncoder().encodeToString(json.toByteArray())
+        val result = SubscriptionParser.parse(b64, "sub")
+        check(result is SubscriptionParser.Result.Unsupported) { "expected Unsupported, got $result" }
+        check((result as SubscriptionParser.Result.Unsupported).reason == "unsupported_protocol:hysteria")
+    }
 }
