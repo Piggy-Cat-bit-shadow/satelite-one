@@ -81,6 +81,10 @@
     <string name="repo_no_nodes">订阅中没有可用节点</string>
     <string name="repo_config_check_failed">配置校验失败: %1$s</string>
     <string name="repo_raw_check_failed">原始配置校验失败:%1$s</string>
+    <string name="repo_raw_unverified">原始配置未经验证，不会作为该订阅的配置启动</string>
+    <string name="repo_raw_write_failed">原始配置无法写入磁盘</string>
+    <string name="repo_raw_delete_failed">旧的原始配置无法删除</string>
+    <string name="status_unverified_config">当前配置未经验证，已拒绝启动</string>
     <string name="repo_refreshed">已刷新 %1$s:%2$d 个节点</string>
     <string name="repo_refreshed_raw">已刷新 %1$s:%2$s 配置已保留</string>
     <string name="repo_refresh_unparsable">刷新后内容无法解析:%1$s</string>

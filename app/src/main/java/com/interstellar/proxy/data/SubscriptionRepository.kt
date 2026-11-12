@@ -10,6 +10,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
+import java.io.FileOutputStream
 import java.util.UUID
 
 /**
@@ -107,7 +108,7 @@ object SubscriptionRepository {
 
     /** Puts a previously retained body back (used to undo a candidate the core refused at runtime). */
     fun restoreRawBody(subscriptionId: String, body: String?) {
-        synchronized(rawBodyLock) { writeRawBodyLocked(subscriptionId, body) }
+        synchronized(rawBodyLock) { restoreRawBodyLocked(subscriptionId, body) }
     }
 
     /**
@@ -117,22 +118,87 @@ object SubscriptionRepository {
      * comparison and the write share [rawBodyLock] with [commitFetchedBody], so a commit that lands
      * between them cannot be rolled back by the older attempt.
      *
-     * @return true when the older body was restored, false when a newer body owns the file.
+     * @return true when the older body was restored AND the verification record was updated, false
+     * when a newer body owns the file or the write could not be made durable.
      */
     fun restoreRawBodyIfCurrent(subscriptionId: String, currentBody: String?, previousBody: String?): Boolean =
         synchronized(rawBodyLock) {
             if (readRawBodyLocked(subscriptionId) != currentBody) return@synchronized false
-            writeRawBodyLocked(subscriptionId, previousBody)
-            true
+            restoreRawBodyLocked(subscriptionId, previousBody)
         }
 
-    private fun writeRawBodyLocked(subscriptionId: String, body: String?) {
+    /**
+     * Replays a known commit: the bytes are written through a temp file, fsynced and renamed, and
+     * the verification record names exactly those bytes again. A write failure is a false return,
+     * never a silent success - a recovery that claims to have restored a body it did not write is
+     * how an unverified raw becomes startable.
+     */
+    private fun restoreRawBodyLocked(subscriptionId: String, body: String?): Boolean {
+        if (!writeRawBodyLocked(subscriptionId, body)) {
+            RawVerificationStore.markUnverified(
+                subscriptionId,
+                body?.let { ConfigStore.sha256(it) },
+                "the previous configuration could not be written back",
+            )
+            return false
+        }
+        if (body == null) {
+            RawVerificationStore.remove(subscriptionId)
+        } else {
+            val format = get(subscriptionId)?.configFormat
+            RawVerificationStore.markVerified(subscriptionId, ConfigStore.sha256(body), format)
+        }
+        return true
+    }
+
+    /**
+     * Writes the retained body atomically: temp file, fsync, checked rename.
+     *
+     * `writeText` is not atomic and its failure used to be ignored, so an accepted commit could be
+     * one the disk never saw. The rename is the commit point; a false return means the previous
+     * body is still what a restart reads.
+     */
+    private fun writeRawBodyLocked(subscriptionId: String, body: String?): Boolean {
         val file = rawFileOf(subscriptionId)
         if (body == null) {
-            runCatching { file.delete() }
-        } else {
-            runCatching { file.writeText(body) }
+            return deleteRawBodyLocked(subscriptionId)
         }
+        file.parentFile?.mkdirs()
+        val temp = File(file.parentFile, "${file.name}.tmp")
+        return runCatching {
+            FileOutputStream(temp).use { stream ->
+                stream.write(body.toByteArray(Charsets.UTF_8))
+                stream.flush()
+                stream.fd.sync()
+            }
+            if (!temp.renameTo(file)) {
+                temp.delete()
+                false
+            } else {
+                true
+            }
+        }.getOrDefault(false)
+    }
+
+    /**
+     * Deletes the retained body, and records a tombstone when the delete did not happen.
+     *
+     * A swallowed delete failure is how a body a recovery was supposed to remove stays on disk and
+     * is later applied as the old profile's configuration.
+     */
+    private fun deleteRawBodyLocked(subscriptionId: String): Boolean {
+        val file = rawFileOf(subscriptionId)
+        val deleted = runCatching { !file.exists() || file.delete() }.getOrDefault(false)
+        if (deleted) {
+            RawVerificationStore.remove(subscriptionId)
+        } else {
+            RawVerificationStore.markUnverified(
+                subscriptionId,
+                runCatching { file.takeIf { it.isFile }?.readText() }.getOrNull()?.let { ConfigStore.sha256(it) },
+                "the retained body could not be deleted",
+            )
+        }
+        return deleted
     }
 
     /** Outcome of deciding what to do with a downloaded subscription body. */
@@ -164,7 +230,11 @@ object SubscriptionRepository {
     fun commitFetchedBody(subscriptionId: String, body: String): BodyCommit = synchronized(rawBodyLock) {
         val detected = com.interstellar.proxy.data.subscription.RawConfigDetector.detect(body)
         if (detected == null) {
-            rawFileOf(subscriptionId).delete()
+            if (!deleteRawBodyLocked(subscriptionId)) {
+                return@synchronized BodyCommit.Refused(
+                    str(com.interstellar.proxy.R.string.repo_raw_delete_failed),
+                )
+            }
             return@synchronized BodyCommit.Accepted(null, null)
         }
         if (detected == com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX) {
@@ -174,7 +244,13 @@ object SubscriptionRepository {
                 return@synchronized BodyCommit.Refused(str(com.interstellar.proxy.R.string.repo_raw_check_failed, failure.message ?: ""))
             }
         }
-        runCatching { rawFileOf(subscriptionId).writeText(body) }
+        // The bytes land first, durably. The record says PENDING: the metadata that describes them
+        // is saved by the caller, and only that save turns the pair into a verified profile.
+        if (!writeRawBodyLocked(subscriptionId, body)) {
+            RawVerificationStore.markUnverified(subscriptionId, ConfigStore.sha256(body), "the fetched body could not be written")
+            return@synchronized BodyCommit.Refused(str(com.interstellar.proxy.R.string.repo_raw_write_failed))
+        }
+        RawVerificationStore.markPending(subscriptionId, ConfigStore.sha256(body), detected.wire)
         BodyCommit.Accepted(detected.wire, body)
     }
 
@@ -221,12 +297,18 @@ object SubscriptionRepository {
         return list
     }
 
+    /**
+     * Writes the metadata index, durably enough that callers can act on the result.
+     *
+     * @return true when the file was replaced. `writeText` used to be wrapped in `runCatching` and
+     * the outcome discarded, so a commit could report success while the subscription metadata
+     * still described the previous body - the exact state that makes a raw untrustworthy.
+     */
     @Synchronized
-    fun save() {
-        runCatching {
-            indexFile.writeText(json.encodeToString(subscriptions.toList()))
-        }
-    }
+    fun save(): Boolean = runCatching {
+        indexFile.writeText(json.encodeToString(subscriptions.toList()))
+        true
+    }.getOrDefault(false)
 
     fun get(id: String): Subscription? = subscriptions.find { it.id == id }
 
@@ -245,7 +327,7 @@ object SubscriptionRepository {
 
     @Synchronized
     fun upsert(subscription: Subscription, regenerate: Boolean = true) {
-        val shouldRegenerate = synchronized(contentLock) {
+        val metadataSaved = synchronized(contentLock) {
             val index = subscriptions.indexOfFirst { it.id == subscription.id }
             if (index >= 0) {
                 subscriptions[index] = subscription
@@ -254,12 +336,45 @@ object SubscriptionRepository {
             }
             if (activeSubscriptionId.isBlank()) activeSubscriptionId = subscription.id
             save()
-            regenerate &&
-                affectsActivePool(subscription.id, activeSubscriptionId, Settings.mixEnabled, Settings.mixSubscriptionIds)
         }
-        if (shouldRegenerate) {
+        // The pair becomes trustworthy only now: the bytes were written by commitFetchedBody as
+        // PENDING, and this save is the metadata they were waiting for. A failed save leaves a
+        // tombstone instead of a profile that looks verified but is not.
+        recordRawVerification(subscription, metadataSaved)
+        if (regenerate &&
+            affectsActivePool(subscription.id, activeSubscriptionId, Settings.mixEnabled, Settings.mixSubscriptionIds)
+        ) {
             regenerateActiveConfig()
         }
+    }
+
+    /**
+     * Ties the verification record to what the metadata now says.
+     *
+     * Three outcomes: the raw and its metadata agree (VERIFIED), there is no raw body (the record is
+     * dropped), or they do not agree (a tombstone the apply gate refuses).
+     */
+    private fun recordRawVerification(subscription: Subscription, metadataSaved: Boolean) {
+        val rawBody = synchronized(rawBodyLock) { readRawBodyLocked(subscription.id) }
+        val rawSha = rawBody?.let { ConfigStore.sha256(it) }
+        if (!metadataSaved) {
+            RawVerificationStore.markUnverified(subscription.id, rawSha, "the subscription metadata could not be saved")
+            return
+        }
+        if (rawBody == null) {
+            RawVerificationStore.remove(subscription.id)
+            return
+        }
+        val format = com.interstellar.proxy.data.subscription.RawConfigFormat.from(subscription.configFormat)
+        if (format != com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX) {
+            RawVerificationStore.markUnverified(
+                subscription.id,
+                rawSha,
+                "the subscription no longer describes a raw configuration",
+            )
+            return
+        }
+        RawVerificationStore.markVerifiedIfCurrent(subscription.id, ConfigStore.sha256(rawBody), format.wire)
     }
 
     @Synchronized
@@ -267,8 +382,10 @@ object SubscriptionRepository {
         val empty = synchronized(contentLock) {
             subscriptions.removeAll { it.id == id }
             // Delete under the same lock as the raw CAS: otherwise a restore that just checked
-            // the old body could have the file removed between its check and write.
-            synchronized(rawBodyLock) { rawFileOf(id).delete() }
+            // the old body could have the file removed between its check and write. The verification
+            // record moves with the body - deleting the file without its record leaves the next
+            // profile that reuses the id trusting a body nobody wrote.
+            synchronized(rawBodyLock) { deleteRawBodyLocked(id) }
             if (activeSubscriptionId == id) {
                 activeSubscriptionId = subscriptions.firstOrNull()?.id ?: ""
             }
@@ -403,7 +520,7 @@ object SubscriptionRepository {
             when (val rawApplied = applyRawConfigIfMatching(activeSub)) {
                 is RawApply.Applied -> {
                     lastConfigError = null
-                    if (commit) ConfigStore.writeActiveConfig(rawApplied.content, activeSub.id)
+                    if (commit) ConfigStore.writeActiveConfig(rawApplied.content, activeSub.id, verified = true)
                     return ActiveConfigBuild(rawApplied.content, activeSub.id, null, raw = true)
                 }
                 // A raw body the core refused is a terminal answer for this regeneration: falling
@@ -415,6 +532,10 @@ object SubscriptionRepository {
                     val lastGoodOwner = ConfigStore.readActiveConfigOwner()
                     lastConfigError = rawApplied.error
                     return if (lastGood != null && lastGoodOwner == activeSub.id) {
+                        // It may keep serving the RUNNING Box, but the bytes now have no verified
+                        // raw behind them. Marking them unstartable is what stops a cold start
+                        // (or the quick-settings tile) from presenting them as a checked profile.
+                        if (commit) ConfigStore.markActiveVerification(false)
                         ActiveConfigBuild(lastGood, activeSub.id, rawApplied.error, raw = true)
                     } else {
                         ActiveConfigBuild(null, null, rawApplied.error, raw = true)
@@ -452,7 +573,7 @@ object SubscriptionRepository {
         return try {
             Libbox.checkConfig(content)
             lastConfigError = null
-            if (commit) ConfigStore.writeActiveConfig(content, activeSub?.id ?: activeId.takeIf { it.isNotBlank() })
+            if (commit) ConfigStore.writeActiveConfig(content, activeSub?.id ?: activeId.takeIf { it.isNotBlank() }, verified = true)
             ActiveConfigBuild(content, activeSub?.id ?: activeId.takeIf { it.isNotBlank() }, null, raw = false)
         } catch (e: Exception) {
             val error = str(com.interstellar.proxy.R.string.repo_config_check_failed, e.message ?: "")
@@ -494,6 +615,14 @@ object SubscriptionRepository {
         // longer ships.
         if (format != com.interstellar.proxy.data.subscription.RawConfigFormat.SINGBOX) return RawApply.NotRaw
         val raw = readRawBody(sub.id)?.takeIf { it.isNotBlank() } ?: return RawApply.NotRaw
+        // "Structurally valid right now" is not "the body that was committed for this profile".
+        // The durable record answers the second question; without a VERIFIED digest the raw is a
+        // document nobody can attribute, and applying it is how an interrupted commit or a failed
+        // recovery becomes the configuration that starts on the next launch.
+        if (!RawVerificationStore.isVerified(sub.id, ConfigStore.sha256(raw))) {
+            android.util.Log.e(TAG, "refusing raw body for ${sub.id}: no verified digest matches the file")
+            return RawApply.Refused(str(com.interstellar.proxy.R.string.repo_raw_unverified))
+        }
         return try {
             Libbox.checkConfig(raw)
             RawApply.Applied(raw)
