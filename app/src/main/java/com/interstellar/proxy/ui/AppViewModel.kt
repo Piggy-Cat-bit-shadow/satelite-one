@@ -18,6 +18,7 @@ import com.interstellar.proxy.data.CoreRuntime
 import com.interstellar.proxy.data.ProviderRefresh
 import com.interstellar.proxy.data.ProviderRefreshSummary
 import com.interstellar.proxy.data.ReloadRequest
+import com.interstellar.proxy.data.SelectOutboundReadBack
 import com.interstellar.proxy.data.Settings
 import com.interstellar.proxy.data.StartupRecovery
 import com.interstellar.proxy.data.SubscriptionRepository
@@ -35,6 +36,8 @@ import com.interstellar.proxy.core.CoreGroup
 import com.interstellar.proxy.core.CoreGroupItem
 import com.interstellar.proxy.utils.CommandClient
 import com.interstellar.proxy.utils.CommandTarget
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -45,6 +48,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
 import com.interstellar.proxy.data.subscription.str
 
 data class SpeedState(
@@ -1612,11 +1617,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _selectedOutboundTag.value = itemTag
         viewModelScope.launch(Dispatchers.IO) {
             if (_status.value == Status.Started) {
-                runCatching {
-                    CommandTarget.standaloneClient().selectOutbound(groupTag, itemTag)
-                }.onFailure {
-                    _message.value = str(com.interstellar.proxy.R.string.vm_switch_failed, it.message ?: "")
-                }
+                selectNodeWithIdentity(groupTag, itemTag)
             } else {
                 // stopped: this rewrite bakes the pick into the selector's `default` for a
                 // *generated* config. A *raw* user config is passed through untouched, so
@@ -1629,6 +1630,76 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     _staticGroups.value = parseSingboxGroups(config)
                 }
                 _selectedOutboundTag.value = Settings.selectedOutboundTag
+            }
+        }
+    }
+
+    /** Numbers selection attempts process-wide so two clients cannot share an identity. */
+    private val selectionRequestCounter = AtomicLong(0)
+
+    /** The latest attempt per group: an answer for a replaced attempt must change nothing. */
+    private val latestSelectionRequest = ConcurrentHashMap<String, Long>()
+
+    /** The revision the kernel reported for a group, used as the next expectedRevision. */
+    private val selectionRevisions = ConcurrentHashMap<String, Long>()
+
+    private val selectionJson = Json { ignoreUnknownKeys = true }
+
+    /**
+     * Sends one selection with its request identity and applies only the read-back that still owns
+     * the row.
+     *
+     * `selectOutbound(tag, tag)` returned nothing, so the UI could not tell its own confirmation
+     * from a late answer to a replaced attempt, and it trusted the tag it had just written. The
+     * kernel now names the attempt, the member the group actually holds and the revision after the
+     * selection; `supported = false` (old core) is a capability answer and leaves the group stream
+     * as the authority instead of inventing a revision.
+     */
+    private fun selectNodeWithIdentity(
+        groupTag: String,
+        itemTag: String,
+        onApplied: ((SelectOutboundReadBack) -> Unit)? = null,
+    ) {
+        val requestId = selectionRequestCounter.incrementAndGet()
+        latestSelectionRequest[groupTag] = requestId
+        val expectedRevision = selectionRevisions[groupTag] ?: 0L
+        viewModelScope.launch(Dispatchers.IO) {
+            val box = runCatching {
+                CommandTarget.standaloneClient()
+                    .selectOutboundWithRequest(groupTag, itemTag, requestId, expectedRevision)
+            }.getOrElse { failure ->
+                withContext(Dispatchers.Main) {
+                    if (latestSelectionRequest[groupTag] == requestId) {
+                        _message.value = str(
+                            com.interstellar.proxy.R.string.vm_switch_failed,
+                            failure.message ?: "",
+                        )
+                    }
+                }
+                return@launch
+            }
+            val document = box?.value ?: ""
+            val readBack = runCatching {
+                selectionJson.decodeFromString<SelectOutboundReadBack>(document)
+            }.getOrNull()
+            withContext(Dispatchers.Main) {
+                if (latestSelectionRequest[groupTag] != requestId) {
+                    // A newer tap owns this group; applying this answer is the defect the request
+                    // identity exists to remove.
+                    return@withContext
+                }
+                val appliedReadBack = readBack ?: return@withContext
+                if (!appliedReadBack.supported || appliedReadBack.unconfirmed) {
+                    return@withContext
+                }
+                selectionRevisions[groupTag] = appliedReadBack.appliedRevision
+                appliedReadBack.appliedOutboundTag?.takeIf { it.isNotBlank() }?.let { applied ->
+                    // The row follows what the group HOLDS, not what was requested: a hard switch
+                    // or a refusing group can end on another member.
+                    Settings.selectedOutboundTag = applied
+                    _selectedOutboundTag.value = applied
+                }
+                onApplied?.invoke(appliedReadBack)
             }
         }
     }
@@ -1661,21 +1732,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             _groups.value,
         ) ?: return
         selectionRestoreAttempted = true
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                CommandTarget.standaloneClient().selectOutbound(pending.first, pending.second)
-            }.onSuccess {
-                // Positive confirmation. Until this line existed the restore was observable only
-                // by its ABSENCE (no vm_switch_failed), so "the stored pick reached the core" and
-                // "nothing was ever sent" looked identical in the logs - which is exactly the
-                // ambiguity that made this behaviour hard to trust.
-                com.interstellar.proxy.core.AppLog.log(
-                    "ui",
-                    str(com.interstellar.proxy.R.string.vm_switch_restored, pending.second, pending.first),
-                )
-            }.onFailure {
-                _message.value = str(com.interstellar.proxy.R.string.vm_switch_failed, it.message ?: "")
-            }
+        selectNodeWithIdentity(pending.first, pending.second) { readBack ->
+            // Positive confirmation. Until this line existed the restore was observable only by
+            // its ABSENCE (no vm_switch_failed), so "the stored pick reached the core" and
+            // "nothing was ever sent" looked identical in the logs - which is exactly the
+            // ambiguity that made this behaviour hard to trust.
+            com.interstellar.proxy.core.AppLog.log(
+                "ui",
+                str(
+                    com.interstellar.proxy.R.string.vm_switch_restored,
+                    readBack.appliedOutboundTag ?: pending.second,
+                    pending.first,
+                ),
+            )
         }
     }
 

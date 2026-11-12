@@ -57,6 +57,14 @@ object ConfigStore {
         val ownerSubscriptionId: String? = null,
         val revision: Long = 0,
         val sha256: String = "",
+        /**
+         * Whether these bytes were verified at the moment they were written.
+         *
+         * `false` means the store knowingly wrote bytes it cannot attest (the raw they came from is
+         * no longer verified). `null` is a record from an older build; the start gate treats it as
+         * legacy and keeps the old behaviour rather than bricking an upgrade.
+         */
+        val verified: Boolean? = null,
     )
 
     /** Config bytes and the identity of exactly those bytes. */
@@ -120,17 +128,25 @@ object ConfigStore {
      * @return the revision the store is now at.
      */
     @Synchronized
-    fun writeActiveConfig(content: String, ownerSubscriptionId: String? = null): Long {
+    fun writeActiveConfig(content: String, ownerSubscriptionId: String? = null, verified: Boolean = true): Long {
         val previous = readMeta()
         val sameBytes = previous.sha256.isNotEmpty() && previous.sha256 == sha256(content)
         val sameOwner = ownerSubscriptionId == null || ownerSubscriptionId == previous.ownerSubscriptionId
         if (sameBytes && sameOwner && activeFile.isFile) {
+            // The bytes are unchanged, but the verification verdict may have moved (a recovery that
+            // failed after the write, a raw that was re-verified). Recording it is not a content
+            // commit, so the revision stays where it is.
+            if (previous.verified != verified) {
+                val next = previous.copy(verified = verified)
+                meta = next
+                runCatching { metaFile.writeText(json.encodeToString(next)) }
+            }
             return previous.revision
         }
         val owner = ownerSubscriptionId ?: previous.ownerSubscriptionId
         activeFile.parentFile?.mkdirs()
         activeFile.writeText(content)
-        val next = Meta(ownerSubscriptionId = owner, revision = previous.revision + 1, sha256 = sha256(content))
+        val next = Meta(ownerSubscriptionId = owner, revision = previous.revision + 1, sha256 = sha256(content), verified = verified)
         meta = next
         runCatching { metaFile.writeText(json.encodeToString(next)) }
         return next.revision
@@ -147,7 +163,12 @@ object ConfigStore {
      * @return the restoring revision, or null when a newer write owns the store (nothing written).
      */
     @Synchronized
-    fun restoreIfRevision(expectedRevision: Long, content: String, ownerSubscriptionId: String?): Long? {
+    fun restoreIfRevision(
+        expectedRevision: Long,
+        content: String,
+        ownerSubscriptionId: String?,
+        verified: Boolean = true,
+    ): Long? {
         val previous = readMeta()
         if (previous.revision != expectedRevision) return null
         if (!activeFile.isFile) return null
@@ -155,11 +176,30 @@ object ConfigStore {
             ownerSubscriptionId = ownerSubscriptionId,
             revision = previous.revision + 1,
             sha256 = sha256(content),
+            verified = verified,
         )
         activeFile.writeText(content)
         meta = next
         runCatching { metaFile.writeText(json.encodeToString(next)) }
         return next.revision
+    }
+
+    /**
+     * Records whether the bytes already on disk are verified, without touching them or their
+     * revision.
+     *
+     * A refused raw is the case this exists for: the previous config may still be serving, but if
+     * the raw it came from can no longer be verified, the next cold start must not present those
+     * bytes as a checked configuration. The bytes stay for the running Box; the marker makes them
+     * unstartable until the repository regenerates from verified inputs.
+     */
+    @Synchronized
+    fun markActiveVerification(verified: Boolean) {
+        val previous = readMeta()
+        if (previous.verified == verified) return
+        val next = previous.copy(verified = verified)
+        meta = next
+        runCatching { metaFile.writeText(json.encodeToString(next)) }
     }
 
     /** Drop the active config (all subscriptions removed — nothing to run). */    @Synchronized

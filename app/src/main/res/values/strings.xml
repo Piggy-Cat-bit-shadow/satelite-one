@@ -89,6 +89,10 @@
     <string name="repo_raw_restore_failed">配置保存失败,旧 raw 恢复失败;已移除未验证的新 raw</string>
     <string name="repo_raw_restore_stuck">配置保存失败,且 raw 文件无法恢复或移除;已阻止使用该 raw,请检查存储空间</string>
     <string name="repo_too_many_nodes">节点数超过上限(%1$d),请缩小订阅</string>
+    <string name="repo_raw_body_write_failed">原始配置无法写入磁盘</string>
+    <string name="repo_raw_delete_failed">旧的原始配置无法删除</string>
+    <string name="repo_raw_unverified">原始配置未经验证，不会作为该订阅的配置启动</string>
+    <string name="status_unverified_config">当前配置未经验证，已拒绝启动</string>
     <string name="repo_refreshed">已刷新 %1$s:%2$d 个节点</string>
     <string name="repo_refreshed_raw">已刷新 %1$s:%2$s 配置已保留</string>
     <string name="repo_refresh_unparsable">刷新后内容无法解析:%1$s</string>

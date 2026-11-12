@@ -377,6 +377,15 @@ class BoxService(private val service: Service, private val platformInterface: Pl
                 stopAndAlert(Alert.EmptyConfiguration)
                 return
             }
+            // The bytes on disk were written while their retained raw could not be attested (a
+            // refused raw, a failed recovery). Starting them would present a configuration nobody
+            // verified - the quick-settings tile reaches this method without ever passing the
+            // repository's regeneration, so the gate has to live here too.
+            if (snapshot.meta.verified == false) {
+                CoreRuntime.onApplyFailed("unverified configuration")
+                stopAndAlert(Alert.CreateService, service.getString(R.string.status_unverified_config))
+                return
+            }
 
             DefaultNetworkMonitor.start(this)
 
@@ -488,6 +497,16 @@ class BoxService(private val service: Service, private val platformInterface: Pl
             )
             CoreRuntime.onApplyFailed("empty configuration")
             stopAndAlert(Alert.EmptyConfiguration)
+            return
+        }
+        if (snapshot.meta.verified == false) {
+            // Same gate as `startService`: a reload must not put unverified bytes in front of the
+            // running Box either.
+            recordReload(
+                ReloadReceipt(requestId ?: 0L, false, "unverified configuration", revision, CoreRuntime.engineGeneration, System.currentTimeMillis()),
+            )
+            CoreRuntime.onApplyFailed("unverified configuration")
+            stopAndAlert(Alert.CreateService, service.getString(R.string.status_unverified_config))
             return
         }
         try {
