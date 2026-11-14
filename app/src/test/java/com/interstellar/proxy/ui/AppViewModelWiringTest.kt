@@ -564,7 +564,7 @@ class AppViewModelWiringTest {
     fun `a partly applied provider refresh is reported before the plain summary`() {
         val body = code(bodyOf("private fun providerMessage("))
         val partial = body.indexOf("partlyApplied(")
-        val summary = body.indexOf("vm_provider_summary")
+        val summary = body.indexOf("vm_provider_prefix")
         assertTrue(
             "`providerMessage()` no longer checks whether the refresh was only partly applied",
             partial >= 0,

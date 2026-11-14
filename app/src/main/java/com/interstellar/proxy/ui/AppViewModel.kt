@@ -1226,7 +1226,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** What happened to the active config after a manual subscription update. */
-    private enum class ActiveConfigOutcome { Unchanged, Reloaded, SavedOnly, Failed, Restored, Superseded }
+    private enum class ActiveConfigOutcome { Unchanged, Reloaded, SavedOnly, Failed, Unconfirmed, Restored, Superseded }
 
     /** What the core said about the revision this client asked it to apply. */
     private sealed interface ReloadOutcome {
@@ -1444,7 +1444,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         }
 
                     ReloadOutcome.Superseded -> ActiveConfigOutcome.Superseded
-                    is ReloadOutcome.Unconfirmed -> ActiveConfigOutcome.Failed
+                    // "Not confirmed" is not "failed": the RPC returned but nothing proves which
+                    // document is running. Saying the reload failed would claim evidence we do not
+                    // have, and saying it applied would claim success we do not have either.
+                    is ReloadOutcome.Unconfirmed -> ActiveConfigOutcome.Unconfirmed
                 }
             }
         }
@@ -1472,10 +1475,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             str(com.interstellar.proxy.R.string.vm_config_unchanged) to UiToast.Kind.Success
         ActiveConfigOutcome.Reloaded ->
             str(com.interstellar.proxy.R.string.vm_config_reloaded) to UiToast.Kind.Success
+        // Saved is a real result, but it is not "applied": keeping it out of the success tone is
+        // what stops a stopped core from looking like a completed update.
         ActiveConfigOutcome.SavedOnly ->
-            str(com.interstellar.proxy.R.string.vm_config_saved) to UiToast.Kind.Success
+            str(com.interstellar.proxy.R.string.vm_config_saved) to UiToast.Kind.Error
         ActiveConfigOutcome.Failed ->
             str(com.interstellar.proxy.R.string.vm_config_apply_failed) to UiToast.Kind.Error
+        ActiveConfigOutcome.Unconfirmed ->
+            str(com.interstellar.proxy.R.string.vm_config_apply_unconfirmed) to UiToast.Kind.Error
         ActiveConfigOutcome.Restored ->
             str(com.interstellar.proxy.R.string.vm_config_apply_restored) to UiToast.Kind.Error
         ActiveConfigOutcome.Superseded ->
@@ -1499,24 +1506,63 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
         // A document the live graph refused comes back as `published` with pending tags and
         // `restartRequired`; counting only `published` would present it as a clean success.
-        if (ProviderRefresh.partlyApplied(counts)) {
-            return str(
-                com.interstellar.proxy.R.string.vm_provider_partial,
-                counts.published,
-                counts.unchanged,
-                counts.failed,
-                counts.skipped,
-                counts.pendingTags,
-                counts.restartRequired,
-            ) to UiToast.Kind.Error
+        val partial = ProviderRefresh.partlyApplied(counts)
+        val unknown = counts.total -
+            (counts.published + counts.unchanged + counts.failed + counts.skipped + counts.busy)
+        // Only meaningful counts: "0 unchanged, 0 failed, 0 skipped" is noise, not a result.
+        val parts = mutableListOf<String>()
+        if (counts.published > 0) {
+            parts += str(com.interstellar.proxy.R.string.vm_provider_count_published, counts.published)
         }
-        return str(
-            com.interstellar.proxy.R.string.vm_provider_summary,
-            counts.published,
-            counts.unchanged,
-            counts.failed,
-            counts.skipped,
-        ) to if (counts.failed > 0 || counts.busy > 0) UiToast.Kind.Error else UiToast.Kind.Success
+        if (counts.unchanged > 0) {
+            parts += str(com.interstellar.proxy.R.string.vm_provider_count_unchanged, counts.unchanged)
+        }
+        if (counts.failed > 0) {
+            parts += str(com.interstellar.proxy.R.string.vm_provider_count_failed, counts.failed)
+        }
+        if (counts.skipped > 0) {
+            parts += str(com.interstellar.proxy.R.string.vm_provider_count_skipped, counts.skipped)
+        }
+        if (counts.busy > 0) {
+            parts += str(com.interstellar.proxy.R.string.vm_provider_count_busy, counts.busy)
+        }
+        if (unknown > 0) {
+            parts += str(com.interstellar.proxy.R.string.vm_provider_count_unknown, unknown)
+        }
+        if (partial) {
+            if (counts.pendingTags > 0) {
+                parts += str(com.interstellar.proxy.R.string.vm_provider_count_pending, counts.pendingTags)
+            }
+            if (counts.restartRequired > 0) {
+                parts += str(com.interstellar.proxy.R.string.vm_provider_count_restart, counts.restartRequired)
+            }
+        }
+        val text =
+            if (parts.isEmpty()) {
+                str(
+                    if (partial) {
+                        com.interstellar.proxy.R.string.vm_provider_partial_no_counts
+                    } else {
+                        com.interstellar.proxy.R.string.vm_provider_no_counts
+                    },
+                )
+            } else {
+                val prefix =
+                    if (partial) {
+                        com.interstellar.proxy.R.string.vm_provider_partial_prefix
+                    } else {
+                        com.interstellar.proxy.R.string.vm_provider_prefix
+                    }
+                str(prefix) +
+                    parts.joinToString(str(com.interstellar.proxy.R.string.vm_provider_separator))
+            }
+        val kind =
+            if (partial || counts.failed > 0 || counts.busy > 0 || unknown > 0) {
+                UiToast.Kind.Error
+            } else {
+                UiToast.Kind.Success
+            }
+        return text to kind
     }
 
     /**
@@ -1567,9 +1613,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 if (configOutcome == ActiveConfigOutcome.Restored) ConfigStore.activeConfigRevision() else expectedRevision
             // The provider RPC must reach the instance that is serving the revision this operation
             // committed: a different revision means another write or reload happened in between, and
-            // a stopped core is "unavailable" rather than "superseded".
+            // a stopped core is "not running" rather than "superseded".
             providerHalf = when {
-                _status.value != Status.Started -> providerMessage(refreshProvidersNow())
+                // A stopped core is not a failed provider refresh: nothing was attempted. The
+                // config line already says the update was only saved, so this line names the skip.
+                _status.value != Status.Started ->
+                    str(com.interstellar.proxy.R.string.vm_provider_not_running) to UiToast.Kind.Error
                 !servingCommittedRevision(providerRevision) ->
                     str(com.interstellar.proxy.R.string.vm_provider_superseded) to UiToast.Kind.Error
                 else -> providerMessage(refreshProvidersNow())
@@ -2326,7 +2375,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 updated = outcome.updated
                 if (!outcome.updated) commitError = outcome.error
             } catch (e: Exception) {
-                showToast(str(com.interstellar.proxy.R.string.vm_refresh_failed, sub.name, e.message ?: ""), UiToast.Kind.Error)
+                // Do not show this now: the provider half still runs for an active profile and its
+                // toast would replace this failure. Carry the reason into the same combined report
+                // every other outcome uses, so the two halves arrive in one pill.
+                commitError = str(
+                    com.interstellar.proxy.R.string.vm_refresh_failed,
+                    sub.name,
+                    e.message?.takeUnless { it.isBlank() }
+                        ?: str(com.interstellar.proxy.R.string.vm_refresh_failed_unknown),
+                )
             } finally {
                 endUpdate(id)
                 _busy.value = false
@@ -2428,6 +2485,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 java.util.Collections.synchronizedList(
                     mutableListOf<SubscriptionRepository.RefreshCommit?>(),
                 )
+            // The repository normally turns a failed fetch into a non-committed RefreshCommit, but
+            // an exception (or a subscription removed mid-batch) is still a failure. `getOrNull()`
+            // used to drop it entirely, leaving the batch with fewer successes and no reason.
+            val failures = java.util.Collections.synchronizedList(mutableListOf<String>())
             try {
                 kotlinx.coroutines.coroutineScope {
                     targets.forEach { sub ->
@@ -2436,11 +2497,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                 // Same repository path as the single refresh, so a
                                 // persistence failure returns committed=false and is
                                 // never counted by the batch.
-                                commits.add(
-                                    runCatching {
-                                        SubscriptionRepository.refresh(sub.id, regenerate = false)
-                                    }.getOrNull(),
-                                )
+                                val refreshed = runCatching {
+                                    SubscriptionRepository.refresh(sub.id, regenerate = false)
+                                }
+                                val commit = refreshed.getOrNull()
+                                if (commit == null) {
+                                    failures.add(
+                                        str(
+                                            com.interstellar.proxy.R.string.vm_refresh_failed,
+                                            sub.name,
+                                            refreshed.exceptionOrNull()?.message
+                                                ?.takeUnless { it.isBlank() }
+                                                ?: str(com.interstellar.proxy.R.string.vm_refresh_failed_unknown),
+                                        ),
+                                    )
+                                }
+                                commits.add(commit)
                             }
                         }
                     }
@@ -2459,6 +2531,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             // active config, reload, or refresh the instance that profile owns.
             val outcome = com.interstellar.proxy.data.subscription.RefreshOutcome.batch(commits.toList())
             val ok = outcome.succeeded
+            // Every failed subscription must keep its reason: the repository's message for a
+            // non-committed result, and the thrown/absent result captured above. The full list is
+            // logged; the pill carries the first reason and the number of others.
+            val errors = outcome.errors + failures.toList()
+            errors.forEach { com.interstellar.proxy.core.AppLog.log("subscription", "batch update failed: $it") }
             var owns = SubscriptionUpdateCoordinator.ownsInstance(
                 affectsActive,
                 start,
@@ -2469,7 +2546,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 showToast(str(com.interstellar.proxy.R.string.vm_update_all_superseded), UiToast.Kind.Error)
                 return@launch
             }
-            var configError = outcome.errors.firstOrNull()
+            var configError = errors.firstOrNull()
+            if (configError != null && errors.size > 1) {
+                configError = configError + str(
+                    com.interstellar.proxy.R.string.vm_batch_more_failures,
+                    errors.size - 1,
+                )
+            }
             if (owns && affectsActive && ok > 0) {
                 SubscriptionRepository.regenerateActiveConfig()
                 configError = configError ?: SubscriptionRepository.takeConfigError()
@@ -2501,7 +2584,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 } else {
                     showToast(
                         str(com.interstellar.proxy.R.string.vm_updated_partial, ok, targets.size),
-                        if (ok > 0) UiToast.Kind.Success else UiToast.Kind.Error,
+                        // A short batch is not a green result just because some subscriptions
+                        // committed: the missing ones are exactly the failures the user needs.
+                        if (ok == targets.size) UiToast.Kind.Success else UiToast.Kind.Error,
                     )
                 }
             }

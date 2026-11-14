@@ -52,6 +52,8 @@
     <string name="vm_config_kept">“%1$s” config kept</string>
     <string name="vm_refresh_unparsable">“%1$s” content could not be parsed after refresh</string>
     <string name="vm_refresh_failed">“%1$s” refresh failed: %2$s</string>
+    <string name="vm_refresh_failed_unknown">unknown error</string>
+    <string name="vm_batch_more_failures">; %1$d more subscriptions failed</string>
     <string name="vm_no_sub_to_update">No subscriptions to update</string>
     <string name="vm_updated_all">Updated all %1$d subscriptions</string>
     <string name="vm_updated_partial">Updated %1$d/%2$d subscriptions</string>
@@ -68,12 +70,24 @@
     <string name="vm_update_in_progress">“%1$s” is already updating; this tap was ignored</string>
 <string name="vm_update_superseded">The active profile changed while “%1$s” was updating; this result was not applied to the running instance</string>
 <string name="vm_update_all_superseded">The active profile changed during the batch update; this result was not applied to the running instance</string>
-    <string name="vm_provider_summary">Provider: %1$d published, %2$d unchanged, %3$d failed, %4$d skipped</string>
     <string name="vm_provider_none">Provider: no remote providers in the current config</string>
-<string name="vm_provider_partial">Provider: %1$d published, %2$d unchanged, %3$d failed, %4$d skipped; %5$d nodes pending, %6$d providers need a restart</string>
     <string name="vm_provider_cancelled">Provider refresh was cancelled</string>
     <string name="vm_provider_box_changed">The core was replaced; provider refresh stopped</string>
-    <string name="vm_provider_unavailable">Provider refresh unavailable (core not running or command failed)</string>
+    <string name="vm_provider_unavailable">Provider refresh unavailable (command failed)</string>
+    <string name="vm_provider_not_running">Providers not refreshed: the core is not running</string>
+    <string name="vm_provider_prefix">Provider: </string>
+    <string name="vm_provider_partial_prefix">Providers partly applied: </string>
+    <string name="vm_provider_separator">, </string>
+    <string name="vm_provider_count_published">%1$d published</string>
+    <string name="vm_provider_count_unchanged">%1$d unchanged</string>
+    <string name="vm_provider_count_failed">%1$d failed</string>
+    <string name="vm_provider_count_skipped">%1$d skipped</string>
+    <string name="vm_provider_count_busy">%1$d busy</string>
+    <string name="vm_provider_count_unknown">%1$d unknown</string>
+    <string name="vm_provider_count_pending">%1$d nodes pending</string>
+    <string name="vm_provider_count_restart">%1$d providers need a restart</string>
+    <string name="vm_provider_no_counts">Provider: no result</string>
+    <string name="vm_provider_partial_no_counts">Providers partly applied</string>
     <string name="vm_keep_one_sub">Keep at least one subscription</string>
 
     <!-- subscription repository -->
