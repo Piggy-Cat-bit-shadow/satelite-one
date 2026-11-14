@@ -53,6 +53,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.interstellar.proxy.R
+import com.interstellar.proxy.core.displayGroups
+import com.interstellar.proxy.core.isGroupType
 import com.interstellar.proxy.data.SubscriptionRepository
 import com.interstellar.proxy.data.config.MinimalConfigBuilder
 import com.interstellar.proxy.ui.AppViewModel
@@ -79,8 +81,7 @@ private data class NodeEntry(
 
 private fun isGroupItem(item: NodeEntry): Boolean {
     // libbox reports group types lowercase
-    val t = item.type.lowercase()
-    return item.tag == MinimalConfigBuilder.AUTO_TAG || t == "urltest" || t == "selector"
+    return item.tag == MinimalConfigBuilder.AUTO_TAG || isGroupType(item.type)
 }
 
 @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
@@ -89,10 +90,12 @@ fun NodesPage(viewModel: AppViewModel) {
     val colors = LocalInterstellarColors.current
     val liveGroups by viewModel.groups.collectAsState()
     val staticGroups by viewModel.staticGroups.collectAsState()
-    // 分组结构永远来自磁盘上的 active.json(内核无关,切订阅立即生效、
-    // 内核死掉/重启中也不会失真);内核轮询只覆盖运行时状态:
-    // delays 流 + 下面这张 tag→当前选中 的表
-    val groups = staticGroups
+    // 分组结构以磁盘上的 active.json 为基底(内核无关,切订阅立即生效、
+    // 内核死掉/重启中也不会失真);内核快照只补齐文件里不可能有的成员:
+    // 由 provider 在运行时发布、渲染为 "<provider>/<node>" 的节点,以及
+    // provider 文档自带的分组。delays 流 + 下面这张 tag→当前选中 的表仍只
+    // 覆盖运行时状态。
+    val groups = remember(staticGroups, liveGroups) { displayGroups(staticGroups, liveGroups) }
     val liveSelectedByTag = remember(liveGroups) {
         liveGroups.mapNotNull { g -> g.selected?.takeIf { it.isNotBlank() }?.let { g.tag to it } }.toMap()
     }
@@ -267,7 +270,10 @@ fun NodesPage(viewModel: AppViewModel) {
             EmptyHint(
                 text = if (mixEnabled) {
                     stringResource(R.string.nodes_empty_mix)
-                } else if (storedNodes.isEmpty()) {
+                } else if (activeSub == null) {
+                    // An empty node pool is not the same as no active subscription: a raw
+                    // config has no share-link pool at all, and a provider-fed one only gets
+                    // members once the core publishes them.
                     stringResource(R.string.nodes_empty_no_subscription)
                 } else {
                     stringResource(R.string.nodes_empty_no_nodes)
@@ -434,11 +440,12 @@ fun NodesPage(viewModel: AppViewModel) {
         // 组引用卡片置顶,后跟按序节点
         val displayed = groupItems + sorted
         val nodeCtx = androidx.compose.ui.platform.LocalContext.current
+        // Only a selector has a manual member to set. A urltest/loadbalance group - or a page
+        // whose tab is not a group at all - must not send a selection the core refuses.
+        val selectionGroup = currentTab?.tag
         val onNodeTap: (NodeEntry) -> Unit = { item ->
-            when {
-                // urltest groups pick their own node — selection taps are no-ops
-                !tabSelectable && !isMainTab -> Unit
-                else -> viewModel.selectNode(currentTab?.tag ?: MinimalConfigBuilder.GROUP_TAG, item.tag)
+            if (tabSelectable && selectionGroup != null) {
+                viewModel.selectNode(selectionGroup, item.tag)
             }
         }
 
@@ -694,6 +701,10 @@ private fun NodeRow(
                         isGroupItem(item) && item.type.equals("urltest", true) -> stringResource(R.string.nodes_group_urltest_arrow)
                         isGroupItem(item) -> stringResource(R.string.nodes_group_arrow)
                         item.node != null -> "${item.node.protocolSummary()} · ${item.node.server}:${item.node.port}"
+                        // A provider node exists only in the core: there is no stored ProxyNode
+                        // to summarise, so the wire type the core reported is the protocol fact
+                        // the card can still show.
+                        item.type.isNotBlank() -> item.type.uppercase()
                         else -> ""
                     },
                     color = colors.textTertiary,
@@ -805,6 +816,20 @@ private fun NodeGridCell(
                     )
                     Spacer(Modifier.height(5.dp))
                 }
+
+                // Provider nodes have no stored ProxyNode; the core's wire type is what the card
+                // can show instead of an empty protocol line.
+                item.type.isNotBlank() -> {
+                    Text(
+                        item.type.uppercase(),
+                        color = colors.textTertiary,
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.height(5.dp))
+                }
             }
             if (!isGroupItem(item)) {
                 DelayBadge(
@@ -850,6 +875,13 @@ private fun NodeDetailSheet(item: NodeEntry, onDismiss: () -> Unit) {
                     "—"
                 },
             )
+
+            // A provider node is unknown to the stored node model, so the only protocol fact
+            // available for it is the wire type the core reported with the member.
+            if (item.node == null && item.type.isNotBlank()) {
+                SheetSection(stringResource(R.string.nodes_section_protocol))
+                DetailRow(stringResource(R.string.nodes_detail_type), item.type.uppercase())
+            }
 
             item.node?.let { n ->
                 SheetSection(stringResource(R.string.nodes_section_protocol))

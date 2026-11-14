@@ -26,6 +26,7 @@ import com.interstellar.proxy.data.SubscriptionUpdateCoordinator
 import com.interstellar.proxy.data.SubscriptionUpdateCoordinator.ActiveConfigAction
 import com.interstellar.proxy.data.SubscriptionUpdateCoordinator.UpdateReport
 import com.interstellar.proxy.data.config.MinimalConfigBuilder
+import com.interstellar.proxy.data.config.parseStaticGroups
 import com.interstellar.proxy.data.model.RoutingMode
 import com.interstellar.proxy.data.net.SubscriptionFetcher
 import com.interstellar.proxy.data.subscription.SubscriptionParser
@@ -50,7 +51,6 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
-import com.interstellar.proxy.data.subscription.str
 
 data class SpeedState(
     val uplinkPerSecond: Long = 0,
@@ -239,6 +239,27 @@ internal fun pendingSelectionRestore(
     if (group.selected == storedItem) return null
     return group.tag to storedItem
 }
+
+/**
+ * Whether a refreshed static structure invalidates the live group snapshot.
+ *
+ * The node page merges provider-published members from the live snapshot into the file's
+ * structure. A snapshot belongs to the config the core was serving when it was produced, so it
+ * may only feed the structure of the same revision:
+ *
+ *  - an unchanged revision (a refresh of another subscription, or a byte-identical write) leaves
+ *    the snapshot valid;
+ *  - a core already serving the new revision means the snapshot may be the new instance's (a
+ *    refresh can run after the reload it belongs to), so it is kept;
+ *  - a core still serving the old revision - or no core at all - means the snapshot describes the
+ *    PREVIOUS profile. Keeping it would append that profile's provider nodes to a same-tagged
+ *    group of the new one, so it must be dropped and repopulated by the reload's own push.
+ */
+internal fun dropLiveGroupsOnRefresh(
+    previousRevision: Long,
+    newRevision: Long,
+    appliedRevision: Long,
+): Boolean = newRevision != previousRevision && appliedRevision != newRevision
 
 /**
  * App-wide state holder: box status via the local command socket,
@@ -1165,7 +1186,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     ?: str(com.interstellar.proxy.R.string.vm_config_update_failed)
                 return@launch
             }
-            _staticGroups.value = parseSingboxGroups(config)
+            _staticGroups.value = parseStaticGroups(config)
             // a switch during Starting would otherwise be silently dropped: the
             // in-flight start already consumed the previous config and no
             // reload fires — wait for the start to settle, then apply
@@ -1628,33 +1649,31 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         showUpdateToast(configHalf, providerHalf)
     }
 
+    /** The active-config revision [_staticGroups] was built from; -1 before the first read. */
+    @Volatile
+    private var staticGroupsRevision = -1L
+
+    /** Serialises overlapping refreshes: an older read must not overwrite a newer one. */
+    private val staticGroupsRefresh = AtomicLong(0)
+
     /** Re-reads whatever config is on disk (startup / core switch). */
     fun refreshStaticGroups() {
+        val refresh = staticGroupsRefresh.incrementAndGet()
         viewModelScope.launch(Dispatchers.IO) {
-            val content = com.interstellar.proxy.data.ConfigStore.readActiveConfig()
-            _staticGroups.value = content?.let { parseSingboxGroups(it) } ?: emptyList()
-        }
-    }
-
-    private fun parseSingboxGroups(content: String): List<CoreGroup> {
-        val root = kotlinx.serialization.json.Json.parseToJsonElement(content)
-            .let { it as? kotlinx.serialization.json.JsonObject } ?: return emptyList()
-        val outbounds = (root["outbounds"] as? kotlinx.serialization.json.JsonArray)
-            ?.filterIsInstance<kotlinx.serialization.json.JsonObject>() ?: return emptyList()
-        val typeOf = outbounds.associateBy { it.str("tag") }
-        return outbounds.mapNotNull { ob ->
-            val type = ob.str("type")?.lowercase() ?: return@mapNotNull null
-            if (type != "selector" && type != "urltest") return@mapNotNull null
-            val tag = ob.str("tag") ?: return@mapNotNull null
-            val members = (ob["outbounds"] as? kotlinx.serialization.json.JsonArray)
-                ?.mapNotNull { (it as? kotlinx.serialization.json.JsonPrimitive)?.content }
-                ?: emptyList()
-            CoreGroup(
-                tag = tag,
-                type = type,
-                selected = ob.str("default")?.takeIf { it in members },
-                items = members.map { CoreGroupItem(it, typeOf[it]?.str("type") ?: "") },
-            )
+            val snapshot = ConfigStore.snapshot()
+            val groups = snapshot.content?.let { parseStaticGroups(it) } ?: emptyList()
+            if (staticGroupsRefresh.get() != refresh) return@launch
+            val revision = snapshot.meta.revision
+            val previousRevision = staticGroupsRevision
+            staticGroupsRevision = revision
+            if (dropLiveGroupsOnRefresh(previousRevision, revision, CoreRuntime.appliedConfigRevision)) {
+                // A snapshot from the previous profile must not feed the new structure: the
+                // reload's own group push repopulates the runtime half.
+                _groups.value = emptyList()
+            }
+            // Clear first, then publish the structure: the other order lets one frame see the
+            // new structure with the previous profile's members.
+            _staticGroups.value = groups
         }
     }
 
@@ -1676,7 +1695,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 // was dropped and the page kept showing a node the core was not using.
                 val config = SubscriptionRepository.regenerateActiveConfig()
                 if (config != null) {
-                    _staticGroups.value = parseSingboxGroups(config)
+                    _staticGroups.value = parseStaticGroups(config)
                 }
                 _selectedOutboundTag.value = Settings.selectedOutboundTag
             }
