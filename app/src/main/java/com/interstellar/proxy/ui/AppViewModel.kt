@@ -299,6 +299,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _staticGroups = MutableStateFlow<List<CoreGroup>>(emptyList())
     val staticGroups: StateFlow<List<CoreGroup>> = _staticGroups
 
+    /*
+     * Refresh bookkeeping for [_staticGroups].
+     *
+     * These MUST stay ABOVE the `init` block below: Kotlin initializes properties and init blocks
+     * in source order, and that init block calls [refreshStaticGroups] synchronously. A field
+     * declared after it is still null when the call runs, so reading it throws
+     * NullPointerException during ViewModel construction - the app closes on launch. This is
+     * exactly what shipped in 0.1.50; [AppViewModelInitOrderTest] pins the order.
+     */
+    /** The active-config revision [_staticGroups] was built from; -1 before the first read. */
+    @Volatile
+    private var staticGroupsRevision = -1L
+
+    /** Serialises overlapping refreshes: an older read must not overwrite a newer one. */
+    private val staticGroupsRefresh = AtomicLong(0)
+
     /** App-proxy scope as the UI sees it (drives the dashboard status row). */
     data class ProxyScope(val whitelist: Boolean, val count: Int) {
         /** Per-app routing armed at all (label text is decided by the caller's locale). */
@@ -1648,13 +1664,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
         showUpdateToast(configHalf, providerHalf)
     }
-
-    /** The active-config revision [_staticGroups] was built from; -1 before the first read. */
-    @Volatile
-    private var staticGroupsRevision = -1L
-
-    /** Serialises overlapping refreshes: an older read must not overwrite a newer one. */
-    private val staticGroupsRefresh = AtomicLong(0)
 
     /** Re-reads whatever config is on disk (startup / core switch). */
     fun refreshStaticGroups() {
