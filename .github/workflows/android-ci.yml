@@ -147,7 +147,10 @@ jobs:
             app/libs/libbox.provenance
           # The resolved SHA is in the key, so overriding `core_ref` gets its own cache
           # entry instead of colliding with (or silently reusing) the branch-tracking one.
-          key: libbox-${{ env.CORE_REPO }}-${{ env.CORE_BRANCH }}-${{ steps.core.outputs.sha }}
+          # The diagnostic cronet override is part of the key too: otherwise a probe
+          # could restore an AAR built with different lib modules while its marker says
+          # the new version.
+          key: libbox-${{ env.CORE_REPO }}-${{ env.CORE_BRANCH }}-${{ steps.core.outputs.sha }}-${{ inputs.cronet_lib_version || 'pinned' }}
 
       # app/libs 只含 gitignore 的 libbox.aar，checkout 不会创建该目录
       - name: Ensure app/libs exists
