@@ -195,6 +195,7 @@ jobs:
             export GOFLAGS="-mod=mod"
             echo "::notice::diagnostic cronet lib override -> ${CRONET_LIB_VERSION}"
             grep -c 'cronet-go/lib/.* => ' go.mod
+            go list -m all | grep 'cronet-go/lib/android_arm'
           fi
           go install "github.com/sagernet/gomobile/cmd/gomobile@${GOMOBILE_VERSION}"
           go install "github.com/sagernet/gomobile/cmd/gobind@${GOMOBILE_VERSION}"
@@ -285,13 +286,25 @@ jobs:
           sha256sum ./*.apk > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      - name: Mark the diagnostic cronet override
+        if: inputs.cronet_lib_version != ''
+        run: |
+          set -euo pipefail
+          {
+            echo "diagnostic only: the 29 cronet-go/lib/* replaces were overridden in the runner checkout"
+            echo "cronet_lib_version=${{ inputs.cronet_lib_version }}"
+            echo "core_ref=${{ steps.core.outputs.sha }}"
+          } > app/build/outputs/apk/debug/CRONET_LIB_OVERRIDE.txt
+          cat app/build/outputs/apk/debug/CRONET_LIB_OVERRIDE.txt
+
       - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
-          name: satelite-one-debug-${{ github.sha }}
+          name: satelite-one-debug-${{ github.sha }}${{ inputs.cronet_lib_version != '' && '-cronetprobe' || '' }}
           path: |
             app/build/outputs/apk/debug/*.apk
             app/build/outputs/apk/debug/SHA256SUMS.txt
+            app/build/outputs/apk/debug/CRONET_LIB_OVERRIDE.txt
           if-no-files-found: error
 
       - name: Upload test reports

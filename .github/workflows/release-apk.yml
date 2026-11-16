@@ -60,8 +60,14 @@ env:
   CORE_BRANCH: testing
   NDK_VERSION: 28.0.13004108
   GOMOBILE_VERSION: v0.1.12
-  # 官方 Go 1.27.4：与 android-ci.yml 使用同一工具链，release 与开发构建不再分叉。
-  GO_VERSION: '1.27.4'
+  # 临时保持 1.25.5：release 按 version.properties 的 coreCommit 构建，而该核心的
+  # go.mod 仍把 29 条 cronet-go/lib/* 固定在 362e63b（cgo 使用 Go 1.27.4 已拒绝的
+  # `-l:libcronet.a`）。cronet 修复在 go 分支 b9f445d，但主仓 pin 前移受
+  # release/source-lock.json + pin-runs.json 冻结契约约束，尚未走完冻结流程。
+  # 在 pin 正移之前把 release 切到 1.27.4 会让每次 v* 发布必然在 libbox 构建失败；
+  # pin 冻结完成后应改回 1.27.4，并删除这条注释。开发 android-ci 已用 1.27.4
+  #（可配合 cronet_lib_version 诊断输入）验证修复。
+  GO_VERSION: '1.25.5'
   # The keystore alias is NON-SECRET release metadata: it is fixed, public, and carries no
   # signing power on its own. It therefore belongs here, versioned with the workflow,
   # instead of in repository settings.
