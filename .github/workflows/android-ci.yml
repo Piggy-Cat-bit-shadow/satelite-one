@@ -38,6 +38,13 @@ on:
         description: 'sing-box revision to follow (blank = CORE_BRANCH HEAD)'
         required: false
         default: ''
+      # 诊断输入（默认留空，不影响产品构建）：把核心 checkout 里的 28 条
+      # cronet-go/lib/* replace 临时指向给定的 go 分支 pseudo-version，用来验证
+      # Go 1.27.4 下 cronet cgo 链接修复，而不需要先改主仓 go.mod。
+      cronet_lib_version:
+        description: 'diagnostic only: override cronet-go lib/* replaces (go-branch pseudo-version)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -50,6 +57,16 @@ env:
   # checkJavaVersion() 里硬性要求 openjdk 17。
   NDK_VERSION: 28.0.13004108
   GOMOBILE_VERSION: v0.1.12
+  CRONET_LIB_MODULES: >-
+    android_386 android_amd64 android_arm android_arm64
+    darwin_amd64 darwin_arm64
+    ios_amd64_simulator ios_arm64 ios_arm64_simulator
+    linux_386 linux_386_musl linux_amd64 linux_amd64_musl
+    linux_arm linux_arm64 linux_arm64_musl linux_arm_musl
+    linux_loong64 linux_loong64_musl linux_mips64le
+    linux_mipsle linux_mipsle_musl linux_riscv64 linux_riscv64_musl
+    tvos_amd64_simulator tvos_arm64 tvos_arm64_simulator
+    windows_amd64 windows_arm64
   # 官方 Go 1.27.4 是本次升级的目标工具链。build_libbox 要求 CI 的 Go 版本
   # 不低于内核 go.mod 的 go 指令；1.27.4 满足该要求，并且是正式构建版本。
   GO_VERSION: '1.27.4'
@@ -157,6 +174,7 @@ jobs:
         if: steps.libbox.outputs.cache-hit != 'true'
         env:
           CORE_SHA: ${{ steps.core.outputs.sha }}
+          CRONET_LIB_VERSION: ${{ inputs.cronet_lib_version }}
           GOMOBILE_GO_STDERR_LOG: ${{ runner.temp }}/gomobile-go-stderr.log
         run: |
           set -euo pipefail
@@ -169,6 +187,14 @@ jobs:
           if [ "$ACTUAL" != "${CORE_SHA}" ]; then
             echo "::error::checked out ${ACTUAL} but resolved core revision is ${CORE_SHA}"
             exit 1
+          fi
+          if [ -n "${CRONET_LIB_VERSION}" ]; then
+            for module in ${CRONET_LIB_MODULES}; do
+              go mod edit -replace "github.com/sagernet/cronet-go/lib/${module}=github.com/Piggy-Cat-bit-shadow/cronet-go/lib/${module}@${CRONET_LIB_VERSION}"
+            done
+            export GOFLAGS="-mod=mod"
+            echo "::notice::diagnostic cronet lib override -> ${CRONET_LIB_VERSION}"
+            grep -c 'cronet-go/lib/.* => .*@' go.mod
           fi
           go install "github.com/sagernet/gomobile/cmd/gomobile@${GOMOBILE_VERSION}"
           go install "github.com/sagernet/gomobile/cmd/gobind@${GOMOBILE_VERSION}"
