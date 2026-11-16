@@ -60,7 +60,8 @@ env:
   CORE_BRANCH: testing
   NDK_VERSION: 28.0.13004108
   GOMOBILE_VERSION: v0.1.12
-  GO_VERSION: '1.25.5'
+  # 官方 Go 1.27.4：与 android-ci.yml 使用同一工具链，release 与开发构建不再分叉。
+  GO_VERSION: '1.27.4'
   # The keystore alias is NON-SECRET release metadata: it is fixed, public, and carries no
   # signing power on its own. It therefore belongs here, versioned with the workflow,
   # instead of in repository settings.

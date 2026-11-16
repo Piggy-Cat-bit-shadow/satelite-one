@@ -50,8 +50,9 @@ env:
   # checkJavaVersion() 里硬性要求 openjdk 17。
   NDK_VERSION: 28.0.13004108
   GOMOBILE_VERSION: v0.1.12
-  # build_libbox 需要 go.mod 的 go 指令版本 (当前 1.25.5)
-  GO_VERSION: '1.25.5'
+  # 官方 Go 1.27.4 是本次升级的目标工具链。build_libbox 要求 CI 的 Go 版本
+  # 不低于内核 go.mod 的 go 指令；1.27.4 满足该要求，并且是正式构建版本。
+  GO_VERSION: '1.27.4'
 
 jobs:
   build:
