@@ -57,6 +57,9 @@ env:
   # checkJavaVersion() 里硬性要求 openjdk 17。
   NDK_VERSION: 28.0.13004108
   GOMOBILE_VERSION: v0.1.12
+  # 工具链只有一个权威来源：GO_VERSION + setup-go，不允许核心 go.mod 的
+  # toolchain 行在 runner 上静默触发另一版本下载。
+  GOTOOLCHAIN: local
   CRONET_LIB_MODULES: >-
     android_386 android_amd64 android_arm android_arm64
     darwin_amd64 darwin_arm64

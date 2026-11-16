@@ -68,6 +68,9 @@ env:
   # pin 冻结完成后应改回 1.27.4，并删除这条注释。开发 android-ci 已用 1.27.4
   #（可配合 cronet_lib_version 诊断输入）验证修复。
   GO_VERSION: '1.25.5'
+  # 与 android-ci 一致：GO_VERSION 是唯一工具链来源，禁止核心 go.mod 的
+  # toolchain 行在 runner 上静默下载/切换 Go 版本。
+  GOTOOLCHAIN: local
   # The keystore alias is NON-SECRET release metadata: it is fixed, public, and carries no
   # signing power on its own. It therefore belongs here, versioned with the workflow,
   # instead of in repository settings.
