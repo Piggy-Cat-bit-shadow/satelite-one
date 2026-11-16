@@ -194,7 +194,7 @@ jobs:
             done
             export GOFLAGS="-mod=mod"
             echo "::notice::diagnostic cronet lib override -> ${CRONET_LIB_VERSION}"
-            grep -c 'cronet-go/lib/.* => .*@' go.mod
+            grep -c 'cronet-go/lib/.* => ' go.mod
           fi
           go install "github.com/sagernet/gomobile/cmd/gomobile@${GOMOBILE_VERSION}"
           go install "github.com/sagernet/gomobile/cmd/gobind@${GOMOBILE_VERSION}"
