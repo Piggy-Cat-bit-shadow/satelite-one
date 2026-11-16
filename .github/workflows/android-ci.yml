@@ -133,12 +133,31 @@ jobs:
       - name: Ensure app/libs exists
         run: mkdir -p app/libs
 
+      # gomobile 只打印 “failed: exit status 1”，内部 go build 的编译/链接 stderr 会丢失。
+      # 在 PATH 前置一个 go 包装器，把 stderr 同时写到日志；构建失败时由下一步展示。
+      - name: Install a go wrapper that keeps gomobile's build stderr
+        env:
+          GOMOBILE_GO_STDERR_LOG: ${{ runner.temp }}/gomobile-go-stderr.log
+        run: |
+          set -euo pipefail
+          REAL_GO="$(command -v go)"
+          WRAP="${RUNNER_TEMP}/go-wrap"
+          mkdir -p "${WRAP}"
+          {
+            printf '#!/bin/bash\n'
+            printf 'LOG="${GOMOBILE_GO_STDERR_LOG:-/dev/null}"\n'
+            printf '"%s" "$@" 2> >(tee -a "${LOG}" >&2)\n' "${REAL_GO}"
+          } > "${WRAP}/go"
+          chmod +x "${WRAP}/go"
+          echo "${WRAP}" >> "${GITHUB_PATH}"
+
       # sing-box v1.14 起移除了 `make lib_android`，改用 cmd/internal/build_libbox，
       # 产出 libbox.aar + libbox-legacy.aar(API 21)，本 app minSdk 24 只需前者。
       - name: Build libbox.aar from ${{ env.CORE_REPO }}@${{ env.CORE_BRANCH }}
         if: steps.libbox.outputs.cache-hit != 'true'
         env:
           CORE_SHA: ${{ steps.core.outputs.sha }}
+          GOMOBILE_GO_STDERR_LOG: ${{ runner.temp }}/gomobile-go-stderr.log
         run: |
           set -euo pipefail
           git init -q /tmp/sing-box
@@ -167,6 +186,28 @@ jobs:
           cp "$AAR" "${GITHUB_WORKSPACE}/app/libs/libbox.aar"
           cp libbox.provenance "${GITHUB_WORKSPACE}/app/libs/libbox.provenance"
           ls -la "${GITHUB_WORKSPACE}/app/libs/"
+
+      - name: Show the gomobile go build stderr if the AAR build failed
+        if: failure()
+        env:
+          GOMOBILE_GO_STDERR_LOG: ${{ runner.temp }}/gomobile-go-stderr.log
+        run: |
+          LOG="${GOMOBILE_GO_STDERR_LOG:-}"
+          if [ -n "${LOG}" ] && [ -f "${LOG}" ]; then
+            echo "::group::gomobile go build stderr"
+            tail -n 300 "${LOG}"
+            echo "::endgroup::"
+          else
+            echo "no gomobile go build stderr was captured"
+          fi
+
+      - name: Upload the gomobile go build stderr
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gomobile-go-stderr-${{ github.run_id }}
+          path: ${{ runner.temp }}/gomobile-go-stderr.log
+          if-no-files-found: warn
 
       # The gate that catches "this AAR is not from the revision we think" must itself
       # be shown to reject; see the negative cases in that script.
