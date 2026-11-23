@@ -53,8 +53,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.interstellar.proxy.R
+import com.interstellar.proxy.core.UrlTestDisplay
+import com.interstellar.proxy.core.UrlTestResult
 import com.interstellar.proxy.core.displayGroups
 import com.interstellar.proxy.core.isGroupType
+import com.interstellar.proxy.core.summarizeUrlTest
+import com.interstellar.proxy.core.urlTestDisplay
 import com.interstellar.proxy.data.SubscriptionRepository
 import com.interstellar.proxy.data.config.MinimalConfigBuilder
 import com.interstellar.proxy.ui.AppViewModel
@@ -91,15 +95,17 @@ fun NodesPage(viewModel: AppViewModel) {
     val liveGroups by viewModel.groups.collectAsState()
     val staticGroups by viewModel.staticGroups.collectAsState()
     // 分组结构以磁盘上的 active.json 为基底(内核无关,切订阅立即生效、
-    // 内核死掉/重启中也不会失真);内核快照只补齐文件里不可能有的成员:
+    // 内核死掉/重启中也不会失真);内核快照补齐文件里不可能有的成员:
     // 由 provider 在运行时发布、渲染为 "<provider>/<node>" 的节点,以及
-    // provider 文档自带的分组。delays 流 + 下面这张 tag→当前选中 的表仍只
-    // 覆盖运行时状态。
-    val groups = remember(staticGroups, liveGroups) { displayGroups(staticGroups, liveGroups) }
+    // provider 文档自带的分组。投影同时把每个成员的完整测速结果(延迟+完成时间)
+    // 叠加到静态成员上,不再出现"延迟来自缓存、时间来自静态项"的跨结果拼接。
+    val urlTestResults by viewModel.urlTestResults.collectAsState()
+    val groups = remember(staticGroups, liveGroups, urlTestResults) {
+        displayGroups(staticGroups, liveGroups, urlTestResults)
+    }
     val liveSelectedByTag = remember(liveGroups) {
         liveGroups.mapNotNull { g -> g.selected?.takeIf { it.isNotBlank() }?.let { g.tag to it } }.toMap()
     }
-    val delays by viewModel.delays.collectAsState()
     val testing by viewModel.testing.collectAsState()
     val message by viewModel.message.collectAsState()
     val subscriptions by viewModel.subscriptions.collectAsState()
@@ -156,28 +162,21 @@ fun NodesPage(viewModel: AppViewModel) {
     // `tagsFor(storedNodes)`, the pool the APP's generated config runs on, so a raw config (no
     // share links, empty pool) reported "0 nodes · 0 ok · 0 failed" beside five real latencies.
     val testedTags by viewModel.testTags.collectAsState()
-    // This run's outcomes only - not `delays`, which accumulates across runs and would report a
-    // previous run's successes for a run in which every node timed out.
+    // This run's outcomes only - not the app-wide result cache, which accumulates across runs and
+    // would report a previous run's successes for a run in which every node timed out.
     val testResult by viewModel.testResult.collectAsState()
 
     // The summary is derived from the run's own results, not from the test lifecycle.
     //
     // It used to be computed when `testing` flipped back to false. That worked only while the
-    // client decided for itself when a run was over. Now the RPC is the lifecycle and it returns
-    // as soon as the kernel has SCHEDULED its round - long before any delay arrives - so a
-    // lifecycle-triggered summary would snapshot an empty result set every time. Deriving it
-    // keeps the same information, refreshes as results land, and gates nothing.
-    // Held to the run's own results, never to the run's lifecycle.
+    // client decided for itself when a run was over; the RPC returns as soon as the kernel has
+    // SCHEDULED its round, so a lifecycle-triggered summary would snapshot an empty result set
+    // every time. Deriving it keeps the same information, refreshes as results land, and gates
+    // nothing.
     //
-    // It used to be computed when `testing` flipped back to false. That worked only while the
-    // client decided for itself when a run was over; now the RPC returns as soon as the kernel
-    // has SCHEDULED its round, long before any delay arrives, so a lifecycle-triggered summary
-    // would snapshot an empty result set every time.
-    //
-    // It is NOT held back until every node reports either - that condition is unreachable. A node
-    // that fails produces no stamp at all (sing-box records display history only for successes),
-    // so "wait for N/N" is the same trap as the old completion gate, one layer up. The verdict is
-    // therefore always shown for the run, and it firms up as results land.
+    // A terminal FAILURE now carries a completion time, so it is a real outcome: the failed count
+    // includes it, and it advances the progress window instead of leaving the bar stuck. A member
+    // that has not returned yet is pending, never failed - see computeNodesTestSummary.
     val testSummary: NodesTestSummary? =
         if (testedTags.isEmpty()) null
         else computeNodesTestSummary(testedTags, testResult, genericFailNote)
@@ -205,13 +204,15 @@ fun NodesPage(viewModel: AppViewModel) {
         val nodeByTag = remember(storedNodes) {
             MinimalConfigBuilder.tagsFor(storedNodes).zip(storedNodes).toMap()
         }
-        val allItems = remember(liveItems, storedNodes, delays, sourceByTag, nodeByTag) {
+        val allItems = remember(liveItems, storedNodes, urlTestResults, sourceByTag, nodeByTag) {
             if (liveItems.isNotEmpty()) {
                 liveItems.map { item ->
                     NodeEntry(
                         tag = item.tag,
                         type = item.type,
-                        delay = delays[item.tag] ?: item.urlTestDelay,
+                        // displayGroups already overlaid the complete result (delay + time) from
+                        // one snapshot entry, so these two fields are always one result's pair.
+                        delay = item.urlTestDelay,
                         testedAt = item.urlTestTime,
                         source = sourceByTag[item.tag],
                         node = nodeByTag[item.tag],
@@ -220,10 +221,14 @@ fun NodesPage(viewModel: AppViewModel) {
             } else {
                 val tags = MinimalConfigBuilder.tagsFor(storedNodes)
                 storedNodes.zip(tags).map { (node, tag) ->
+                    // No live member to project: the last complete result is still a fact about
+                    // the node, and its pair comes from the map entry as a whole.
+                    val result = urlTestResults[tag]
                     NodeEntry(
                         tag,
                         node.type.wire,
-                        delays[tag] ?: 0,
+                        result?.delay ?: 0,
+                        result?.completedAt ?: 0L,
                         source = sourceByTag[tag],
                         node = node,
                     )
@@ -428,12 +433,13 @@ fun NodesPage(viewModel: AppViewModel) {
             )
         }
 
-        val sorted = remember(nodeItems, sortMode, delays) {
+        val sorted = remember(nodeItems, sortMode) {
             when (sortMode) {
                 1 -> nodeItems.sortedBy { it.tag.lowercase() }
                 else -> nodeItems.sortedBy { item ->
-                    val d = delays[item.tag]?.takeIf { it > 0 } ?: item.delay
-                    if (d > 0) d else Int.MAX_VALUE
+                    // Only a successful delay ranks. A timeout (0 with a time) and an untested
+                    // member both have no latency to compare and sort last, never first.
+                    if (item.delay > 0) item.delay else Int.MAX_VALUE
                 }
             }
         }
@@ -467,7 +473,6 @@ fun NodesPage(viewModel: AppViewModel) {
                     items(displayed, key = { it.tag }) { item ->
                         NodeGridCell(
                             item = item,
-                            delay = delays[item.tag] ?: item.delay,
                             selected = item.tag == selectedTag,
                             onClick = { onNodeTap(item) },
                             onLongPress = { if (!isGroupItem(item)) detailItem = item },
@@ -486,7 +491,6 @@ fun NodesPage(viewModel: AppViewModel) {
                 items(displayed, key = { it.tag }) { item ->
                     NodeRow(
                         item = item,
-                        delay = delays[item.tag] ?: item.delay,
                         selected = item.tag == selectedTag,
                         onClick = { onNodeTap(item) },
                         onLongPress = { if (!isGroupItem(item)) detailItem = item },
@@ -514,26 +518,29 @@ private data class NodesTestSummary(
     val failNote: String? = null,
 )
 
-/** ok = tested with a real delay (sentinels and untested excluded). */
+/**
+ * Count only outcomes this run actually received.
+ *
+ * The previous version computed `tags.size - successes`, so every member that had not returned yet
+ * - and every member the kernel skipped - was shown as failed. Now a finished failure is a
+ * terminal result of its own, and a member with no result is pending: it neither inflates the
+ * failed count nor pretends to have a latency.
+ */
 private fun computeNodesTestSummary(
     tags: List<String>,
-    delays: Map<String, Int>,
+    results: Map<String, UrlTestResult>,
     genericFailNote: String,
 ): NodesTestSummary {
-    val values = tags.mapNotNull { tag ->
-        delays[tag]?.takeIf { it > 0 && it < 65_000 }
-    }.sorted()
-    fun pct(p: Double) = if (values.isEmpty()) 0 else values[((values.size - 1) * p).toInt()]
-    val failed = (tags.size - values.size).coerceAtLeast(0)
+    val summary = summarizeUrlTest(tags, results)
     return NodesTestSummary(
-        total = tags.size,
-        okCount = values.size,
-        minMs = values.firstOrNull() ?: 0,
-        maxMs = values.lastOrNull() ?: 0,
-        p50 = pct(0.50),
-        p95 = pct(0.95),
-        failed = failed,
-        failNote = if (failed > 0) genericFailNote else null,
+        total = summary.total,
+        okCount = summary.ok,
+        minMs = summary.minMs,
+        maxMs = summary.maxMs,
+        p50 = summary.p50,
+        p95 = summary.p95,
+        failed = summary.failed,
+        failNote = if (summary.failed > 0) genericFailNote else null,
     )
 }
 
@@ -591,12 +598,13 @@ private fun TestSummaryBar(
         }
         // NOT `else if`, and deliberately not gated on `running` either.
         //
-        // The two rows answer different questions and neither can wait for the other: the
-        // progress row closes when every node has reported (which a failing node never does -
-        // sing-box records no stamp for a failure), while the verdict is already known and merely
-        // firms up as more results land. Chaining them, or gating the verdict on the progress
-        // window, meant a run containing any failed node showed no verdict at all - the same
-        // unreachable-condition mistake as the old completion gate, one layer up.
+        // The two rows answer different questions and neither can wait for the other: the progress
+        // row closes when every submitted node has reported, while the verdict is already known
+        // and merely firms up as more results land. A finished failure now reports a completion
+        // time, so it is both a verdict outcome and progress; a member that was skipped or has not
+        // answered yet is pending. Gating the verdict on the progress window meant a run
+        // containing a failed node could show no verdict at all - the same unreachable-condition
+        // mistake as the old completion gate, one layer up.
         if (summary != null) {
             val summaryModeLabel = stringResource(R.string.nodes_url_test)
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -651,7 +659,6 @@ private fun TestSummaryBar(
 @Composable
 private fun NodeRow(
     item: NodeEntry,
-    delay: Int,
     selected: Boolean,
     onClick: () -> Unit,
     onLongPress: () -> Unit,
@@ -728,7 +735,7 @@ private fun NodeRow(
             if (isGroupItem(item)) {
                 Text("›", color = colors.textTertiary, fontSize = 18.sp)
             } else {
-                DelayBadge(delay, tested = item.testedAt > 0)
+                DelayBadge(delay = item.delay, completedAt = item.testedAt)
             }
         }
     }
@@ -738,7 +745,6 @@ private fun NodeRow(
 @Composable
 private fun NodeGridCell(
     item: NodeEntry,
-    delay: Int,
     selected: Boolean,
     onClick: () -> Unit,
     onLongPress: () -> Unit,
@@ -833,9 +839,9 @@ private fun NodeGridCell(
             }
             if (!isGroupItem(item)) {
                 DelayBadge(
-                    delay = delay,
+                    delay = item.delay,
+                    completedAt = item.testedAt,
                     modifier = Modifier.align(Alignment.End),
-                    tested = item.testedAt > 0,
                 )
             }
         }
@@ -861,10 +867,10 @@ private fun NodeDetailSheet(item: NodeEntry, onDismiss: () -> Unit) {
             Spacer(Modifier.height(14.dp))
             DetailRow(stringResource(R.string.nodes_detail_name), item.tag)
             item.source?.let { DetailRow(stringResource(R.string.nodes_detail_source), it) }
-            DetailRow(stringResource(R.string.nodes_detail_delay), when {
-                item.delay > 0 -> stringResource(R.string.nodes_delay_ms_fmt, item.delay)
-                item.testedAt > 0 -> stringResource(R.string.nodes_delay_timeout)
-                else -> stringResource(R.string.nodes_delay_untested_full)
+            DetailRow(stringResource(R.string.nodes_detail_delay), when (urlTestDisplay(item.delay, item.testedAt)) {
+                UrlTestDisplay.Delay -> stringResource(R.string.nodes_delay_ms_fmt, item.delay)
+                UrlTestDisplay.Timeout -> stringResource(R.string.nodes_delay_timeout)
+                UrlTestDisplay.Untested -> stringResource(R.string.nodes_delay_untested_full)
             })
             DetailRow(
                 stringResource(R.string.nodes_detail_last_test),
@@ -1019,17 +1025,21 @@ private fun DetailRow(label: String, value: String) {
 }
 
 @Composable
-fun DelayBadge(delay: Int, modifier: Modifier = Modifier, tested: Boolean = false) {
+fun DelayBadge(delay: Int, completedAt: Long = 0L, modifier: Modifier = Modifier) {
     val colors = LocalInterstellarColors.current
     val timeoutLabel = stringResource(R.string.nodes_delay_timeout)
     val untestedLabel = stringResource(R.string.nodes_delay_untested)
-    val (text, color) = when {
-        // stamped but no delay → the test ran and the node failed/timed out
-        delay <= 0 -> if (tested) timeoutLabel to colors.danger else untestedLabel to colors.textTertiary
-        delay >= 65000 -> timeoutLabel to colors.danger
-        delay < 200 -> stringResource(R.string.nodes_delay_ms_badge_fmt, delay) to colors.success
-        delay < 300 -> stringResource(R.string.nodes_delay_ms_badge_fmt, delay) to colors.warning
-        else -> stringResource(R.string.nodes_delay_ms_badge_fmt, delay) to colors.danger
+    // The two fields decide the state: a completion time makes this a real result, and only a
+    // positive delay inside it is a success. No magic threshold turns a legitimate delay into a
+    // timeout, and a failure is never inferred from a zero alone.
+    val (text, color) = when (urlTestDisplay(delay, completedAt)) {
+        UrlTestDisplay.Untested -> untestedLabel to colors.textTertiary
+        UrlTestDisplay.Timeout -> timeoutLabel to colors.danger
+        UrlTestDisplay.Delay -> when {
+            delay < 200 -> stringResource(R.string.nodes_delay_ms_badge_fmt, delay) to colors.success
+            delay < 300 -> stringResource(R.string.nodes_delay_ms_badge_fmt, delay) to colors.warning
+            else -> stringResource(R.string.nodes_delay_ms_badge_fmt, delay) to colors.danger
+        }
     }
     Box(
         modifier = modifier

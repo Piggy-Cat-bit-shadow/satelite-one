@@ -7,7 +7,8 @@ import java.io.File
 import org.junit.Test
 
 /**
- * The sing-box url-test lifecycle belongs to the RPC call, and nothing else.
+ * The sing-box url-test lifecycle belongs to the RPC call, and nothing else - on the ATTACHED
+ * path.
  *
  * This is the property the client kept breaking. Each earlier version decided for itself whether
  * a run had finished - with a `done >= total` gate over the outbounds stream, then a 15 s + 10 s
@@ -17,6 +18,12 @@ import org.junit.Test
  * The official client does none of this: `GroupsViewModel.urlTestGroup` adds the tag to
  * `testingGroups`, awaits `CommandClient.urlTest(tag)`, and removes it in `finally`. The call is
  * the lifecycle.
+ *
+ * The headless (offline) path is the one deliberate exception: it owns a temporary core, so the
+ * empty RPC response must NOT be read as completion - the core would be stopped while its probes
+ * are still running. That path therefore waits for the members' real terminal results (see
+ * [headlessProbeProgress]) and its constraint is pinned at the bottom of this class. Neither path
+ * may use a fixed settle duration.
  *
  * The runtime half of that cannot be unit-tested without a core and a device, so - as elsewhere
  * in this suite - the structural half is pinned against the real source. These tests fail if the
@@ -227,6 +234,45 @@ class UrlTestLifecycleTest {
         check(eligible.size == 38) {
             "progress total must be the target's testable members (38), never the proxy " +
                 "selector's item count (45); got ${eligible.size}"
+        }
+    }
+
+    // ---- the headless path: wait for real results, never for a duration -----
+
+    /**
+     * The offline path is the exception that proves the rule.
+     *
+     * It owns a temporary core, so the empty async RPC response cannot mean "done" - stopping the
+     * core there is exactly the early-teardown defect. Its wait is driven by the members' terminal
+     * results, and the only time bound is the derived safety budget. A fixed settle delay would
+     * reintroduce the old 15 s + 10 s poll the rest of this suite forbids.
+     */
+    @Test
+    fun `the headless path waits on terminal results, never on a fixed duration`() {
+        val start = viewModelSource.indexOf("private suspend fun runDisconnectedUrlTest(")
+        check(start >= 0) { "runDisconnectedUrlTest was not found" }
+        // This declaration has a default parameter, so bodyOf's expression-body heuristic cannot
+        // be used; the next declarations are the wait's own helpers.
+        val end = viewModelSource.indexOf("private sealed interface HeadlessWaitOutcome", start)
+        check(end > start) { "the headless wait helpers were not found" }
+        val body = viewModelSource.substring(start, end)
+
+        check(body.contains("awaitHeadlessUrlTestCompletion(target)")) {
+            "the headless probe must wait for completion before its finally stops the temporary core"
+        }
+        check(!body.contains("awaitUrlTestSettled")) {
+            "the removed settle poll must not come back through the headless path"
+        }
+
+        val wait = bodyOf("private suspend fun awaitHeadlessUrlTestCompletion(")
+        check(wait.contains("headlessProbeProgress(")) {
+            "completion must be proven from the members' terminal delay+time results"
+        }
+        check(wait.contains("withTimeoutOrNull(headlessCompletionBudgetMs(")) {
+            "the only time bound may be the derived safety budget, not a completion criterion"
+        }
+        check(!wait.contains("delay(")) {
+            "the wait must be woken by subscription data, not by sleeping/polling"
         }
     }
 }

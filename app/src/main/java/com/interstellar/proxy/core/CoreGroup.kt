@@ -31,7 +31,7 @@ internal fun isGroupType(type: String): Boolean = type.lowercase() in GROUP_TYPE
 
 /**
  * The groups the node list shows: the structure read from the active config, extended with the
- * members only the running core can know.
+ * members only the running core can know and with the latest complete url-test result.
  *
  * # Why the static half cannot be the whole answer
  *
@@ -52,21 +52,90 @@ internal fun isGroupType(type: String): Boolean = type.lowercase() in GROUP_TYPE
  * Runtime-only groups (tag absent from the file) are appended after the static ones. An empty
  * runtime-only group adds nothing to display, so it is not given a tab of its own.
  *
- * The returned `selected` is the static one: this function only extends membership. Callers that
- * need runtime selection read it from the live snapshot, which is the authority while the core
- * runs.
+ * # Why results are overlaid instead of replaced
+ *
+ * The live snapshot of a declared group also carries the members' latest url-test results, but
+ * the static object is what the page keeps for a declared member - so a result reported only on
+ * the live half used to be dropped. Worse, the page combined its delay from a separate delay
+ * cache with the time from the static item, which could compose a "0 / no time" pair out of two
+ * different results and leave a failed node looking untested.
+ *
+ * [results] is therefore overlaid onto the members as a COMPLETE pair (delay + completion time)
+ * during projection; the member's identity, type and position still come from the file. The
+ * group-scope result carried by the live item wins over the tag-only global cache: a URLTest
+ * group measures its members against its own target, and a value measured against another target
+ * must not overwrite it. The global entry is used only when the group itself has no result.
+ *
+ * The returned `selected` is the static one: this function only extends membership and overlays
+ * results. Callers that need runtime selection read it from the live snapshot, which is the
+ * authority while the core runs.
  */
-internal fun displayGroups(static: List<CoreGroup>, live: List<CoreGroup>): List<CoreGroup> {
-    if (live.isEmpty()) return static
+internal fun displayGroups(
+    static: List<CoreGroup>,
+    live: List<CoreGroup>,
+    results: Map<String, UrlTestResult> = emptyMap(),
+): List<CoreGroup> {
+    if (live.isEmpty()) {
+        // The core is stopped (or has not reported yet): the file keeps the structure, and the
+        // last complete results are still valid facts about the nodes.
+        if (results.isEmpty()) return static
+        return static.map { group ->
+            val items = projectMembers(group, liveGroup = null, results)
+            if (items == group.items) group else group.copy(items = items)
+        }
+    }
     val liveByTag = live.associateBy { it.tag }
     val merged = static.map { staticGroup ->
-        val liveGroup = liveByTag[staticGroup.tag] ?: return@map staticGroup
-        if (liveGroup.items.isEmpty()) return@map staticGroup
-        val known = staticGroup.items.mapTo(HashSet()) { it.tag }
-        val extra = liveGroup.items.filter { known.add(it.tag) }
-        if (extra.isEmpty()) staticGroup else staticGroup.copy(items = staticGroup.items + extra)
+        val liveGroup = liveByTag[staticGroup.tag]
+        if (liveGroup == null || liveGroup.items.isEmpty()) {
+            val items = projectMembers(staticGroup, liveGroup = null, results)
+            if (items == staticGroup.items) staticGroup else staticGroup.copy(items = items)
+        } else {
+            staticGroup.copy(items = projectMembers(staticGroup, liveGroup, results))
+        }
     }
     val staticTags = static.mapTo(HashSet()) { it.tag }
-    val runtimeOnly = live.filter { it.tag !in staticTags && it.items.isNotEmpty() }
+    val runtimeOnly = live
+        .filter { it.tag !in staticTags && it.items.isNotEmpty() }
+        .map { group ->
+            group.copy(items = projectMembers(group, liveGroup = group, results))
+        }
     return if (runtimeOnly.isEmpty()) merged else merged + runtimeOnly
+}
+
+/**
+ * The file's members, in the file's order and with the file's types, followed by the members
+ * only the core knows. Each produced item carries the newest complete result known for it.
+ */
+private fun projectMembers(
+    group: CoreGroup,
+    liveGroup: CoreGroup?,
+    results: Map<String, UrlTestResult>,
+): List<CoreGroupItem> {
+    val liveByTag = liveGroup?.items.orEmpty().associateBy { it.tag }
+    val seen = HashSet<String>(group.items.size)
+    val declared = group.items.map { item ->
+        seen.add(item.tag)
+        item.withRuntimeResult(group.type, liveByTag[item.tag], results)
+    }
+    val extra = liveGroup?.items.orEmpty()
+        .filter { seen.add(it.tag) }
+        .map { item -> item.withRuntimeResult(group.type, item, results) }
+    return if (extra.isEmpty()) declared else declared + extra
+}
+
+/**
+ * This item with the complete runtime result for its tag attached.
+ *
+ * The pair is copied from ONE source, never merged field by field. [resultForMember] decides
+ * which source is authoritative for this group: the live item's scoped pair for a URLTest group,
+ * the newer complete pair otherwise.
+ */
+private fun CoreGroupItem.withRuntimeResult(
+    groupType: String,
+    liveItem: CoreGroupItem?,
+    results: Map<String, UrlTestResult>,
+): CoreGroupItem {
+    val runtime = resultForMember(groupType, liveItem?.urlTestResult(), results[tag]) ?: return this
+    return copy(urlTestDelay = runtime.delay, urlTestTime = runtime.completedAt)
 }

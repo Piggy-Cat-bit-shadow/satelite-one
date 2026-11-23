@@ -35,6 +35,8 @@ import io.nekohasekai.libbox.OutboundGroup
 import io.nekohasekai.libbox.StatusMessage
 import com.interstellar.proxy.core.CoreGroup
 import com.interstellar.proxy.core.CoreGroupItem
+import com.interstellar.proxy.core.UrlTestResult
+import com.interstellar.proxy.core.urlTestResultsUpdate
 import com.interstellar.proxy.utils.CommandClient
 import com.interstellar.proxy.utils.CommandTarget
 import java.util.concurrent.ConcurrentHashMap
@@ -45,11 +47,14 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 
 data class SpeedState(
@@ -330,9 +335,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         count = Settings.perAppProxyList.size,
     )
 
-    /** tag → latest url-test delay (pushed via the outbounds stream). */
-    private val _delays = MutableStateFlow<Map<String, Int>>(emptyMap())
-    val delays: StateFlow<Map<String, Int>> = _delays
+    /**
+     * tag -> the complete latest url-test result pushed by the outbounds stream.
+     *
+     * The pair is the unit: [UrlTestResult] is built from one snapshot entry, so a delay can
+     * never be read beside another result's completion time. A member with no result is absent
+     * (never zero), which is what keeps "never tested" distinct from "tested, failed".
+     *
+     * Bounded by construction: every kernel push carries the whole outbound list, and
+     * [updateOutbounds] REPLACES this map with that snapshot instead of merging into it. A tag
+     * that left the snapshot (removed node, shorter config) therefore leaves the map in the same
+     * frame it leaves the kernel, and a new core instance starts from the results THAT instance
+     * publishes (a fresh instance has none, so the map is empty until it measures again). Config
+     * switches and subscription removals, which do not necessarily produce an outbounds push,
+     * clear it explicitly.
+     */
+    private val _urlTestResults = MutableStateFlow<Map<String, UrlTestResult>>(emptyMap())
+    val urlTestResults: StateFlow<Map<String, UrlTestResult>> = _urlTestResults
 
     /**
      * True while a manual url-test RPC is in flight - nothing more.
@@ -342,7 +361,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      * timestamp gate, no settle wait: the call IS the lifecycle.
      *
      * In the pinned core `StartedService.URLTest` schedules its round with `go ...` and returns
-     * immediately, so this window is short by design. The delays keep arriving afterwards on the
+     * immediately, so this window is short by design. The results keep arriving afterwards on the
      * outbounds stream, and those are what the user actually reads off the page.
      */
     private val _testing = MutableStateFlow(false)
@@ -373,25 +392,30 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     val testTags: StateFlow<List<String>> = _testTags
 
     /**
-     * This run's outcomes: tag → delay, for the nodes that actually reported during it.
+     * This run's outcomes: tag -> COMPLETE result, for the nodes that actually reported during
+     * it.
      *
-     * Deliberately NOT the `delays` map. `delays` accumulates across runs, so after a run where
-     * every node timed out it still holds the previous run's successes - and the summary then
-     * reported "5 nodes · 5 ok · 0 failed" for a run in which nothing succeeded. A node missing
-     * from here did not succeed in this run, which is what makes failure and timeout countable.
+     * Deliberately NOT the global `urlTestResults` map. That map accumulates across runs, so
+     * after a run where every node timed out it still holds the previous run's successes - and
+     * the summary then reported "5 nodes · 5 ok · 0 failed" for a run in which nothing succeeded.
+     * A node missing from here has not returned a terminal state in THIS run; the summary counts
+     * it as pending, never as failed, and a reported failure is a real terminal outcome with its
+     * own time.
      */
-    private val _testResult = MutableStateFlow<Map<String, Int>>(emptyMap())
-    val testResult: StateFlow<Map<String, Int>> = _testResult
+    private val _testResult = MutableStateFlow<Map<String, UrlTestResult>>(emptyMap())
+    val testResult: StateFlow<Map<String, UrlTestResult>> = _testResult
 
     /**
-     * Epoch seconds when the current run started (0 = no run to attribute stamps to).
+     * Epoch seconds when the current run started (0 = no run to attribute results to).
      *
-     * A DISPLAY FILTER only: it decides which streamed delays belong to this run, so the progress
-     * numbers and the summary describe this run rather than the accumulated `delays` cache.
+     * A DISPLAY / ATTRIBUTION FILTER only: it decides which streamed results belong to this run,
+     * so the progress numbers and the summary describe this run rather than a previous one. The
+     * kernel's completion time is stored in epoch seconds too, so a result completed in the same
+     * second as the request is accepted rather than dropped.
      *
-     * It deliberately no longer gates anything. It used to be polled by `awaitUrlTestSettled`
+     * It deliberately gates nothing by itself. It used to be polled by a settle loop
      * ("while testStartEpoch > 0") to decide the client was finished, which is the client-side
-     * lifecycle this refactor removes - the core had long since returned.
+     * lifecycle this refactor removes - the online core had long since returned.
      */
     @Volatile private var testStartEpoch = 0L
 
@@ -407,15 +431,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      * the bar never reached N/N.
      */
     @Volatile private var testRunTags: Set<String> = emptySet()
-
-    /**
-     * tag → newest urlTestTime seen during the current run.
-     *
-     * Accumulated across snapshots instead of read from the latest one: `updateOutbounds` carries
-     * whatever subset the kernel chose to push, so counting within a single snapshot would drop
-     * results that arrived earlier and stall the run again.
-     */
-    private val testRunStamps = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     /** Wall clock at run start, for the per-node and total durations in the log. */
     @Volatile private var testRunStartedAtMs = 0L
@@ -532,8 +547,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     private var toastClearJob: Job? = null
 
-    private val delaysMutex = kotlinx.coroutines.sync.Mutex()
-
     fun showToast(text: String, kind: UiToast.Kind) {
         _toast.value = UiToast(text, kind)
         toastClearJob?.cancel()
@@ -613,8 +626,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         const val STARTING_TIMEOUT_MS = 15_000L
         const val SOCKET_DROP_TIMEOUT_MS = 400L
 
-        /** Sentinel delay for timed-out / unreachable nodes (url-test). */
-        const val TIMEOUT_DELAY = 65535
+        /**
+         * The kernel's active-probe budget (`constant.TCPTimeout` in the pinned core).
+         *
+         * Used only to derive a safety bound for the headless completion wait; it is never used
+         * to decide that a round finished.
+         */
+        const val KERNEL_PROBE_TIMEOUT_MS = 15_000L
+
+        /** The kernel's per-round probe concurrency (`constant.URLTestConcurrencyLimit`). */
+        const val KERNEL_URL_TEST_CONCURRENCY = 10
     }
 
     private val commandClient = CommandClient(
@@ -717,56 +738,30 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             override fun updateOutbounds(outbounds: List<io.nekohasekai.libbox.OutboundGroupItem>) {
-                val map = _delays.value.toMutableMap()
-                for (item in outbounds) {
-                    map[item.tag] = item.urlTestDelay
-                    // Remember every stamp this run has seen, not just this snapshot's.
-                    if (testStartEpoch > 0 && item.urlTestTime > 0) {
-                        testRunStamps[item.tag] = item.urlTestTime
-                    }
+                // ONE full snapshot -> ONE complete result map. Each pair is copied out of the
+                // same entry, and a non-empty map REPLACES the previous one, so no delay can be
+                // read beside another result's time and a tag that is gone from the snapshot
+                // cannot keep a dead core's value.
+                val update = urlTestResultsUpdate(
+                    outbounds.map { CoreGroupItem(it.tag, it.type, it.urlTestDelay, it.urlTestTime) },
+                )
+                if (update == null) {
+                    // The stream's "service not started" frame (zero-length list). Keeping the
+                    // last results is what lets an offline test's timeout/delay survive the stop
+                    // of its temporary core; a running config always lists at least one outbound,
+                    // so this is not a measurement of a live instance.
+                    return
                 }
-                _delays.value = map
+                _urlTestResults.value = update
                 // Progress and summary are measured over the SAME set the run submitted. Nothing
                 // here reads outbounds.size: that snapshot also carries `direct`, `block`,
-                // selectors and nodes no run ever submits, none of which can report a stamp.
+                // selectors and nodes no run ever submits, none of which can report a result.
                 //
-                // Nothing here touches `_testing` either. This stream cannot know whether the RPC
-                // is still in flight, and it used to end the run on `done >= total` - a condition
-                // it could only satisfy by accident, because a node that is never submitted never
-                // reports. `done >= total` is now display-only: it closes the PROGRESS DISPLAY,
-                // and the lifecycle belongs to the RPC alone.
-                val eligible = testRunTags
-                if (testStartEpoch > 0 && eligible.isNotEmpty()) {
-                    val startedAt = testRunStartedAtMs
-                    for (tag in eligible) {
-                        val stamp = testRunStamps[tag] ?: continue
-                        if (stamp >= testStartEpoch && startedAt > 0 && testRunReported.add(tag)) {
-                            com.interstellar.proxy.core.AppLog.log(
-                                "test",
-                                "  $tag → ${map[tag] ?: 0}ms at +${System.currentTimeMillis() - startedAt}ms",
-                            )
-                        }
-                    }
-                    val reported = eligible.filter { tag -> (testRunStamps[tag] ?: 0L) >= testStartEpoch }
-                    // Publish this run's outcomes as they land: a tag absent from here did not
-                    // report in THIS run, so the summary counts it as a failure instead of
-                    // reusing a delay from an earlier run.
-                    _testResult.value = reported.associateWith { tag -> map[tag] ?: 0 }
-                    if (reported.size >= eligible.size) {
-                        // Display complete. The RPC may be long done - the core schedules its round
-                        // and returns at once - so this only closes the progress window.
-                        val elapsed = if (startedAt > 0) System.currentTimeMillis() - startedAt else 0
-                        com.interstellar.proxy.core.AppLog.log(
-                            "test",
-                            "batch results complete: ${reported.size}/${eligible.size} in ${elapsed}ms",
-                        )
-                        _testProgress.value = null
-                    } else {
-                        _testProgress.value = reported.size to eligible.size
-                    }
-                }
-                // NB: snapshots can arrive at any moment (delayed pushes) and must never kill an
-                // in-flight run - the RPC's own finally owns the testing state.
+                // Nothing here touches `_testing` either: this stream cannot know whether the RPC
+                // is still in flight. A member's terminal state - a FAILURE now included, because
+                // it carries a completion time - is what ends that member's pending progress; the
+                // RPC's own finally owns the run's testing state.
+                publishTestRunResults(update)
             }
 
         },
@@ -1203,6 +1198,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
             _staticGroups.value = parseStaticGroups(config)
+            // A changed config is a replaced outbound set; results measured against the old set
+            // (or its core instance) must not survive as if they described this one. The new
+            // core's outbounds snapshot is the authority and repopulates the map. An unchanged
+            // regeneration keeps them: nothing it describes was replaced.
+            if (before != config) _urlTestResults.value = emptyMap()
             // a switch during Starting would otherwise be silently dropped: the
             // in-flight start already consumed the previous config and no
             // reload fires — wait for the start to settle, then apply
@@ -1677,8 +1677,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             staticGroupsRevision = revision
             if (dropLiveGroupsOnRefresh(previousRevision, revision, CoreRuntime.appliedConfigRevision)) {
                 // A snapshot from the previous profile must not feed the new structure: the
-                // reload's own group push repopulates the runtime half.
+                // reload's own group push repopulates the runtime half. The runtime url-test
+                // results belong to the same replaced instance, so they go with it.
                 _groups.value = emptyList()
+                _urlTestResults.value = emptyMap()
             }
             // Clear first, then publish the structure: the other order lets one frame see the
             // new structure with the previous profile's members.
@@ -2023,7 +2025,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      * The denominator for [target], or null when it cannot be established.
      *
      * Null rather than a guess: a wrong "47 / 52" is worse than no count, and the page says
-     * 测速中… instead. This is also the reason there is no `_delays.size` fallback any more - a
+     * 测速中… instead. This is also the reason there is no delay-cache-size fallback any more - a
      * historical delay cache is not this run's member set, so using it made the total describe
      * nodes that were never submitted.
      */
@@ -2056,18 +2058,82 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      */
     private fun beginTestRun(target: String) {
         val eligible = eligibleUrlTestTags(target)
-        testRunStamps.clear()
         testRunReported.clear()
         testRunTags = eligible.toSet()
         _testTags.value = eligible
         _testResult.value = emptyMap()
         testRunStartedAtMs = System.currentTimeMillis()
-        // Stamps at or after this belong to this run. Display filter only - see testStartEpoch.
+        // Results completed at or after this belong to this run. Attribution filter only - see
+        // testStartEpoch. Same-second results are accepted (`>=`), never guessed at.
         testStartEpoch = System.currentTimeMillis() / 1000
         com.interstellar.proxy.core.AppLog.log(
             "test",
             "batch start: ${eligible.size} node(s) in group '$target': ${eligible.joinToString()}",
         )
+    }
+
+    /**
+     * Publish this run's outcomes from ONE complete result snapshot.
+     *
+     * Both the count and the published pairs come from the same snapshot, so a member can only
+     * ever be counted with its own delay/time pair. A member is "reported" once its completion
+     * time is at or after the request second - a FAILURE is reported too, because the kernel
+     * gives it a completion time; that is what ends its pending progress instead of leaving the
+     * run stuck at N-1/N. A member with no terminal result is left out of [_testResult] rather
+     * than recorded as 0: the summary treats it as pending, not as failed.
+     *
+     * Nothing here touches `_testing` or resets the epoch - this is display/progress bookkeeping
+     * fed by a stream that cannot know whether the RPC is still in flight.
+     */
+    private fun publishTestRunResults(results: Map<String, UrlTestResult>) {
+        val eligible = testRunTags
+        if (testStartEpoch <= 0L || eligible.isEmpty()) return
+        val startedAt = testRunStartedAtMs
+        val reported = eligible.filter { tag ->
+            (results[tag]?.completedAt ?: 0L) >= testStartEpoch
+        }
+        for (tag in reported) {
+            if (startedAt > 0 && testRunReported.add(tag)) {
+                val result = results.getValue(tag)
+                com.interstellar.proxy.core.AppLog.log(
+                    "test",
+                    "  $tag → ${result.delay}ms at +${System.currentTimeMillis() - startedAt}ms",
+                )
+            }
+        }
+        _testResult.value = reported.associateWith { results.getValue(it) }
+        if (reported.size >= eligible.size) {
+            // Display complete. The RPC may be long done - the core schedules its round and
+            // returns at once - so this only closes the progress window, never the run.
+            val elapsed = if (startedAt > 0) System.currentTimeMillis() - startedAt else 0
+            com.interstellar.proxy.core.AppLog.log(
+                "test",
+                "batch results complete: ${reported.size}/${eligible.size} in ${elapsed}ms",
+            )
+            _testProgress.value = null
+        } else {
+            _testProgress.value = reported.size to eligible.size
+        }
+    }
+
+    /**
+     * Adopt the member set the probe core reports for a headless run.
+     *
+     * A headless run starts while no core is running, so [beginTestRun] may not have known the
+     * target's members (the live group snapshot can be empty on a cold start). The probe core
+     * publishes them through the ordinary groups stream; adopting them here is what lets the
+     * offline run's progress, summary and completion wait use the set that was really submitted.
+     * Online runs already know their set, so this is a no-op for them.
+     */
+    private fun adoptHeadlessTestRunMembers(members: List<String>) {
+        if (members.isEmpty()) return
+        val submitted = members.toSet()
+        if (testRunTags == submitted) return
+        testRunTags = submitted
+        _testTags.value = members
+        // Results may already have arrived before the member set did; count them now so the
+        // progress is not left at 0/N just because no further snapshot is pushed.
+        publishTestRunResults(_urlTestResults.value)
     }
 
     /**
@@ -2145,10 +2211,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 if (i > 0 && i % 10 == 0) commandClient.connect()
             }
             if (!connected) throw IllegalStateException(str(com.interstellar.proxy.R.string.vm_test_service_timeout))
-            // A headless probe reaches the kernel through the same single call, so the client's
-            // involvement ends when that call returns. It used to be followed by a
-            // `awaitUrlTestSettled()` that waited out the kernel's per-node timeout plus margin -
-            // the same client-side lifecycle this refactor removes from the attached path.
+            // The RPC only SCHEDULES the round: the kernel returns an empty response before any
+            // probe has necessarily finished. The temporary core must stay alive until the
+            // members' real terminal states arrive, so the wait below uses the subscription data
+            // this headless path already receives. (It used to be the reverse mistake: a fixed
+            // 15 s + 10 s client-side poll. This wait adds no settle delay; it ends on results.)
             val failure = runCatching {
                 CommandTarget.standaloneClient().urlTest(target)
             }.exceptionOrNull()
@@ -2159,6 +2226,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         failure.message ?: failure.toString(),
                     ),
                 )
+            }
+            when (val completion = awaitHeadlessUrlTestCompletion(target)) {
+                HeadlessWaitOutcome.Completed -> Unit
+                // A real connection took over; the core is no longer ours to stop and the
+                // probe's results are not a failure to report.
+                HeadlessWaitOutcome.TakenOver -> Unit
+                // The caller wraps this in the existing "test failed" message, so the detail is
+                // passed unwrapped and names exactly which members never reported.
+                is HeadlessWaitOutcome.Unproven -> throw IllegalStateException(completion.detail)
             }
         } finally {
             probeSocketUp = false
@@ -2178,6 +2254,148 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 else SubscriptionRepository.regenerateActiveConfig()
             }
         }
+    }
+
+    /** What the headless wait could establish about the round it submitted. */
+    private sealed interface HeadlessWaitOutcome {
+        /** Every submitted member reported a terminal state belonging to this request. */
+        data object Completed : HeadlessWaitOutcome
+
+        /** A real connection took over; the temporary core is no longer this operation's to stop. */
+        data object TakenOver : HeadlessWaitOutcome
+
+        /** The wait could not be proven complete, with the concrete detail to report. */
+        data class Unproven(val detail: String) : HeadlessWaitOutcome
+    }
+
+    /** One emission of the streams the headless wait watches, plus the take-over edge. */
+    private data class HeadlessWaitObservation(
+        val progress: HeadlessProbeProgress,
+        val takenOver: Boolean,
+    )
+
+    /**
+     * Wait until the headless round's probes have really finished.
+     *
+     * # Why this exists
+     *
+     * `StartedService.URLTest` schedules its round with `go ...` and answers with an empty
+     * response. The host used to treat that response as completion and stop the temporary core in
+     * the caller's `finally` - possibly while the probes it had just submitted were still running,
+     * which could tear an offline test down mid-round.
+     *
+     * # What proves completion
+     *
+     * Only the data the headless path already receives: the probe core publishes its groups and
+     * every finished member's complete `delay + completion time` pair (a failure has a time too).
+     * A member counts once it has a terminal pair completed at or after this request's start.
+     * The wait ends on that condition; there is no fixed settle delay and no guessed number of
+     * seconds. If the member set is never published, or members never report, the wait returns
+     * [HeadlessWaitOutcome.Unproven] naming exactly what was missing instead of pretending.
+     *
+     * # Cleanup
+     *
+     * A real connection taking over ends the wait immediately; the caller's `finally` already
+     * skips stopping the core in that case. Cancellation propagates out of the flow and the
+     * `finally` still runs. [headlessCompletionBudgetMs] is a safety valve so a lost round cannot
+     * keep a temporary core alive forever - expiry is reported as unproven, never as success.
+     */
+    private suspend fun awaitHeadlessUrlTestCompletion(target: String): HeadlessWaitOutcome {
+        val requestEpoch = testStartEpoch
+        // The submitted members can only be known from the probe core itself on a cold start
+        // (no live snapshot exists while nothing is running). Bounded by the service-start
+        // budget: this answers "did the core publish its groups", it does not time the probes.
+        val membership = withTimeoutOrNull(STARTING_TIMEOUT_MS) {
+            combine(_groups, _status) { groups, status -> groups to status }
+                .first { (groups, status) ->
+                    status == Status.Starting || status == Status.Started ||
+                        groups.any { it.tag == target && it.items.isNotEmpty() }
+                }
+        }
+        if (membership == null) {
+            return HeadlessWaitOutcome.Unproven(
+                "the probe core published no members for group '$target'",
+            )
+        }
+        val (groups, status) = membership
+        if (status == Status.Starting || status == Status.Started) {
+            return HeadlessWaitOutcome.TakenOver
+        }
+        val firstProgress = headlessProbeProgress(
+            target,
+            requestEpoch,
+            groups,
+            _urlTestResults.value,
+        )
+        if (firstProgress.unprovable.isNotEmpty()) {
+            // A nested group the core did not publish: its leaves were submitted by the round but
+            // cannot even be named, so waiting could never be proven. Say what is missing instead
+            // of stopping on a guess or burning the whole budget.
+            com.interstellar.proxy.core.AppLog.log(
+                "test",
+                "headless completion unprovable for '$target': " +
+                    firstProgress.unprovable.joinToString(),
+            )
+            return HeadlessWaitOutcome.Unproven(
+                "cannot enumerate member(s) of '$target': nested group(s) not published by the " +
+                    "probe core: " +
+                    firstProgress.unprovable.take(3).joinToString() +
+                    if (firstProgress.unprovable.size > 3) "…" else "",
+            )
+        }
+        if (firstProgress.members.isEmpty()) {
+            return HeadlessWaitOutcome.Unproven("group '$target' has no measurable members")
+        }
+        // Make the offline run's progress/summary describe the set the probe core really submitted.
+        adoptHeadlessTestRunMembers(firstProgress.members)
+
+        val observation = withTimeoutOrNull(headlessCompletionBudgetMs(firstProgress.members.size)) {
+            combine(_groups, _urlTestResults, _status) { latestGroups, results, latestStatus ->
+                HeadlessWaitObservation(
+                    progress = headlessProbeProgress(target, requestEpoch, latestGroups, results),
+                    takenOver = latestStatus == Status.Starting || latestStatus == Status.Started,
+                )
+            }.first { it.takenOver || it.progress.complete }
+        }
+        if (observation == null) {
+            val progress = headlessProbeProgress(
+                target,
+                requestEpoch,
+                _groups.value,
+                _urlTestResults.value,
+            )
+            com.interstellar.proxy.core.AppLog.log(
+                "test",
+                "headless completion unproven: ${progress.pending.size}/${progress.members.size} " +
+                    "member(s) without a terminal result in '$target': " +
+                    progress.pending.joinToString(),
+            )
+            return HeadlessWaitOutcome.Unproven(
+                "no terminal result for ${progress.pending.size}/${progress.members.size} " +
+                    "node(s) in '$target': ${progress.pending.take(3).joinToString()}" +
+                    if (progress.pending.size > 3) "…" else "",
+            )
+        }
+        return if (observation.takenOver) {
+            HeadlessWaitOutcome.TakenOver
+        } else {
+            HeadlessWaitOutcome.Completed
+        }
+    }
+
+    /**
+     * Safety bound for [awaitHeadlessUrlTestCompletion], NOT a completion criterion.
+     *
+     * Every result ends the wait as soon as it arrives; this only stops a round that will never
+     * publish from keeping the temporary core alive forever. It is derived from the kernel's own
+     * limits rather than a guessed latency: one active probe is bounded by `TCPTimeout` (15 s) and
+     * a URLTest round runs at most ten probes at once (`newProbeBatch(cancelRound, 10, 20)` in
+     * `protocol/group/urltest.go`), so [members] need at most ceil(n / 10) probe budgets. One
+     * extra budget covers waiting for the Box's other allowed round (`maxConcurrentRounds = 2`).
+     */
+    private fun headlessCompletionBudgetMs(members: Int): Long {
+        val probeRounds = (members + KERNEL_URL_TEST_CONCURRENCY - 1) / KERNEL_URL_TEST_CONCURRENCY
+        return (probeRounds + 1).toLong() * KERNEL_PROBE_TIMEOUT_MS
     }
 
     fun addSubscriptionFromUrl(name: String, url: String) {
@@ -2643,11 +2861,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun removeSubscription(id: String) {
         val wasActive = id == SubscriptionRepository.activeSubscriptionId
         SubscriptionRepository.remove(id)
+        // Removing a subscription removes or renumbers node tags, so every stored result is no
+        // longer attributable to the displayed pool. Drop them rather than let a deleted node's
+        // timeout (or a renamed node's old delay) describe whatever takes its place; the next
+        // outbounds snapshot repopulates the map from the core that is still running.
+        _urlTestResults.value = emptyMap()
         when {
             SubscriptionRepository.subscriptions.isEmpty() -> {
                 // 删光了:节点/分组全清,停掉还在吃旧配置的内核
                 _groups.value = emptyList()
-                _delays.value = emptyMap()
                 _staticGroups.value = emptyList()
                 if (_status.value == Status.Started || _status.value == Status.Starting) {
                     com.interstellar.proxy.bg.BoxService.stop()

@@ -81,7 +81,6 @@ import com.interstellar.proxy.ui.components.pressableClick
 import com.interstellar.proxy.ui.theme.LocalInterstellarColors
 import com.interstellar.proxy.ui.theme.Motion
 import io.nekohasekai.libbox.Libbox
-import com.interstellar.proxy.core.CoreGroup
 
 /**
  * Core identity line: the fork this APK was built against plus the revision
@@ -101,7 +100,14 @@ fun DashboardPage(
     val status by viewModel.status.collectAsState()
     val speed by viewModel.speed.collectAsState()
     val groups by viewModel.groups.collectAsState()
-    val delays by viewModel.delays.collectAsState()
+    val urlTestResults by viewModel.urlTestResults.collectAsState()
+    // Needed to distinguish "this member is still pending" from "it was never tested": a
+    // completion time tells us the result is terminal, the run's submitted set tells us whether
+    // waiting is still honest.
+    val testing by viewModel.testing.collectAsState()
+    val testProgress by viewModel.testProgress.collectAsState()
+    val testTags by viewModel.testTags.collectAsState()
+    val testResult by viewModel.testResult.collectAsState()
     val busy by viewModel.busy.collectAsState()
     val storedSelected by viewModel.selectedOutboundTag.collectAsState()
     val subscriptions by viewModel.subscriptions.collectAsState()
@@ -207,7 +213,7 @@ fun DashboardPage(
             // ── 节点名（大字，自动缩放）：连接中显示实时出口，未连接显示下次将使用的节点
             val connected = status == Status.Started || status == Status.Starting
             val context = androidx.compose.ui.platform.LocalContext.current
-            val resolvedNode = nodeRowValue(groups, delays, mainGroup, storedSelected)
+            val resolvedNode = nodeRowValue(groups, urlTestResults, mainGroup, storedSelected)
             val picking = connected && (resolvedNode == "自动" || resolvedNode == "未选择")
             // 选择中呼吸动画只在 picking 时运转,其余时间零帧开销
             val pickPulse = if (picking) {
@@ -253,13 +259,22 @@ fun DashboardPage(
 
             // ── 协议 · 延迟（点击测速）
             if (running && mainGroup != null) {
-                val delay = delayOf(groups, delays)
+                val leaf = currentLeafTag(groups, urlTestResults, mainGroup, storedSelected)
+                val result = selectedResult(groups, urlTestResults, mainGroup, storedSelected)
+                // Loading is shown only for a member that is really part of the run in flight and
+                // has not answered yet. A finished FAILURE now carries a completion time, so it
+                // shows the timeout; a node with no result and no run is untested, not "testing".
+                val memberPending = result == null && leaf != null &&
+                    (testing || testProgress != null) &&
+                    leaf in testTags && leaf !in testResult
                 val delayText = when {
-                    delay <= 0 -> stringResource(R.string.dash_testing)
-                    delay > 65000 -> stringResource(R.string.dash_timeout)
-                    else -> stringResource(R.string.dash_delay_ms, delay)
+                    result != null && result.isSuccess ->
+                        stringResource(R.string.dash_delay_ms, result.delay)
+                    result != null -> stringResource(R.string.dash_timeout)
+                    memberPending -> stringResource(R.string.dash_testing)
+                    else -> stringResource(R.string.nodes_delay_untested_full)
                 }
-                val protocol = currentLeafTag(groups, delays, mainGroup)?.let { protocolByTag[it] }
+                val protocol = leaf?.let { protocolByTag[it] }
                 Spacer(Modifier.height(2.dp))
                 Text(
                     listOfNotNull(protocol, delayText).joinToString(" · "),
@@ -873,72 +888,4 @@ private fun formatElapsed(ms: Long): String {
     val m = (total % 3600) / 60
     val s = total % 60
     return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
-}
-
-private fun nodeRowValue(
-    groups: List<CoreGroup>,
-    delays: Map<String, Int>,
-    mainGroup: CoreGroup?,
-    storedSelected: String,
-): String {
-    // live core selection first; when 未连接 fall back to the persisted tag
-    val selected = mainGroup?.selected?.takeIf { it.isNotBlank() }
-        ?: storedSelected.takeIf { it.isNotBlank() }
-        ?: return "未选择"
-    val leaf = resolveNow(groups, delays, selected)
-    return if (leaf == MinimalConfigBuilder.AUTO_TAG || leaf == MinimalConfigBuilder.GROUP_TAG) "自动" else leaf
-}
-
-/** Leaf node tag currently in use (null when it stays on a group / auto itself). */
-private fun currentLeafTag(
-    groups: List<CoreGroup>,
-    delays: Map<String, Int>,
-    mainGroup: CoreGroup?,
-): String? {
-    val selected = mainGroup?.selected?.takeIf { it.isNotBlank() } ?: return null
-    val leaf = resolveNow(groups, delays, selected)
-    return leaf.takeIf { it != MinimalConfigBuilder.AUTO_TAG && it != MinimalConfigBuilder.GROUP_TAG }
-}
-
-/**
- * Walk selector / urltest until the leaf in use. Urltest's Now() is empty
- * until the first full test finishes — fall back to the current fastest
- * (or first) member so the home row does not sit on "自动" for seconds.
- */
-private fun resolveNow(
-    groups: List<CoreGroup>,
-    delays: Map<String, Int>,
-    tag: String,
-    depth: Int = 0,
-): String {
-    if (depth > 5) return tag
-    val group = groups.find { it.tag == tag } ?: return tag
-    val next = group.selected
-    if (!next.isNullOrBlank() && next != tag) {
-        return resolveNow(groups, delays, next, depth + 1)
-    }
-    val items = groupItems(group)
-    if (items.isEmpty()) return tag
-    val fastest = items.minByOrNull { delayOfItem(it, delays).takeIf { d -> d > 0 } ?: Int.MAX_VALUE }
-    val candidate = when {
-        fastest != null && delayOfItem(fastest, delays) > 0 -> fastest.tag
-        else -> items.first().tag
-    }
-    return if (candidate == tag) tag else resolveNow(groups, delays, candidate, depth + 1)
-}
-
-private fun groupItems(group: com.interstellar.proxy.core.CoreGroup) = group.items
-
-private fun delayOfItem(item: com.interstellar.proxy.core.CoreGroupItem, delays: Map<String, Int>): Int =
-    delays[item.tag]?.takeIf { it > 0 } ?: item.urlTestDelay
-
-private fun delayOf(groups: List<com.interstellar.proxy.core.CoreGroup>, delays: Map<String, Int>): Int {
-    val main = groups.find { it.tag == MinimalConfigBuilder.GROUP_TAG }
-        ?: groups.firstOrNull { it.type.equals("selector", ignoreCase = true) }
-        ?: return 0
-    val selected = main.selected ?: return 0
-    val leaf = resolveNow(groups, delays, selected)
-    delays[leaf]?.let { if (it > 0) return it }
-    delays[selected]?.let { if (it > 0) return it }
-    return 0
 }
