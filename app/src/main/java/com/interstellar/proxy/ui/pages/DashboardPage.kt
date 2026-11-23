@@ -267,12 +267,12 @@ fun DashboardPage(
                 val memberPending = result == null && leaf != null &&
                     (testing || testProgress != null) &&
                     leaf in testTags && leaf !in testResult
-                val delayText = when {
-                    result != null && result.isSuccess ->
-                        stringResource(R.string.dash_delay_ms, result.delay)
-                    result != null -> stringResource(R.string.dash_timeout)
-                    memberPending -> stringResource(R.string.dash_testing)
-                    else -> stringResource(R.string.nodes_delay_untested_full)
+                val delayText = when (dashboardDelayDisplay(result, memberPending)) {
+                    DashboardDelayDisplay.Delay ->
+                        stringResource(R.string.dash_delay_ms, result?.delay ?: 0)
+                    DashboardDelayDisplay.Timeout -> stringResource(R.string.dash_timeout)
+                    DashboardDelayDisplay.Testing -> stringResource(R.string.dash_testing)
+                    DashboardDelayDisplay.Untested -> stringResource(R.string.nodes_delay_untested_full)
                 }
                 val protocol = leaf?.let { protocolByTag[it] }
                 Spacer(Modifier.height(2.dp))

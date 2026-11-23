@@ -4,6 +4,8 @@ import com.interstellar.proxy.core.CoreGroup
 import com.interstellar.proxy.core.CoreGroupItem
 import com.interstellar.proxy.core.UrlTestResult
 import com.interstellar.proxy.data.config.MinimalConfigBuilder
+import com.interstellar.proxy.core.UrlTestDisplay
+import com.interstellar.proxy.core.urlTestDisplay
 import org.junit.Test
 
 /**
@@ -202,5 +204,49 @@ class DashboardNodeSelectionTest {
         val selection = resolveNow(listOf(a, b), emptyMap(), "a")
 
         check(selection.tag.isNotBlank())
+    }
+}
+
+// ---- the differential the two screens never had ------------------------------------------------
+
+/**
+ * The dashboard's delay line and the node badge derive their text from the same terminal state, and
+ * before this test they could disagree: the dashboard rendered `delay <= 0` as "testing" while the
+ * badge rendered a finished failure as a timeout. Both decisions are now values, so they can be
+ * compared without a device.
+ */
+class DashboardAndBadgeAgreeTest {
+    private fun allStates(): List<Pair<String, UrlTestResult?>> = listOf(
+        "never tested" to null,
+        "timeout" to UrlTestResult(0, 1_700_000_000L),
+        "success" to UrlTestResult(37, 1_700_000_000L),
+        "delay without time" to UrlTestResult(37, 0L),
+        "zero delay and zero time" to UrlTestResult(0, 0L),
+    )
+
+    @Test
+    fun `the dashboard and the badge agree on every terminal state`() {
+        for ((name, result) in allStates()) {
+            val badge = urlTestDisplay(result)
+            val dashboard = dashboardDelayDisplay(result, memberPending = false)
+            val expected = when (badge) {
+                UrlTestDisplay.Delay -> DashboardDelayDisplay.Delay
+                UrlTestDisplay.Timeout -> DashboardDelayDisplay.Timeout
+                UrlTestDisplay.Untested -> DashboardDelayDisplay.Untested
+            }
+            check(dashboard == expected) {
+                "$name: the badge says $badge but the dashboard says $dashboard"
+            }
+        }
+    }
+
+    @Test
+    fun `only a pending member that has no result shows the loading state`() {
+        check(dashboardDelayDisplay(null, memberPending = true) == DashboardDelayDisplay.Testing)
+        // A failure that already arrived ends the loading state, even inside the run that asked for it.
+        check(dashboardDelayDisplay(UrlTestResult(0, 10L), memberPending = true) == DashboardDelayDisplay.Timeout)
+        check(dashboardDelayDisplay(UrlTestResult(9, 10L), memberPending = true) == DashboardDelayDisplay.Delay)
+        // And nothing outside a run may claim to be loading.
+        check(dashboardDelayDisplay(null, memberPending = false) == DashboardDelayDisplay.Untested)
     }
 }

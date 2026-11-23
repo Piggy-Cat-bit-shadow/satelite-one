@@ -121,3 +121,32 @@ internal fun memberResult(
     results: Map<String, UrlTestResult>,
 ): UrlTestResult? =
     resultForMember(group.type, item.urlTestResult(), results[item.tag])
+
+/**
+ * What the dashboard's delay line must say for one member.
+ *
+ * Why this is a value and not an inline `when` in the composable: the dashboard used to render
+ * `delay <= 0` as "testing" unconditionally, while the node badge used the completion time and showed
+ * a timeout. The two screens could therefore disagree about the very same state, and there was no way
+ * to compare them without starting the app. This enum is the dashboard's decision, [urlTestDisplay] is
+ * the badge's, and the test asserts they agree for every terminal state.
+ */
+internal enum class DashboardDelayDisplay { Delay, Timeout, Testing, Untested }
+
+/**
+ * @param result the member's complete result, or null when it has none
+ * @param memberPending true only when this member is part of the run in flight and has not answered
+ */
+internal fun dashboardDelayDisplay(
+    result: UrlTestResult?,
+    memberPending: Boolean,
+): DashboardDelayDisplay = when {
+    // isTerminal, not merely "result is not null": a zero/zero pair carries no result, and reading it
+    // as a timeout is exactly the disagreement this decision was extracted to make testable. The node
+    // badge always required a terminal state; a `UrlTestResult(0, 0)` built from an unmeasured member
+    // would otherwise have shown "timeout" on the dashboard and "untested" on the badge.
+    result != null && result.isTerminal && result.isSuccess -> DashboardDelayDisplay.Delay
+    result != null && result.isTerminal -> DashboardDelayDisplay.Timeout
+    memberPending -> DashboardDelayDisplay.Testing
+    else -> DashboardDelayDisplay.Untested
+}

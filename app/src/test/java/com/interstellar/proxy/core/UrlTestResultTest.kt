@@ -100,6 +100,18 @@ class UrlTestResultTest {
         check(urlTestDisplay(12, 10L) == UrlTestDisplay.Delay)
     }
 
+    @Test
+    fun `a positive delay without a time is still a measurement`() {
+        // The kernel writes the pair together, so this state only comes from an older producer or a
+        // fixture. It must not be read as "never tested": that would hide a delay the user already
+        // paid for. It is not a timeout either, because a delay exists.
+        check(urlTestDisplay(12, 0L) == UrlTestDisplay.Delay)
+        check(UrlTestResult(12, 0L).isTerminal)
+        check(UrlTestResult(12, 0L).isSuccess)
+        check(!UrlTestResult(12, 0L).isTimeout)
+        check(urlTestResultsOf(listOf(item("n", delay = 12, completedAt = 0L)))["n"] == UrlTestResult(12, 0L))
+    }
+
     // ---- summary counting ----------------------------------------------------
 
     @Test

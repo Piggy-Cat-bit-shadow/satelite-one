@@ -17,8 +17,16 @@ package com.interstellar.proxy.core
  * tested.
  */
 data class UrlTestResult(val delay: Int, val completedAt: Long) {
-    /** A finished probe, success or failure. */
-    val isTerminal: Boolean get() = completedAt > 0L
+    /**
+     * A finished probe, success or failure.
+     *
+     * A positive delay is itself proof that a probe ran, so it counts even when the producer left the
+     * completion time at zero. The kernel writes the pair together, so that state only comes from an
+     * older producer or a hand-built fixture - but rendering it as "never tested" would hide a delay
+     * the user already paid for, and the other clients (Apple, Dashboard, Desktop) render the same
+     * two fields as a success.
+     */
+    val isTerminal: Boolean get() = completedAt > 0L || delay > 0
 
     val isSuccess: Boolean get() = isTerminal && delay > 0
 
@@ -28,7 +36,7 @@ data class UrlTestResult(val delay: Int, val completedAt: Long) {
 
 /** The complete result this member carries, or null when it was never probed. */
 fun CoreGroupItem.urlTestResult(): UrlTestResult? =
-    if (urlTestTime > 0L) UrlTestResult(urlTestDelay, urlTestTime) else null
+    if (urlTestTime > 0L || urlTestDelay > 0) UrlTestResult(urlTestDelay, urlTestTime) else null
 
 /**
  * The tag -> complete result map of ONE full outbounds snapshot.
@@ -74,7 +82,7 @@ fun urlTestDisplay(result: UrlTestResult?): UrlTestDisplay = when {
 
 /** Same decision for the two raw fields, for callers that hold them separately. */
 fun urlTestDisplay(delay: Int, completedAt: Long): UrlTestDisplay =
-    urlTestDisplay(if (completedAt > 0L) UrlTestResult(delay, completedAt) else null)
+    urlTestDisplay(if (completedAt > 0L || delay > 0) UrlTestResult(delay, completedAt) else null)
 
 /**
  * Pick the result that describes one member of a group with type [groupType].
